@@ -121,6 +121,7 @@ mod pub_macros;
 #[cfg(bench)]
 mod benchmarks;
 mod blanket_traits;
+pub mod confidential;
 pub mod descriptor;
 mod error;
 pub mod expression;
@@ -142,6 +143,7 @@ use core::{fmt, hash, str};
 use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
 
 pub use crate::blanket_traits::FromStrKey;
+pub use crate::confidential::{slip77, Descriptor as ConfidentialDescriptor};
 pub use crate::descriptor::{DefiniteDescriptorKey, Descriptor, DescriptorPublicKey};
 pub use crate::error::ParseError;
 pub use crate::expression::{ParseNumError, ParseThresholdError, ParseTreeError};

@@ -1,0 +1,182 @@
+// Written in 2022 by Andrew Poelstra <apoelstra@wpsoftware.net>
+// SPDX-License-Identifier: CC0-1.0
+
+//! SLIP-77
+//!
+//! Implementation of the SLIP-77 protocol, documented at
+//! <https://github.com/satoshilabs/slips/blob/master/slip-0077.md>
+
+use core::{borrow, fmt, str};
+
+use bitcoin::hashes::{sha256, sha512, Hash, HashEngine, Hmac, HmacEngine};
+use bitcoin::hex::{self, DisplayHex};
+use bitcoin::secp256k1;
+use elements::secp256k1_zkp;
+
+/// A master blinding key, used for SLIP-77 derived confidential addresses
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MasterBlindingKey([u8; 32]);
+
+impl fmt::Display for MasterBlindingKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0.as_hex(), f) }
+}
+
+impl From<[u8; 32]> for MasterBlindingKey {
+    fn from(x: [u8; 32]) -> Self { Self(x) }
+}
+
+impl borrow::Borrow<[u8]> for MasterBlindingKey {
+    fn borrow(&self) -> &[u8] { &self.0 }
+}
+
+impl MasterBlindingKey {
+    /// Computes a master blinding key from a seed, usually the 64-byte BIP-39 seed.
+    pub fn from_seed(seed: &[u8]) -> Self {
+        const DOMAIN: &[u8] = b"Symmetric key seed";
+        let mut root_eng = HmacEngine::<sha512::Hash>::new(DOMAIN);
+        root_eng.input(seed);
+        let root = Hmac::from_engine(root_eng);
+
+        const LABEL: &[u8] = b"SLIP-0077";
+        let mut node_eng = HmacEngine::<sha512::Hash>::new(&root[0..32]);
+        node_eng.input(&[0]);
+        node_eng.input(LABEL);
+        let node = Hmac::from_engine(node_eng);
+
+        let mut ret = [0; 32];
+        ret.copy_from_slice(&node[32..64]);
+        Self(ret)
+    }
+
+    /// Accessor for the underlying bytes
+    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+
+    /// Derives the blinding private key for a scriptPubKey
+    ///
+    /// # Errors
+    ///
+    /// If the HMAC-SHA256 output is zero or not below the curve order, which happens with
+    /// negligible probability.
+    pub fn blinding_private_key(
+        &self,
+        spk: &elements::Script,
+    ) -> Result<secp256k1_zkp::SecretKey, secp256k1::Error> {
+        let mut eng = HmacEngine::<sha256::Hash>::new(&self.0);
+        eng.input(spk.as_bytes());
+        secp256k1_zkp::SecretKey::from_slice(&Hmac::from_engine(eng).to_byte_array())
+    }
+
+    /// Derives the blinding public key for a scriptPubKey
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::blinding_private_key`].
+    pub fn blinding_key<C: secp256k1_zkp::Signing>(
+        &self,
+        secp: &secp256k1_zkp::Secp256k1<C>,
+        spk: &elements::Script,
+    ) -> Result<secp256k1_zkp::PublicKey, secp256k1::Error> {
+        let sk = self.blinding_private_key(spk)?;
+        Ok(secp256k1_zkp::PublicKey::from_secret_key(secp, &sk))
+    }
+}
+
+impl hex::FromHex for MasterBlindingKey {
+    type Error = hex::HexToArrayError;
+
+    fn from_hex(s: &str) -> Result<Self, Self::Error> { Ok(Self(<[u8; 32]>::from_hex(s)?)) }
+}
+
+impl str::FromStr for MasterBlindingKey {
+    type Err = hex::HexToArrayError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> { hex::FromHex::from_hex(s) }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use bitcoin::hex::FromHex;
+
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> { Vec::<u8>::from_hex(s).unwrap() }
+
+    #[test]
+    fn mbk_from_seed() {
+        // taken from libwally src/test/test_confidential_addr.py
+        let mbk = MasterBlindingKey::from_seed(&unhex("c76c4ac4f4e4a00d6b274d5c39c700bb4a7ddc04fbc6f78e85ca75007b5b495f74a9043eeb77bdd53aa6fc3a0e31462270316fa04b8c19114c8798706cd02ac8"));
+        assert_eq!(
+            mbk.as_bytes(),
+            &unhex("6c2de18eabeff3f7822bc724ad482bef0557f3e1c1e1c75b7a393a5ced4de616")[..]
+        );
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let spk = elements::Script::from_hex_no_prefix(
+            "76a914a579388225827d9f2fe9014add644487808c695d88ac",
+        )
+        .unwrap();
+        let mut addr = elements::Address::from_str("2dpWh6jbhAowNsQ5agtFzi7j6nKscj6UnEr").unwrap();
+        addr.blinding_pubkey = Some(mbk.blinding_key(&secp, &spk).unwrap());
+        assert_eq!(
+            addr.to_string(),
+            "CTEkf75DFff5ReB7juTg2oehrj41aMj21kvvJaQdWsEAQohz1EDhu7Ayh6goxpz3GZRVKidTtaXaXYEJ"
+        );
+    }
+
+    #[test]
+    fn slip77_from_rust_elements() {
+        // taken from rust-elements
+        let mbk = MasterBlindingKey::from_seed(&unhex(
+            "731e9b42eb9774f8a6b51af35a06f6ef1cdb6cf04402163ceacf0c8bace2831a",
+        ));
+        assert_eq!(
+            mbk.as_bytes(),
+            &unhex("c2f338e32ad1a2bd9cac569e67728163bf4c326a1770ec2293ba65548a581e97")[..]
+        );
+
+        let spk =
+            elements::Script::from_hex_no_prefix("a914afa92d77cd3541b443771649572db096cf49bf8c87")
+                .unwrap();
+        let expected = secp256k1_zkp::SecretKey::from_slice(&unhex(
+            "02b067c374bb56c54c016fae29218c000ada60f81ef45b4aeebbeb24931bb8bc",
+        ))
+        .unwrap();
+        assert_eq!(mbk.blinding_private_key(&spk).unwrap(), expected);
+    }
+
+    #[test]
+    fn local_test_elements_22_0() {
+        // Local test on elements 22.0
+        let mbk = MasterBlindingKey::from_hex(
+            "64269a8de756da06ebe35d26dccb4dd46bddcf858b54eeaae315490cfe6cacc0",
+        )
+        .unwrap();
+
+        let addr = elements::Address::from_str(
+            "el1qqg2pz79c0reryhr6hzxrzueju9m2asllwydrhexs6vj854cvwlen4tryh4thsdt2a26rte3fe87rf3my9t90wt78pcqrxv733",
+        )
+        .unwrap();
+
+        let derived_blinding_key = mbk.blinding_private_key(&addr.script_pubkey()).unwrap();
+        assert_eq!(
+            derived_blinding_key,
+            secp256k1_zkp::SecretKey::from_slice(&unhex(
+                "791a1081ae2ad98a5ad603737c648247f19d3c26e2beb54617638172edb230e7"
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn display_round_trip() {
+        let mbk = MasterBlindingKey::from_seed(b"abcd");
+        assert_eq!(
+            mbk.to_string(),
+            "b2396b3ee20509cdb64fe24180a14a72dbd671728eaa49bac69d2bdecb5f5a04"
+        );
+        assert_eq!(MasterBlindingKey::from_str(&mbk.to_string()).unwrap(), mbk);
+        assert!(MasterBlindingKey::from_str("b2396b3e").is_err());
+    }
+}

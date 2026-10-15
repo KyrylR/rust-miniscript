@@ -80,6 +80,14 @@ rather than the total input weight.
 The crate-wide error no longer wraps Bitcoin address parsing or P2SH construction
 errors. Elements descriptor address methods do not produce these errors.
 
+## Blinding key derivation
+
+Bare-key tweaks and SLIP-77 blinding key derivation return `Result`. Propagate
+the returned `bitcoin::secp256k1::Error` if a derived scalar or tweaked key
+is invalid. Confidential descriptor methods wrap this error in
+`confidential::Error::BlindingKeyDerivation`. No replacement scalar or retry
+is used.
+
 ## Interpreter constraints
 
 Unlike in rust-miniscript, `KeySigPair` and `SatisfiedConstraint` do not

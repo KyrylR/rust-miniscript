@@ -27,7 +27,8 @@ coins in a given Elements transaction
 Elements requires the Rust standard library. Disabling default features does not enable `no_std` or embedded targets.
 
 Descriptor names use the `el` prefix, for example `elwpkh(KEY)` and
-`eltr(KEY,TREE)`. The `psbt` module operates on Elements PSETs.
+`eltr(KEY,TREE)`. Confidential descriptors use `ct(BLINDING_KEY,DESCRIPTOR)`.
+The `psbt` module operates on Elements PSETs.
 
 More information can be found in [the documentation](https://docs.rs/elements-miniscript)
 or in [the `examples/` directory](examples/)
