@@ -96,6 +96,7 @@ compile_error!(
 );
 
 pub use bitcoin;
+pub use bitcoin_miniscript;
 pub use elements;
 pub use hex;
 

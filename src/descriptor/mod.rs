@@ -33,6 +33,7 @@ use crate::{
 
 mod bare;
 mod iter;
+pub mod pegin;
 mod segwitv0;
 mod sh;
 mod tr;

@@ -8,6 +8,9 @@ See the [migration notes](doc/migration.md) for upgrading from 0.5.
   spending APIs.
 - Reject an unparsable PSET partial signature when finalizing its input, and
   check every partial signature's encoding and sighash type when extracting.
+- Tweak pegin federation keys with the claim scriptPubKey as Elements does.
+  This changes legacy pegin addresses and some dynamic federation addresses.
+  Claim scripts longer than 100 bytes are rejected.
 - Add rust-miniscript's default `std` feature. Dependencies require the standard
   library even when it is disabled.
 
