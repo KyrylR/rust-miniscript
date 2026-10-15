@@ -126,6 +126,7 @@ pub mod confidential;
 pub mod descriptor;
 mod error;
 pub mod expression;
+pub mod extensions;
 pub mod interpreter;
 pub mod iter;
 pub mod miniscript;
@@ -148,6 +149,7 @@ pub use crate::confidential::{slip77, Descriptor as ConfidentialDescriptor};
 pub use crate::descriptor::{DefiniteDescriptorKey, Descriptor, DescriptorPublicKey};
 pub use crate::error::ParseError;
 pub use crate::expression::{ParseNumError, ParseThresholdError, ParseTreeError};
+pub use crate::extensions::{CovenantExt, ExtTranslator, Extension, NoExt, ParseableExt, TxEnv};
 pub use crate::interpreter::Interpreter;
 pub use crate::miniscript::context::{BareCtx, Legacy, ScriptContext, Segwitv0, SigType, Tap};
 pub use crate::miniscript::decode::Terminal;
@@ -501,6 +503,8 @@ pub enum Error {
     Parse(ParseError),
     /// Validation of a script failed.
     Validation(ValidationError),
+    /// A legacy covenant could not be constructed or satisfied.
+    LegacyCovenant(Box<descriptor::csfs_cov::Error>),
 }
 
 #[doc(hidden)] // will be removed when we remove Error
@@ -514,6 +518,7 @@ const MAX_RECURSION_DEPTH: u32 = 402;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            Self::LegacyCovenant(ref e) => fmt::Display::fmt(e, f),
             Self::ScriptLexer(ref e) => e.fmt(f),
             Self::UnexpectedStart => f.write_str("unexpected start of script"),
             Self::Unexpected(ref s) => write!(f, "unexpected «{}»", s),
@@ -576,6 +581,7 @@ impl std::error::Error for Error {
             | BareDescriptorAddr
             | TrNoScriptCode
             | MultipathDescLenMismatch => None,
+            LegacyCovenant(e) => Some(e.as_ref()),
             ScriptLexer(e) => Some(e),
             Secp(e) => Some(e),
             #[cfg(feature = "compiler")]
@@ -591,6 +597,15 @@ impl std::error::Error for Error {
             ParseThreshold(e) => Some(e),
             Parse(e) => Some(e),
             Validation(e) => Some(e),
+        }
+    }
+}
+
+impl From<descriptor::csfs_cov::Error> for Error {
+    fn from(error: descriptor::csfs_cov::Error) -> Self {
+        match error {
+            descriptor::csfs_cov::Error::Miniscript(error) => error,
+            error => Self::LegacyCovenant(Box::new(error)),
         }
     }
 }

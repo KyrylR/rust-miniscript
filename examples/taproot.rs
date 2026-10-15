@@ -48,9 +48,10 @@ fn main() {
     // a random pubkey as specified by BIP341 (which are *unspendable* by any party :p)
     let desc = pol.compile_tr(Some("UNSPENDABLE_KEY".to_string())).unwrap();
 
-    let expected_desc =
-        Descriptor::<String>::from_str("eltr(Ca,{and_v(v:pk(In),older(9)),and_v(v:pk(hA),pk(S))})")
-            .unwrap();
+    let expected_desc = Descriptor::<String, elements_miniscript::NoExt>::from_str(
+        "eltr(Ca,{and_v(v:pk(In),older(9)),and_v(v:pk(hA),pk(S))})",
+    )
+    .unwrap();
     assert_eq!(desc, expected_desc);
 
     // Descriptor type and version should match respectively for taproot

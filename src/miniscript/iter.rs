@@ -12,18 +12,19 @@ use sync::Arc;
 use super::decode::Terminal;
 use super::{Miniscript, MiniscriptKey, ScriptContext};
 use crate::prelude::*;
+use crate::{Extension, NoExt};
 
 /// Iterator-related extensions for [Miniscript]
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
     /// Creates a new [Iter] iterator that will iterate over all [Miniscript] items within
     /// AST by traversing its branches. For the specific algorithm please see
     /// [Iter::next] function.
-    pub fn iter(&self) -> Iter<'_, Pk, Ctx> { Iter::new(self) }
+    pub fn iter(&self) -> Iter<'_, Pk, Ctx, Ext> { Iter::new(self) }
 
     /// Creates a new [PkIter] iterator that will iterate over all plain public keys (and not
     /// key hash values) present in [Miniscript] items within AST by traversing all its branches.
     /// For the specific algorithm please see [PkIter::next] function.
-    pub fn iter_pk(&self) -> PkIter<'_, Pk, Ctx> { PkIter::new(self) }
+    pub fn iter_pk(&self) -> PkIter<'_, Pk, Ctx, Ext> { PkIter::new(self) }
 
     /// Enumerates all child nodes of the current AST node (`self`) and returns a `Vec` referencing
     /// them.
@@ -112,22 +113,24 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
 
 /// Iterator for traversing all [Miniscript] miniscript AST references starting from some specific
 /// node which constructs the iterator via [Miniscript::iter] method.
-pub struct Iter<'a, Pk: MiniscriptKey, Ctx: ScriptContext> {
-    next: Option<&'a Miniscript<Pk, Ctx>>,
+pub struct Iter<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension = NoExt> {
+    next: Option<&'a Miniscript<Pk, Ctx, Ext>>,
     // Here we store vec of path elements, where each element is a tuple, consisting of:
     // 1. Miniscript node on the path
     // 2. Index of the current branch
-    path: Vec<(&'a Miniscript<Pk, Ctx>, usize)>,
+    path: Vec<(&'a Miniscript<Pk, Ctx, Ext>, usize)>,
 }
 
-impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> Iter<'a, Pk, Ctx> {
-    fn new(miniscript: &'a Miniscript<Pk, Ctx>) -> Self {
+impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Iter<'a, Pk, Ctx, Ext> {
+    fn new(miniscript: &'a Miniscript<Pk, Ctx, Ext>) -> Self {
         Iter { next: Some(miniscript), path: vec![] }
     }
 }
 
-impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> Iterator for Iter<'a, Pk, Ctx> {
-    type Item = &'a Miniscript<Pk, Ctx>;
+impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Iterator
+    for Iter<'a, Pk, Ctx, Ext>
+{
+    type Item = &'a Miniscript<Pk, Ctx, Ext>;
 
     /// First, the function returns `self`, then the first child of the self (if any),
     /// then proceeds to the child of the child — down to a leaf of the tree in its first branch.
@@ -171,20 +174,20 @@ impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> Iterator for Iter<'a, Pk, Ctx> {
 
 /// Iterator for traversing all [MiniscriptKey]'s in AST starting from some specific node which
 /// constructs the iterator via [Miniscript::iter_pk] method.
-pub struct PkIter<'a, Pk: MiniscriptKey, Ctx: ScriptContext> {
-    node_iter: Iter<'a, Pk, Ctx>,
-    curr_node: Option<&'a Miniscript<Pk, Ctx>>,
+pub struct PkIter<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension = NoExt> {
+    node_iter: Iter<'a, Pk, Ctx, Ext>,
+    curr_node: Option<&'a Miniscript<Pk, Ctx, Ext>>,
     key_index: usize,
 }
 
-impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> PkIter<'a, Pk, Ctx> {
-    fn new(miniscript: &'a Miniscript<Pk, Ctx>) -> Self {
+impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> PkIter<'a, Pk, Ctx, Ext> {
+    fn new(miniscript: &'a Miniscript<Pk, Ctx, Ext>) -> Self {
         let mut iter = Iter::new(miniscript);
         PkIter { curr_node: iter.next(), node_iter: iter, key_index: 0 }
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Iterator for PkIter<'_, Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Iterator for PkIter<'_, Pk, Ctx, Ext> {
     type Item = Pk;
 
     fn next(&mut self) -> Option<Self::Item> {

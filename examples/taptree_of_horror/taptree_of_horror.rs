@@ -188,7 +188,8 @@ fn main() {
 
     // make sure policy doesn't have any issues
     let pol = Concrete::<DescriptorPublicKey>::from_str(&pol_str).unwrap();
-    let policy_desc: Descriptor<DescriptorPublicKey> = pol.compile_tr(None).unwrap();
+    let policy_desc: Descriptor<DescriptorPublicKey, elements_miniscript::NoExt> =
+        pol.compile_tr(None).unwrap();
 
     // Now, using this public descriptor create the script address
     let derived_descriptor = policy_desc.derive_at_index(0).unwrap();

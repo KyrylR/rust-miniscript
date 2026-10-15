@@ -12,6 +12,7 @@ use std::error;
 use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
 use sync::Arc;
 
+use crate::extensions::{Extension, NoExt, ParseableExt};
 use crate::iter::TreeLike;
 use crate::miniscript::lex::{Token as Tk, TokenIter};
 use crate::miniscript::limits::{MAX_PUBKEYS_IN_CHECKSIGADD, MAX_PUBKEYS_PER_MULTISIG};
@@ -87,7 +88,7 @@ enum NonTerm {
 ///
 /// The average user should always use the [`Descriptor`] APIs. Advanced users who want deal
 /// with Miniscript ASTs should use the [`Miniscript`] APIs.
-pub enum Terminal<Pk: MiniscriptKey, Ctx: ScriptContext> {
+pub enum Terminal<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension = NoExt> {
     /// `1`
     True,
     /// `0`
@@ -119,38 +120,42 @@ pub enum Terminal<Pk: MiniscriptKey, Ctx: ScriptContext> {
     Hash160(Pk::Hash160),
     // Wrappers
     /// `TOALTSTACK [E] FROMALTSTACK`
-    Alt(Arc<Miniscript<Pk, Ctx>>),
+    Alt(Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `SWAP [E1]`
-    Swap(Arc<Miniscript<Pk, Ctx>>),
+    Swap(Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `[Kt]/[Ke] CHECKSIG`
-    Check(Arc<Miniscript<Pk, Ctx>>),
+    Check(Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `DUP IF [V] ENDIF`
-    DupIf(Arc<Miniscript<Pk, Ctx>>),
+    DupIf(Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `[T] VERIFY`
-    Verify(Arc<Miniscript<Pk, Ctx>>),
+    Verify(Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `SIZE 0NOTEQUAL IF [Fn] ENDIF`
-    NonZero(Arc<Miniscript<Pk, Ctx>>),
+    NonZero(Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `[X] 0NOTEQUAL`
-    ZeroNotEqual(Arc<Miniscript<Pk, Ctx>>),
+    ZeroNotEqual(Arc<Miniscript<Pk, Ctx, Ext>>),
     // Conjunctions
     /// `[V] [T]/[V]/[F]/[Kt]`
-    AndV(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>),
+    AndV(Arc<Miniscript<Pk, Ctx, Ext>>, Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `[E] [W] BOOLAND`
-    AndB(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>),
+    AndB(Arc<Miniscript<Pk, Ctx, Ext>>, Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `[various] NOTIF [various] ELSE [various] ENDIF`
-    AndOr(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>),
+    AndOr(
+        Arc<Miniscript<Pk, Ctx, Ext>>,
+        Arc<Miniscript<Pk, Ctx, Ext>>,
+        Arc<Miniscript<Pk, Ctx, Ext>>,
+    ),
     // Disjunctions
     /// `[E] [W] BOOLOR`
-    OrB(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>),
+    OrB(Arc<Miniscript<Pk, Ctx, Ext>>, Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `[E] IFDUP NOTIF [T]/[E] ENDIF`
-    OrD(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>),
+    OrD(Arc<Miniscript<Pk, Ctx, Ext>>, Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `[E] NOTIF [V] ENDIF`
-    OrC(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>),
+    OrC(Arc<Miniscript<Pk, Ctx, Ext>>, Arc<Miniscript<Pk, Ctx, Ext>>),
     /// `IF [various] ELSE [various] ENDIF`
-    OrI(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>),
+    OrI(Arc<Miniscript<Pk, Ctx, Ext>>, Arc<Miniscript<Pk, Ctx, Ext>>),
     // Thresholds
     /// `[E] ([W] ADD)* k EQUAL`
-    Thresh(Threshold<Arc<Miniscript<Pk, Ctx>>, 0>),
+    Thresh(Threshold<Arc<Miniscript<Pk, Ctx, Ext>>, 0>),
     /// `k (<key>)* n CHECKMULTISIG`
     Multi(Threshold<Pk, MAX_PUBKEYS_PER_MULTISIG>),
     /// `k (<key>)* n CHECKMULTISIG`
@@ -159,9 +164,11 @@ pub enum Terminal<Pk: MiniscriptKey, Ctx: ScriptContext> {
     MultiA(Threshold<Pk, MAX_PUBKEYS_IN_CHECKSIGADD>),
     /// `<key> CHECKSIG (<key> CHECKSIGADD)*(n-1) k NUMEQUAL`
     SortedMultiA(Threshold<Pk, MAX_PUBKEYS_IN_CHECKSIGADD>),
+    /// An extension fragment
+    Ext(Ext),
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Clone for Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Clone for Terminal<Pk, Ctx, Ext> {
     /// We implement clone as a "deep clone" which reconstructs the entire tree.
     ///
     /// If users just want to clone Arcs they can use Arc::clone themselves.
@@ -215,11 +222,12 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Clone for Terminal<Pk, Ctx> {
             Self::SortedMulti(ref thresh) => Self::SortedMulti(thresh.clone()),
             Self::MultiA(ref thresh) => Self::MultiA(thresh.clone()),
             Self::SortedMultiA(ref thresh) => Self::SortedMultiA(thresh.clone()),
+            Self::Ext(ref e) => Self::Ext(e.clone()),
         }
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> PartialEq for Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> PartialEq for Terminal<Pk, Ctx, Ext> {
     fn eq(&self, other: &Self) -> bool {
         for (me, you) in self.pre_order_iter().zip(other.pre_order_iter()) {
             match (me, you) {
@@ -236,6 +244,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> PartialEq for Terminal<Pk, Ctx> {
                 (Self::SortedMulti(th1), Self::SortedMulti(th2)) if th1 != th2 => return false,
                 (Self::MultiA(th1), Self::MultiA(th2)) if th1 != th2 => return false,
                 (Self::SortedMultiA(th1), Self::SortedMultiA(th2)) if th1 != th2 => return false,
+                (Self::Ext(e1), Self::Ext(e2)) if e1 != e2 => return false,
                 _ => {
                     if mem::discriminant(me) != mem::discriminant(you) {
                         return false;
@@ -246,9 +255,11 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> PartialEq for Terminal<Pk, Ctx> {
         true
     }
 }
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Eq for Terminal<Pk, Ctx> {}
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Eq for Terminal<Pk, Ctx, Ext> {}
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> core::hash::Hash for Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> core::hash::Hash
+    for Terminal<Pk, Ctx, Ext>
+{
     fn hash<H: core::hash::Hasher>(&self, hasher: &mut H) {
         for term in self.pre_order_iter() {
             mem::discriminant(term).hash(hasher);
@@ -269,6 +280,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> core::hash::Hash for Terminal<Pk, Ct
                 }
                 Self::Multi(th) | Self::SortedMulti(th) => th.hash(hasher),
                 Self::MultiA(th) | Self::SortedMultiA(th) => th.hash(hasher),
+                Self::Ext(e) => e.hash(hasher),
                 _ => {}
             }
         }
@@ -292,17 +304,19 @@ macro_rules! match_token {
 
 ///Vec representing terminals stack while decoding.
 #[derive(Debug)]
-struct TerminalStack<Pk: MiniscriptKey, Ctx: ScriptContext>(Vec<Miniscript<Pk, Ctx>>);
+struct TerminalStack<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension>(
+    Vec<Miniscript<Pk, Ctx, Ext>>,
+);
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> TerminalStack<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> TerminalStack<Pk, Ctx, Ext> {
     /// Wrapper around self.0.pop()
-    fn pop(&mut self) -> Option<Miniscript<Pk, Ctx>> { self.0.pop() }
+    fn pop(&mut self) -> Option<Miniscript<Pk, Ctx, Ext>> { self.0.pop() }
 
     /// Wrapper around self.0.push()
-    fn push(&mut self, ms: Miniscript<Pk, Ctx>) { self.0.push(ms) }
+    fn push(&mut self, ms: Miniscript<Pk, Ctx, Ext>) { self.0.push(ms) }
 
     ///reduce, type check and push a 0-arg node
-    fn reduce0(&mut self, ms: Terminal<Pk, Ctx>) -> Result<(), Error> {
+    fn reduce0(&mut self, ms: Terminal<Pk, Ctx, Ext>) -> Result<(), Error> {
         let ms = Miniscript::from_ast(ms)?;
         self.0.push(ms);
         Ok(())
@@ -311,7 +325,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> TerminalStack<Pk, Ctx> {
     ///reduce, type check and push a 1-arg node
     fn reduce1<F>(&mut self, wrap: F) -> Result<(), Error>
     where
-        F: FnOnce(Arc<Miniscript<Pk, Ctx>>) -> Terminal<Pk, Ctx>,
+        F: FnOnce(Arc<Miniscript<Pk, Ctx, Ext>>) -> Terminal<Pk, Ctx, Ext>,
     {
         let top = self.pop().unwrap();
         let wrapped_ms = wrap(Arc::new(top));
@@ -322,7 +336,10 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> TerminalStack<Pk, Ctx> {
     ///reduce, type check and push a 2-arg node
     fn reduce2<F>(&mut self, wrap: F) -> Result<(), Error>
     where
-        F: FnOnce(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>) -> Terminal<Pk, Ctx>,
+        F: FnOnce(
+            Arc<Miniscript<Pk, Ctx, Ext>>,
+            Arc<Miniscript<Pk, Ctx, Ext>>,
+        ) -> Terminal<Pk, Ctx, Ext>,
     {
         let left = self.pop().unwrap();
         let right = self.pop().unwrap();
@@ -335,9 +352,9 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> TerminalStack<Pk, Ctx> {
 
 /// Parse a script fragment into an `Miniscript`
 #[allow(unreachable_patterns)]
-pub fn decode<Ctx: ScriptContext>(
+pub fn decode<Ctx: ScriptContext, Ext: ParseableExt>(
     tokens: &mut TokenIter,
-) -> Result<Miniscript<Ctx::Key, Ctx>, Error> {
+) -> Result<Miniscript<Ctx::Key, Ctx, Ext>, Error> {
     let mut non_term = Vec::with_capacity(tokens.len());
     let mut term = TerminalStack(Vec::with_capacity(tokens.len()));
 
@@ -347,6 +364,23 @@ pub fn decode<Ctx: ScriptContext>(
     loop {
         match non_term.pop() {
             Some(NonTerm::Expression) => {
+                if Ext::HAS_FRAGMENTS {
+                    if let Some(ext) = Ext::decode(tokens) {
+                        term.reduce0(Terminal::Ext(ext))?;
+                        continue;
+                    }
+                    // `v:` of an extension ending in `EQUAL` makes `EQUALVERIFY`, which the
+                    // hash and threshold arms below would claim.
+                    if tokens.peek() == Some(&Tk::Verify) {
+                        tokens.next();
+                        if let Some(ext) = Ext::decode(tokens) {
+                            non_term.push(NonTerm::Verify);
+                            term.reduce0(Terminal::Ext(ext))?;
+                            continue;
+                        }
+                        tokens.un_next(Tk::Verify);
+                    }
+                }
                 match_token!(
                     tokens,
                     // pubkey

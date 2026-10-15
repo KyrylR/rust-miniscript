@@ -59,6 +59,7 @@ fn descriptors() {
         format!("elsh(wsh(pk({PK})))"),
         format!("elwsh(or_d(pk({PK}),and_v(v:pk({NUMS}),older(10))))"),
         format!("eltr({NUMS},{{{{pk({PK}),pk({NUMS})}},pk({CT_KEY})}})"),
+        format!("elcovwsh({PK},pk({NUMS}))"),
     ] {
         check_curly_braces::<Descriptor>(&s);
     }

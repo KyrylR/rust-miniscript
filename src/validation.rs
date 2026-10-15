@@ -20,6 +20,8 @@ pub struct ValidationParams {
     pub allow_duplicate_keys: bool,
     /// Allow the `d:` fragment. (Disallowed pre-segwit because minimality is not enforced.)
     pub allow_dup_if: bool,
+    /// Allow extension fragments that are valid in the script context.
+    pub allow_extensions: bool,
     /// Allow scripts with 3rd-party malleability vectors.
     pub allow_malleability: bool,
     /// Allow the `multi` fragment. (This allowed only pre-Taproot.)
@@ -75,6 +77,7 @@ impl ValidationParams {
         allow_compressed_keys: true,
         allow_duplicate_keys: true,
         allow_dup_if: true,
+        allow_extensions: true,
         allow_malleability: true,
         allow_mixed_time_locks: true,
         allow_multi: true,
@@ -104,6 +107,7 @@ impl ValidationParams {
         allow_compressed_keys: true,
         allow_duplicate_keys: false,
         allow_dup_if: true,
+        allow_extensions: true,
         allow_malleability: false,
         allow_mixed_time_locks: false,
         allow_multi: true,
@@ -134,6 +138,7 @@ impl ValidationParams {
         allow_compressed_keys: true,
         allow_duplicate_keys: true,
         allow_dup_if: true,
+        allow_extensions: true,
         allow_malleability: true,
         allow_mixed_time_locks: true,
         allow_multi: true,
@@ -161,6 +166,7 @@ impl ValidationParams {
         self.allow_compressed_keys == other.allow_compressed_keys
             && self.allow_duplicate_keys == other.allow_duplicate_keys
             && self.allow_dup_if == other.allow_dup_if
+            && self.allow_extensions == other.allow_extensions
             && self.allow_malleability == other.allow_malleability
             && self.allow_mixed_time_locks == other.allow_mixed_time_locks
             && self.allow_multi == other.allow_multi
@@ -190,6 +196,7 @@ impl ValidationParams {
             allow_compressed_keys: self.allow_compressed_keys && other.allow_compressed_keys,
             allow_duplicate_keys: self.allow_duplicate_keys && other.allow_duplicate_keys,
             allow_dup_if: self.allow_dup_if && other.allow_dup_if,
+            allow_extensions: self.allow_extensions && other.allow_extensions,
             allow_malleability: self.allow_malleability && other.allow_malleability,
             allow_mixed_time_locks: self.allow_mixed_time_locks && other.allow_mixed_time_locks,
             allow_multi: self.allow_multi && other.allow_multi,
@@ -267,6 +274,8 @@ pub enum Error {
     DuplicateKeys,
     /// Script had a `d:` fragment in a context it was not allowed.
     IllegalDupIf,
+    /// Script had an extension fragment where the parameters forbid them.
+    IllegalExtension,
     /// Taproot script had a `multi` fragment
     IllegalMulti,
     /// Non-Taproot script had a `multi_a` fragment
@@ -322,6 +331,7 @@ impl fmt::Display for Error {
         match *self {
             Self::DuplicateKeys => f.write_str("duplicate public keys"),
             Self::IllegalDupIf => f.write_str("legacy script with a `dup_if` fragment"),
+            Self::IllegalExtension => f.write_str("script with a disallowed extension fragment"),
             Self::IllegalMulti => f.write_str("non-Taproot script with a `multi_a` fragment"),
             Self::IllegalMultiA => f.write_str("non-Taproot script with a `multi_a` fragment"),
             Self::IllegalOrI => f.write_str("legacy script with a `or_i` fragment"),

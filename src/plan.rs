@@ -20,11 +20,13 @@ use core::iter::FromIterator;
 
 use bitcoin::hashes::{hash160, ripemd160, sha256};
 use bitcoin::key::XOnlyPublicKey;
+use bitcoin::secp256k1::schnorr;
 use bitcoin::{absolute, bip32, relative, WitnessVersion};
 use elements::pset;
 use elements::taproot::{ControlBlock, LeafVersion, TapLeafHash};
 
 use crate::descriptor::{self, Descriptor, DescriptorType, KeyMap};
+use crate::extensions::{CovExtArgs, CovenantExt, CsfsMsg, Extension, ParseableExt, TxEnv};
 use crate::miniscript::hash256;
 use crate::miniscript::satisfy::{Placeholder, Satisfier, SchnorrSigType};
 use crate::prelude::*;
@@ -103,6 +105,22 @@ pub trait AssetProvider<Pk: MiniscriptKey> {
 
     /// Assert whether an absolute locktime is satisfied
     fn check_after(&self, _: absolute::LockTime) -> bool { false }
+
+    /// The transaction that covenant fragments inspect.
+    fn provider_lookup_tx_env(&self) -> Option<&TxEnv<'_, '_>> { None }
+
+    /// Given the key and message of a `csfs` fragment, return whether we have a signature
+    fn provider_lookup_csfs_sig(&self, _: &XOnlyPublicKey, _: &CsfsMsg) -> bool { false }
+
+    /// Given a price oracle key and the earliest timestamp allowed, look up an attestation:
+    /// its signature, price and timestamp.
+    fn provider_lookup_price_oracle_sig(
+        &self,
+        _: &XOnlyPublicKey,
+        _: u64,
+    ) -> Option<(schnorr::Signature, i64, u64)> {
+        None
+    }
 }
 
 /// Wrapper around [`Assets`] that logs every query and value returned
@@ -201,6 +219,20 @@ where
     fn check_older(&self, s: relative::LockTime) -> bool { Satisfier::check_older(self, s) }
 
     fn check_after(&self, l: absolute::LockTime) -> bool { Satisfier::check_after(self, l) }
+
+    fn provider_lookup_tx_env(&self) -> Option<&TxEnv<'_, '_>> { Satisfier::lookup_tx_env(self) }
+
+    fn provider_lookup_csfs_sig(&self, pk: &XOnlyPublicKey, msg: &CsfsMsg) -> bool {
+        Satisfier::lookup_csfs_sig(self, pk, msg).is_some()
+    }
+
+    fn provider_lookup_price_oracle_sig(
+        &self,
+        pk: &XOnlyPublicKey,
+        timestamp: u64,
+    ) -> Option<(schnorr::Signature, i64, u64)> {
+        Satisfier::lookup_price_oracle_sig(self, pk, timestamp)
+    }
 }
 
 // The length of `sig.to_vec()`, which omits the sighash byte for `SIGHASH_DEFAULT`.
@@ -218,7 +250,7 @@ fn schnorr_sig_len(sig: &elements::SchnorrSig) -> usize {
 /// Calling `plan` on a Descriptor will return this structure,
 /// containing the cheapest spending path possible (considering the `Assets` given)
 #[derive(Debug, Clone)]
-pub struct Plan<Pk: MiniscriptKey> {
+pub struct Plan<Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
     /// This plan's witness template
     pub(crate) template: Vec<Placeholder<Pk>>,
     /// The absolute timelock this plan uses
@@ -226,10 +258,10 @@ pub struct Plan<Pk: MiniscriptKey> {
     /// The relative timelock this plan uses
     pub relative_timelock: Option<relative::LockTime>,
     /// The target descriptor for this plan
-    pub descriptor: Descriptor<Pk>,
+    pub descriptor: Descriptor<Pk, Ext>,
 }
 
-impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
+impl<Pk: MiniscriptKey + ToPublicKey, Ext: ParseableExt> Plan<Pk, Ext> {
     /// Returns the witness template
     pub fn witness_template(&self) -> &Vec<Placeholder<Pk>> { &self.template }
 
@@ -317,11 +349,13 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
                 stack.push(witness_script.into_bytes());
                 (stack, self.descriptor.unsigned_script_sig())
             }
+            // The template of a legacy covenant would lack the transaction data of its witness.
+            DescriptorType::Cov => return Err(Error::CouldNotSatisfy),
         })
     }
 }
 
-impl Plan<DefiniteDescriptorKey> {
+impl<Ext: ParseableExt> Plan<DefiniteDescriptorKey, Ext> {
     /// Update a PSET input with the metadata required to complete this plan
     ///
     /// This will only add the metadata for items required to complete this plan. For example, if
@@ -430,6 +464,7 @@ impl Plan<DefiniteDescriptorKey> {
                     descriptor::ShInner::Ms(_) => input.redeem_script = Some(sh.inner_script()),
                 },
                 Descriptor::Wsh(wsh) => input.witness_script = Some(wsh.inner_script()),
+                Descriptor::LegacyCSFSCov(cov) => input.witness_script = Some(cov.inner_script()),
                 Descriptor::Tr(_) => unreachable!("Tr is dealt with separately"),
             }
         }
@@ -1125,7 +1160,7 @@ mod test {
             xpub, xpub, xpub, xpub
         );
 
-        let desc = Descriptor::from_str(&desc).unwrap();
+        let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
 
         let internal_key = DescriptorPublicKey::from_str(&format!("{}/0/0", xpub)).unwrap();
         let first_branch = DescriptorPublicKey::from_str(&format!("{}/0/1", xpub)).unwrap();
@@ -1172,7 +1207,7 @@ mod test {
         let xpub = format!("[{}/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ", fingerprint);
         let desc = format!("elwsh(multi(2,{}/1/0,{}/1/1))", xpub, xpub);
 
-        let desc = Descriptor::from_str(&desc).unwrap();
+        let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
 
         let asset_key = DescriptorPublicKey::from_str(&format!("{}/1/*", xpub)).unwrap(); // Note this is a wildcard key, so it can sign for the whole multi
 

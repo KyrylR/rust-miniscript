@@ -26,8 +26,8 @@ use crate::miniscript::context::SigType;
 use crate::prelude::*;
 use crate::{
     descriptor, elementssig_from_rawsig, interpreter, DefiniteDescriptorKey, Descriptor,
-    DescriptorPublicKey, ElementsSig, MiniscriptKey, Preimage32, Satisfier, ToPublicKey,
-    Translator,
+    DescriptorPublicKey, ElementsSig, MiniscriptKey, ParseableExt, Preimage32, Satisfier,
+    ToPublicKey, Translator,
 };
 
 mod finalizer;
@@ -255,12 +255,23 @@ pub struct PsbtInputSatisfier<'psbt> {
     psbt: &'psbt Psbt,
     /// input index
     index: usize,
+    legacy_covenant_key: Option<bitcoin::PublicKey>,
 }
 
 impl<'psbt> PsbtInputSatisfier<'psbt> {
     /// create a new PsbtInputsatisfier from
     /// psbt and index
-    pub fn new(psbt: &'psbt Psbt, index: usize) -> Self { Self { psbt, index } }
+    pub fn new(psbt: &'psbt Psbt, index: usize) -> Self {
+        let legacy_covenant_key = psbt
+            .inputs()
+            .get(index)
+            .and_then(|input| input.witness_script.as_ref())
+            .and_then(|script| {
+                crate::descriptor::csfs_cov::LegacyCSFSCov::decode_consensus(script).ok()
+            })
+            .map(|cov| *cov.pk());
+        Self { psbt, index, legacy_covenant_key }
+    }
 
     /// Accessor for the PSBT this satisfier is associated with.
     pub fn psbt(&self) -> &'psbt Psbt { self.psbt }
@@ -316,11 +327,24 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for PsbtInputSatisfier<'_> {
     }
 
     fn lookup_ecdsa_sig(&self, pk: &Pk) -> Option<ElementsSig> {
+        if self.legacy_covenant_key == Some(pk.to_public_key()) {
+            return None;
+        }
         // The finalizer rejects a partial signature that does not parse before satisfying its
         // input. Other users of this satisfier see such a signature as missing.
         self.psbt_input()
             .partial_sigs
             .get(&pk.to_public_key())
+            .and_then(|sig| elementssig_from_rawsig(sig).ok())
+    }
+
+    fn lookup_legacy_covenant_sig(&self, pk: &Pk) -> Option<ElementsSig> {
+        let key = self
+            .legacy_covenant_key
+            .filter(|key| *key == pk.to_public_key())?;
+        self.psbt_input()
+            .partial_sigs
+            .get(&key)
             .and_then(|sig| elementssig_from_rawsig(sig).ok())
     }
 
@@ -331,7 +355,9 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for PsbtInputSatisfier<'_> {
         self.psbt_input()
             .partial_sigs
             .iter()
-            .find(|&(pk, _)| pk.to_pubkeyhash(SigType::Ecdsa) == *pkh)
+            .find(|&(pk, _)| {
+                Some(*pk) != self.legacy_covenant_key && pk.to_pubkeyhash(SigType::Ecdsa) == *pkh
+            })
             .and_then(|(&pk, sig)| elementssig_from_rawsig(sig).ok().map(|sig| (pk, sig)))
     }
 
@@ -582,10 +608,10 @@ pub trait PsbtExt {
     ///
     /// [`update_with_descriptor_unchecked`]: PsbtInputExt::update_with_descriptor_unchecked
     /// [segwit bug]: https://bitcoinhackers.org/@lukedashjr/104287698361196952
-    fn update_input_with_descriptor(
+    fn update_input_with_descriptor<Ext: ParseableExt>(
         &mut self,
         input_index: usize,
-        descriptor: &Descriptor<DefiniteDescriptorKey>,
+        descriptor: &Descriptor<DefiniteDescriptorKey, Ext>,
     ) -> Result<(), UtxoUpdateError>;
 
     /// Update PSBT output with a descriptor and check consistency of the output's `script_pubkey`
@@ -597,10 +623,10 @@ pub trait PsbtExt {
     /// otherwise an error will be returned however it can (and should) have extended keys in it.
     ///
     /// [`update_with_descriptor_unchecked`]: PsbtOutputExt::update_with_descriptor_unchecked
-    fn update_output_with_descriptor(
+    fn update_output_with_descriptor<Ext: ParseableExt>(
         &mut self,
         output_index: usize,
-        descriptor: &Descriptor<DefiniteDescriptorKey>,
+        descriptor: &Descriptor<DefiniteDescriptorKey, Ext>,
     ) -> Result<(), OutputUpdateError>;
 
     /// Get the sighash message(data to sign) at input index `idx`.
@@ -789,10 +815,10 @@ impl PsbtExt for Psbt {
         Ok(ret)
     }
 
-    fn update_input_with_descriptor(
+    fn update_input_with_descriptor<Ext: ParseableExt>(
         &mut self,
         input_index: usize,
-        desc: &Descriptor<DefiniteDescriptorKey>,
+        desc: &Descriptor<DefiniteDescriptorKey, Ext>,
     ) -> Result<(), UtxoUpdateError> {
         let n_inputs = self.inputs().len();
         let input = self
@@ -852,10 +878,10 @@ impl PsbtExt for Psbt {
         Ok(())
     }
 
-    fn update_output_with_descriptor(
+    fn update_output_with_descriptor<Ext: ParseableExt>(
         &mut self,
         output_index: usize,
-        desc: &Descriptor<DefiniteDescriptorKey>,
+        desc: &Descriptor<DefiniteDescriptorKey, Ext>,
     ) -> Result<(), OutputUpdateError> {
         let n_outputs = self.outputs().len();
         let output = self
@@ -1004,17 +1030,17 @@ pub trait PsbtInputExt {
     /// `witness_utxo` and/or `non_witness_utxo` is consistent with the descriptor.
     ///
     /// [`update_input_with_descriptor`]: PsbtExt::update_input_with_descriptor
-    fn update_with_descriptor_unchecked(
+    fn update_with_descriptor_unchecked<Ext: ParseableExt>(
         &mut self,
-        descriptor: &Descriptor<DefiniteDescriptorKey>,
-    ) -> Result<Descriptor<bitcoin::PublicKey>, descriptor::NonDefiniteKeyError>;
+        descriptor: &Descriptor<DefiniteDescriptorKey, Ext>,
+    ) -> Result<Descriptor<bitcoin::PublicKey, Ext>, descriptor::NonDefiniteKeyError>;
 }
 
 impl PsbtInputExt for psbt::Input {
-    fn update_with_descriptor_unchecked(
+    fn update_with_descriptor_unchecked<Ext: ParseableExt>(
         &mut self,
-        descriptor: &Descriptor<DefiniteDescriptorKey>,
-    ) -> Result<Descriptor<bitcoin::PublicKey>, descriptor::NonDefiniteKeyError> {
+        descriptor: &Descriptor<DefiniteDescriptorKey, Ext>,
+    ) -> Result<Descriptor<bitcoin::PublicKey, Ext>, descriptor::NonDefiniteKeyError> {
         let (derived, _) = update_item_with_descriptor_helper(self, descriptor, None)?;
         Ok(derived)
     }
@@ -1043,17 +1069,17 @@ pub trait PsbtOutputExt {
     /// consistent with the descriptor.
     ///
     /// [`update_output_with_descriptor`]: PsbtExt::update_output_with_descriptor
-    fn update_with_descriptor_unchecked(
+    fn update_with_descriptor_unchecked<Ext: ParseableExt>(
         &mut self,
-        descriptor: &Descriptor<DefiniteDescriptorKey>,
-    ) -> Result<Descriptor<bitcoin::PublicKey>, descriptor::NonDefiniteKeyError>;
+        descriptor: &Descriptor<DefiniteDescriptorKey, Ext>,
+    ) -> Result<Descriptor<bitcoin::PublicKey, Ext>, descriptor::NonDefiniteKeyError>;
 }
 
 impl PsbtOutputExt for psbt::Output {
-    fn update_with_descriptor_unchecked(
+    fn update_with_descriptor_unchecked<Ext: ParseableExt>(
         &mut self,
-        descriptor: &Descriptor<DefiniteDescriptorKey>,
-    ) -> Result<Descriptor<bitcoin::PublicKey>, descriptor::NonDefiniteKeyError> {
+        descriptor: &Descriptor<DefiniteDescriptorKey, Ext>,
+    ) -> Result<Descriptor<bitcoin::PublicKey, Ext>, descriptor::NonDefiniteKeyError> {
         let (derived, _) = update_item_with_descriptor_helper(self, descriptor, None)?;
         Ok(derived)
     }
@@ -1162,16 +1188,16 @@ impl PsbtFields for psbt::Output {
     fn tap_tree(&mut self) -> Option<&mut Option<psbt::TapTree>> { Some(&mut self.tap_tree) }
 }
 
-fn update_item_with_descriptor_helper<F: PsbtFields>(
+fn update_item_with_descriptor_helper<F: PsbtFields, Ext: ParseableExt>(
     item: &mut F,
-    descriptor: &Descriptor<DefiniteDescriptorKey>,
+    descriptor: &Descriptor<DefiniteDescriptorKey, Ext>,
     check_script: Option<&Script>,
     // We return an extra boolean here to indicate an error with `check_script`. We do this
     // because the error is "morally" a UtxoUpdateError::MismatchedScriptPubkey, but some
     // callers expect a `descriptor::NonDefiniteKeyError`, which cannot be produced from a
     // `UtxoUpdateError`, and those callers can't get this error anyway because they pass
     // `None` for `check_script`.
-) -> Result<(Descriptor<bitcoin::PublicKey>, bool), descriptor::NonDefiniteKeyError> {
+) -> Result<(Descriptor<bitcoin::PublicKey, Ext>, bool), descriptor::NonDefiniteKeyError> {
     let secp = Secp256k1::verification_only();
 
     // 1. Derive the descriptor, recording each key derivation in a map from xpubs
@@ -1250,6 +1276,7 @@ fn update_item_with_descriptor_helper<F: PsbtFields>(
                 descriptor::ShInner::Ms(_) => *item.redeem_script() = Some(sh.inner_script()),
             },
             Descriptor::Wsh(wsh) => *item.witness_script() = Some(wsh.inner_script()),
+            Descriptor::LegacyCSFSCov(cov) => *item.witness_script() = Some(cov.inner_script()),
             Descriptor::Tr(_) => unreachable!("Tr is dealt with separately"),
         }
     };
@@ -1736,7 +1763,7 @@ mod tests {
         let root_xpub = Xpub::from_str("xpub661MyMwAqRbcFkPHucMnrGNzDwb6teAX1RbKQmqtEF8kK3Z7LZ59qafCjB9eCRLiTVG3uxBxgKvRgbubRhqSKXnGGb1aoaqLrpMBDrVxga8").unwrap();
         let fingerprint = root_xpub.fingerprint();
         let desc = format!("eltr([{}/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/0)", fingerprint);
-        let desc = Descriptor::from_str(&desc).unwrap();
+        let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
         let mut psbt_input = psbt::Input::default();
         psbt_input.update_with_descriptor_unchecked(&desc).unwrap();
         let mut psbt_output = psbt::Output::default();
@@ -1771,7 +1798,7 @@ mod tests {
             xpub, xpub, xpub, xpub
         );
 
-        let desc = Descriptor::from_str(&desc).unwrap();
+        let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
         let internal_key = XOnlyPublicKey::from_str(
             "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115",
         )
@@ -1862,7 +1889,7 @@ mod tests {
         {
             // test segwit
             let desc = format!("elwsh(multi(2,{}/0/0,{}/0/1,{}/1/0))", xpub, xpub, xpub);
-            let desc = Descriptor::from_str(&desc).unwrap();
+            let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
             let derived = format!("elwsh(multi(2,{}))", pubkeys.join(","));
             let derived = Descriptor::<bitcoin::PublicKey>::from_str(&derived).unwrap();
 
@@ -1882,7 +1909,7 @@ mod tests {
         {
             // test non-segwit
             let desc = format!("elsh(multi(2,{}/0/0,{}/0/1,{}/1/0))", xpub, xpub, xpub);
-            let desc = Descriptor::from_str(&desc).unwrap();
+            let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
             let derived = format!("elsh(multi(2,{}))", pubkeys.join(","));
             let derived = Descriptor::<bitcoin::PublicKey>::from_str(&derived).unwrap();
 

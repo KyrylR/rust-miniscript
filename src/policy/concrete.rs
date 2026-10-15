@@ -11,11 +11,12 @@ use std::error;
 use bitcoin::absolute;
 #[cfg(feature = "compiler")]
 use {
-    crate::descriptor::{TapTree, TapTreeDepthError},
+    crate::descriptor::{Bare, Sh, TapTree, TapTreeDepthError, Tr, Wsh},
     crate::miniscript::ScriptContext,
     crate::policy::compiler::{self, CompilerError},
     crate::Descriptor,
     crate::Miniscript,
+    crate::NoExt,
     crate::Tap,
     crate::Terminal,
     core::cmp::Reverse,
@@ -280,7 +281,10 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     /// is also *cost-efficient*.
     // TODO: We might require other compile errors for Taproot.
     #[cfg(feature = "compiler")]
-    pub fn compile_tr(&self, unspendable_key: Option<Pk>) -> Result<Descriptor<Pk>, CompilerError> {
+    pub fn compile_tr(
+        &self,
+        unspendable_key: Option<Pk>,
+    ) -> Result<Descriptor<Pk, NoExt>, CompilerError> {
         self.is_valid().map_err(CompilerError::PolicyError)?;
         self.check_binary_ops()?;
         match self.is_safe_nonmalleable() {
@@ -289,7 +293,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
             _ => {
                 let (internal_key, policy) = self.clone().extract_key(unspendable_key)?;
                 policy.check_num_tapleaves()?;
-                let tree = Descriptor::new_tr(
+                let tree = Tr::new(
                     internal_key,
                     match policy {
                         Self::Trivial => None,
@@ -316,7 +320,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
                     },
                 )
                 .map_err(|_| CompilerError::UncompressedTaprootInternalKey)?;
-                Ok(tree)
+                Ok(Descriptor::Tr(tree))
             }
         }
     }
@@ -334,7 +338,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
         &self,
         unspendable_key: Option<Pk>,
         max_leaves: usize,
-    ) -> Result<Descriptor<Pk>, CompilerError> {
+    ) -> Result<Descriptor<Pk, NoExt>, CompilerError> {
         if max_leaves == 0 {
             return Err(CompilerError::TooManyTapleaves { n: 1, max: 0 });
         }
@@ -381,9 +385,9 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
                         }
                     }
                 };
-                let tree = Descriptor::new_tr(internal_key, tap_tree)
+                let tree = Tr::new(internal_key, tap_tree)
                     .map_err(|_| CompilerError::UncompressedTaprootInternalKey)?;
-                Ok(tree)
+                Ok(Descriptor::Tr(tree))
             }
         }
     }
@@ -410,7 +414,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     pub fn compile_tr_private_experimental(
         &self,
         unspendable_key: Option<Pk>,
-    ) -> Result<Descriptor<Pk>, Error> {
+    ) -> Result<Descriptor<Pk, NoExt>, Error> {
         self.is_valid().map_err(Error::ConcretePolicy)?;
         self.check_binary_ops()?;
         match self.is_safe_nonmalleable() {
@@ -418,7 +422,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
             (_, false) => Err(Error::from(CompilerError::ImpossibleNonMalleableCompilation)),
             _ => {
                 let (internal_key, policy) = self.clone().extract_key(unspendable_key)?;
-                let tree = Descriptor::new_tr(
+                let tree = Tr::new(
                     internal_key,
                     match policy {
                         Self::Trivial => None,
@@ -442,7 +446,7 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
                         }
                     },
                 )?;
-                Ok(tree)
+                Ok(Descriptor::Tr(tree))
             }
         }
     }
@@ -461,17 +465,17 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
     pub fn compile_to_descriptor<Ctx: ScriptContext>(
         &self,
         desc_ctx: DescriptorCtx<Pk>,
-    ) -> Result<Descriptor<Pk>, Error> {
+    ) -> Result<Descriptor<Pk, NoExt>, Error> {
         self.is_valid().map_err(Error::ConcretePolicy)?;
         self.check_binary_ops()?;
         match self.is_safe_nonmalleable() {
             (false, _) => Err(Error::from(CompilerError::TopLevelSigless)),
             (_, false) => Err(Error::from(CompilerError::ImpossibleNonMalleableCompilation)),
             _ => match desc_ctx {
-                DescriptorCtx::Bare => Descriptor::new_bare(compiler::best_compilation(self)?),
-                DescriptorCtx::Sh => Descriptor::new_sh(compiler::best_compilation(self)?),
-                DescriptorCtx::Wsh => Descriptor::new_wsh(compiler::best_compilation(self)?),
-                DescriptorCtx::ShWsh => Descriptor::new_sh_wsh(compiler::best_compilation(self)?),
+                DescriptorCtx::Bare => Ok(Bare::new(compiler::best_compilation(self)?)?.into()),
+                DescriptorCtx::Sh => Ok(Sh::new(compiler::best_compilation(self)?)?.into()),
+                DescriptorCtx::Wsh => Ok(Wsh::new(compiler::best_compilation(self)?)?.into()),
+                DescriptorCtx::ShWsh => Ok(Sh::new_wsh(compiler::best_compilation(self)?)?.into()),
                 DescriptorCtx::Tr(unspendable_key) => self
                     .compile_tr(unspendable_key)
                     .map_err(Error::CompilerError),
@@ -1148,8 +1152,8 @@ fn has_if_fragment<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Tap>) -> bool {
 #[cfg(feature = "compiler")]
 fn with_huffman_tree<Pk: MiniscriptKey>(
     ms: Vec<(PositiveF64, Miniscript<Pk, Tap>)>,
-) -> Result<TapTree<Pk>, TapTreeDepthError> {
-    let mut node_weights = BinaryHeap::<(Reverse<PositiveF64>, TapTree<Pk>)>::new();
+) -> Result<TapTree<Pk, NoExt>, TapTreeDepthError> {
+    let mut node_weights = BinaryHeap::<(Reverse<PositiveF64>, TapTree<Pk, NoExt>)>::new();
     for (prob, script) in ms {
         node_weights.push((Reverse(prob), TapTree::leaf(script)));
     }

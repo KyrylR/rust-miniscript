@@ -11,16 +11,21 @@ mod sat_dissat;
 use core::{cmp, fmt, mem};
 
 use bitcoin::hashes::hash160;
+use bitcoin::hex::DisplayHex as _;
 use bitcoin::key::XOnlyPublicKey;
+use bitcoin::secp256k1::schnorr;
 use bitcoin::{absolute, relative};
 use elements::secp256k1_zkp;
 use elements::taproot::{ControlBlock, LeafVersion, TapLeafHash, TapNodeHash};
 
 use super::context::SigType;
+use crate::extensions::{CsfsMsg, TxEnv};
 use crate::plan::AssetProvider;
 use crate::prelude::*;
 use crate::util::witness_size;
-use crate::{AbsLockTime, Miniscript, MiniscriptKey, RelLockTime, ScriptContext, ToPublicKey};
+use crate::{
+    AbsLockTime, Miniscript, MiniscriptKey, ParseableExt, RelLockTime, ScriptContext, ToPublicKey,
+};
 
 /// Type alias for an ECDSA signature and its Elements sighash type.
 pub type ElementsSig = (secp256k1_zkp::ecdsa::Signature, elements::EcdsaSighashType);
@@ -55,6 +60,12 @@ pub fn elementssig_from_rawsig(rawsig: &[u8]) -> Result<ElementsSig, crate::inte
 pub trait Satisfier<Pk: MiniscriptKey + ToPublicKey> {
     /// Given a public key, look up an ECDSA signature with that key
     fn lookup_ecdsa_sig(&self, _: &Pk) -> Option<ElementsSig> { None }
+
+    /// Looks up the signature for the `elcovwsh` covenant suffix.
+    ///
+    /// It signs a different scriptCode from signatures inside the Miniscript, even when
+    /// both use the same key. Ordinary ECDSA signature maps do not supply this signature.
+    fn lookup_legacy_covenant_sig(&self, _: &Pk) -> Option<ElementsSig> { None }
 
     /// Lookup the tap key spend sig
     fn lookup_tap_key_spend_sig(&self, _: &Pk) -> Option<elements::SchnorrSig> { None }
@@ -128,6 +139,24 @@ pub trait Satisfier<Pk: MiniscriptKey + ToPublicKey> {
     /// simultaneously, satisfaction for that path becomes [`Witness::Impossible`]
     /// and plan building fails or selects another path.
     fn check_after(&self, _: absolute::LockTime) -> bool { false }
+
+    /// The transaction that covenant fragments inspect.
+    fn lookup_tx_env(&self) -> Option<&TxEnv<'_, '_>> { None }
+
+    /// Given the key and message of a `csfs` fragment, look up a signature.
+    fn lookup_csfs_sig(&self, _: &XOnlyPublicKey, _: &CsfsMsg) -> Option<schnorr::Signature> {
+        None
+    }
+
+    /// Given a price oracle key and the earliest timestamp allowed, look up an attestation:
+    /// its signature, price and timestamp.
+    fn lookup_price_oracle_sig(
+        &self,
+        _: &XOnlyPublicKey,
+        _: u64,
+    ) -> Option<(schnorr::Signature, i64, u64)> {
+        None
+    }
 }
 
 // Allow use of `()` as a "no conditions available" satisfier
@@ -292,6 +321,10 @@ impl_satisfier_for_map_hash_tapleafhash_to_key_taproot_sig! {
 impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &S {
     fn lookup_ecdsa_sig(&self, p: &Pk) -> Option<ElementsSig> { (**self).lookup_ecdsa_sig(p) }
 
+    fn lookup_legacy_covenant_sig(&self, p: &Pk) -> Option<ElementsSig> {
+        (**self).lookup_legacy_covenant_sig(p)
+    }
+
     fn lookup_tap_leaf_script_sig(&self, p: &Pk, h: &TapLeafHash) -> Option<elements::SchnorrSig> {
         (**self).lookup_tap_leaf_script_sig(p, h)
     }
@@ -341,11 +374,29 @@ impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &S {
     fn check_older(&self, t: relative::LockTime) -> bool { (**self).check_older(t) }
 
     fn check_after(&self, n: absolute::LockTime) -> bool { (**self).check_after(n) }
+
+    fn lookup_tx_env(&self) -> Option<&TxEnv<'_, '_>> { (**self).lookup_tx_env() }
+
+    fn lookup_csfs_sig(&self, pk: &XOnlyPublicKey, msg: &CsfsMsg) -> Option<schnorr::Signature> {
+        (**self).lookup_csfs_sig(pk, msg)
+    }
+
+    fn lookup_price_oracle_sig(
+        &self,
+        pk: &XOnlyPublicKey,
+        timestamp: u64,
+    ) -> Option<(schnorr::Signature, i64, u64)> {
+        (**self).lookup_price_oracle_sig(pk, timestamp)
+    }
 }
 
 impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &mut S {
     fn lookup_ecdsa_sig(&self, p: &Pk) -> Option<ElementsSig> { (**self).lookup_ecdsa_sig(p) }
 
+    fn lookup_legacy_covenant_sig(&self, p: &Pk) -> Option<ElementsSig> {
+        (**self).lookup_legacy_covenant_sig(p)
+    }
+
     fn lookup_tap_leaf_script_sig(&self, p: &Pk, h: &TapLeafHash) -> Option<elements::SchnorrSig> {
         (**self).lookup_tap_leaf_script_sig(p, h)
     }
@@ -395,6 +446,20 @@ impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &mut S
     fn check_older(&self, t: relative::LockTime) -> bool { (**self).check_older(t) }
 
     fn check_after(&self, n: absolute::LockTime) -> bool { (**self).check_after(n) }
+
+    fn lookup_tx_env(&self) -> Option<&TxEnv<'_, '_>> { (**self).lookup_tx_env() }
+
+    fn lookup_csfs_sig(&self, pk: &XOnlyPublicKey, msg: &CsfsMsg) -> Option<schnorr::Signature> {
+        (**self).lookup_csfs_sig(pk, msg)
+    }
+
+    fn lookup_price_oracle_sig(
+        &self,
+        pk: &XOnlyPublicKey,
+        timestamp: u64,
+    ) -> Option<(schnorr::Signature, i64, u64)> {
+        (**self).lookup_price_oracle_sig(pk, timestamp)
+    }
 }
 
 macro_rules! impl_tuple_satisfier {
@@ -409,6 +474,16 @@ macro_rules! impl_tuple_satisfier {
                 let &($(ref $ty,)*) = self;
                 $(
                     if let Some(result) = $ty.lookup_ecdsa_sig(key) {
+                        return Some(result);
+                    }
+                )*
+                None
+            }
+
+            fn lookup_legacy_covenant_sig(&self, key: &Pk) -> Option<ElementsSig> {
+                let &($(ref $ty,)*) = self;
+                $(
+                    if let Some(result) = $ty.lookup_legacy_covenant_sig(key) {
                         return Some(result);
                     }
                 )*
@@ -557,6 +632,44 @@ macro_rules! impl_tuple_satisfier {
                 )*
                 false
             }
+
+            fn lookup_tx_env(&self) -> Option<&TxEnv<'_, '_>> {
+                let &($(ref $ty,)*) = self;
+                $(
+                    if let Some(result) = $ty.lookup_tx_env() {
+                        return Some(result);
+                    }
+                )*
+                None
+            }
+
+            fn lookup_csfs_sig(
+                &self,
+                pk: &XOnlyPublicKey,
+                msg: &CsfsMsg,
+            ) -> Option<schnorr::Signature> {
+                let &($(ref $ty,)*) = self;
+                $(
+                    if let Some(result) = $ty.lookup_csfs_sig(pk, msg) {
+                        return Some(result);
+                    }
+                )*
+                None
+            }
+
+            fn lookup_price_oracle_sig(
+                &self,
+                pk: &XOnlyPublicKey,
+                timestamp: u64,
+            ) -> Option<(schnorr::Signature, i64, u64)> {
+                let &($(ref $ty,)*) = self;
+                $(
+                    if let Some(result) = $ty.lookup_price_oracle_sig(pk, timestamp) {
+                        return Some(result);
+                    }
+                )*
+                None
+            }
         }
     }
 }
@@ -620,6 +733,10 @@ pub enum Placeholder<Pk: MiniscriptKey> {
     TapScript(elements::Script),
     /// Taproot control block
     TapControlBlock(ControlBlock),
+    /// Signature of a `csfs` fragment, given its key and message
+    CsfsSig(XOnlyPublicKey, CsfsMsg),
+    /// Known data, such as a price oracle attestation
+    Data(Vec<u8>),
 }
 
 impl<Pk: MiniscriptKey> fmt::Display for Placeholder<Pk> {
@@ -653,6 +770,8 @@ impl<Pk: MiniscriptKey> fmt::Display for Placeholder<Pk> {
                 "TapControlBlock(control_block: {})",
                 bitcoin::consensus::encode::serialize_hex(&control_block.serialize())
             ),
+            CsfsSig(pk, msg) => write!(f, "CsfsSig(pk: {}, msg: {})", pk, msg),
+            Data(data) => write!(f, "Data({})", data.as_hex()),
         }
     }
 }
@@ -712,6 +831,8 @@ impl<Pk: MiniscriptKey + ToPublicKey> Placeholder<Pk> {
             Self::PushOne => Some(vec![1]),
             Self::TapScript(s) => Some(s.to_bytes()),
             Self::TapControlBlock(cb) => Some(cb.serialize()),
+            Self::CsfsSig(pk, msg) => sat.lookup_csfs_sig(pk, msg).map(|s| s.serialize().to_vec()),
+            Self::Data(data) => Some(data.clone()),
         }
     }
 }
@@ -960,8 +1081,8 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
         }
     }
 
-    pub(crate) fn build_template<P, Ctx>(
-        node: &Miniscript<Pk, Ctx>,
+    pub(crate) fn build_template<P, Ctx, Ext>(
+        node: &Miniscript<Pk, Ctx, Ext>,
         provider: &P,
         root_has_sig: bool,
         leaf_hash: Option<TapLeafHash>,
@@ -969,12 +1090,13 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
     where
         Ctx: ScriptContext,
         P: AssetProvider<Pk>,
+        Ext: ParseableExt,
     {
         Self::sat_dissat(node, provider, false, root_has_sig, leaf_hash).sat
     }
 
-    pub(crate) fn build_template_mall<P, Ctx>(
-        node: &Miniscript<Pk, Ctx>,
+    pub(crate) fn build_template_mall<P, Ctx, Ext>(
+        node: &Miniscript<Pk, Ctx, Ext>,
         provider: &P,
         root_has_sig: bool,
         leaf_hash: Option<TapLeafHash>,
@@ -982,6 +1104,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
     where
         Ctx: ScriptContext,
         P: AssetProvider<Pk>,
+        Ext: ParseableExt,
     {
         Self::sat_dissat(node, provider, true, root_has_sig, leaf_hash).sat
     }
@@ -1189,8 +1312,8 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
 
 impl Satisfaction<Vec<u8>> {
     /// Produce a satisfaction non-malleable satisfaction
-    pub(super) fn satisfy<Ctx, Pk, Sat>(
-        node: &Miniscript<Pk, Ctx>,
+    pub(super) fn satisfy<Ctx, Pk, Sat, Ext>(
+        node: &Miniscript<Pk, Ctx, Ext>,
         stfr: &Sat,
         root_has_sig: bool,
         leaf_hash: Option<TapLeafHash>,
@@ -1199,6 +1322,7 @@ impl Satisfaction<Vec<u8>> {
         Ctx: ScriptContext,
         Pk: MiniscriptKey + ToPublicKey,
         Sat: Satisfier<Pk>,
+        Ext: ParseableExt,
     {
         Satisfaction::<Placeholder<Pk>>::build_template(node, &stfr, root_has_sig, leaf_hash)
             .try_completing(stfr)
@@ -1206,8 +1330,8 @@ impl Satisfaction<Vec<u8>> {
     }
 
     /// Produce a satisfaction(possibly malleable)
-    pub(super) fn satisfy_mall<Ctx, Pk, Sat>(
-        node: &Miniscript<Pk, Ctx>,
+    pub(super) fn satisfy_mall<Ctx, Pk, Sat, Ext>(
+        node: &Miniscript<Pk, Ctx, Ext>,
         stfr: &Sat,
         root_has_sig: bool,
         leaf_hash: Option<TapLeafHash>,
@@ -1216,6 +1340,7 @@ impl Satisfaction<Vec<u8>> {
         Ctx: ScriptContext,
         Pk: MiniscriptKey + ToPublicKey,
         Sat: Satisfier<Pk>,
+        Ext: ParseableExt,
     {
         Satisfaction::<Placeholder<Pk>>::build_template_mall(node, &stfr, root_has_sig, leaf_hash)
             .try_completing(stfr)

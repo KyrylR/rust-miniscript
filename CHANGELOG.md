@@ -11,6 +11,13 @@ See the [migration notes](doc/migration.md) for upgrading from 0.5.
 - Tweak pegin federation keys with the claim scriptPubKey as Elements does.
   This changes legacy pegin addresses and some dynamic federation addresses.
   Claim scripts longer than 100 bytes are rejected.
+- Integrate CSFS, arithmetic and introspection fragments with validation,
+  planning and interpretation. Message signatures and price attestations do not
+  count as transaction signatures in safety checks.
+- Support `elcovwsh` with authenticated covenant preimages and separate signature
+  checks for the inner script and covenant suffix.
+- Check issuance presence before reading its amounts, preventing witness items
+  from replacing absent issuance data.
 - Add rust-miniscript's default `std` feature. Dependencies require the standard
   library even when it is disabled.
 

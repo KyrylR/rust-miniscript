@@ -20,6 +20,7 @@ use elements::taproot::LeafVersion;
 use elements::{Script, TxOut, Witness};
 
 use super::{partial_sigs, sanity_check, Error, InputError, Psbt, PsbtInputSatisfier};
+use crate::extensions::{CovExtArgs, CovenantExt, TxEnv};
 use crate::prelude::*;
 use crate::util::witness_size;
 use crate::{
@@ -33,6 +34,7 @@ use crate::{
 // inferring a descriptor is not possible
 fn construct_tap_witness(
     sat: &PsbtInputSatisfier,
+    env: &TxEnv,
     allow_mall: bool,
 ) -> Result<Vec<Vec<u8>>, InputError> {
     // When miniscript tries to finalize the PSBT, it doesn't have the full descriptor (which contained a pkh() fragment)
@@ -61,17 +63,20 @@ fn construct_tap_witness(
                 // We don't know how to satisfy non default version scripts yet
                 continue;
             }
-            let ms = match Miniscript::<XOnlyPublicKey, Tap>::decode_consensus(script) {
-                Ok(ms) => ms.substitute_raw_pkh(&map),
-                Err(..) => continue, // try another script
-            };
+            let ms =
+                match Miniscript::<XOnlyPublicKey, Tap, CovenantExt<CovExtArgs>>::decode_consensus(
+                    script,
+                ) {
+                    Ok(ms) => ms.substitute_raw_pkh(&map),
+                    Err(..) => continue, // try another script
+                };
             let mut wit = if allow_mall {
-                match ms.satisfy_malleable(sat) {
+                match ms.satisfy_malleable((sat, env)) {
                     Ok(ms) => ms,
                     Err(..) => continue,
                 }
             } else {
-                match ms.satisfy(sat) {
+                match ms.satisfy((sat, env)) {
                     Ok(ms) => ms,
                     Err(..) => continue,
                 }
@@ -191,6 +196,11 @@ fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, In
                     witness_script: witness_script.clone(),
                     p2wsh_expected: script_pubkey.clone(),
                 });
+            }
+            if let Ok(cov) =
+                crate::descriptor::csfs_cov::LegacyCSFSCov::decode_consensus(witness_script)
+            {
+                return Ok(Descriptor::LegacyCSFSCov(cov));
             }
             let ms = Miniscript::<bitcoin::PublicKey, Segwitv0>::decode_consensus(witness_script)?;
             Ok(Descriptor::new_wsh(ms.substitute_raw_pkh(&map))?)
@@ -389,31 +399,37 @@ fn finalize_input_helper<C: secp256k1::Verification>(
     genesis_hash: elements::BlockHash,
     tx: &elements::Transaction,
 ) -> Result<(Witness, Script), super::Error> {
+    let utxos = prevouts(psbt)?;
+    let env = TxEnv::from_refs(tx, &utxos, index)
+        .ok_or(Error::InputError(InputError::MissingUtxo, index))?;
     let (witness, script_sig) = {
         let spk = get_scriptpubkey(psbt, index).map_err(|e| Error::InputError(e, index))?;
-        let sat = PsbtInputSatisfier::new(psbt, index);
-
         if spk.is_v1_p2tr() {
+            let sat = PsbtInputSatisfier { psbt, index, legacy_covenant_key: None };
             // Deal with tr case separately, unfortunately we cannot infer the full descriptor for Tr
-            let wit =
-                construct_tap_witness(&sat, allow_mall).map_err(|e| Error::InputError(e, index))?;
+            let wit = construct_tap_witness(&sat, &env, allow_mall)
+                .map_err(|e| Error::InputError(e, index))?;
             (wit, Script::new())
         } else {
             // Get a descriptor for this input.
             let desc = get_descriptor(psbt, index).map_err(|e| Error::InputError(e, index))?;
+            let legacy_covenant_key = match &desc {
+                Descriptor::LegacyCSFSCov(cov) => Some(*cov.pk()),
+                _ => None,
+            };
+            let sat = PsbtInputSatisfier { psbt, index, legacy_covenant_key };
 
             //generate the satisfaction witness and scriptsig
             if !allow_mall {
-                desc.get_satisfaction(sat)
+                desc.get_satisfaction((sat, &env))
             } else {
-                desc.get_satisfaction_mall(sat)
+                desc.get_satisfaction_mall((sat, &env))
             }
             .map_err(|e| Error::InputError(InputError::MiniscriptError(e), index))?
         }
     };
 
     let witness = Witness::from_slice(&witness);
-    let utxos = prevouts(psbt)?;
     let utxos = &Prevouts::All(&utxos);
     interpreter_inp_check(psbt, secp, index, utxos, &witness, &script_sig, tx, genesis_hash)?;
 

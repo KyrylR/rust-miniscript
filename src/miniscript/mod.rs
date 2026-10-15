@@ -12,6 +12,7 @@
 //! components of the AST.
 //!
 
+use core::marker::PhantomData;
 use core::{hash, str};
 
 use bitcoin::hashes::hash160;
@@ -19,6 +20,7 @@ use bitcoin::script;
 use elements::taproot::{LeafVersion, TapLeafHash};
 
 pub use self::context::{BareCtx, Legacy, Segwitv0, Tap};
+use crate::extensions::{ExtTranslator, Extension, ParseableExt};
 use crate::iter::{StackExt as _, TreeLike};
 use crate::prelude::*;
 use crate::{script_num_size, TranslateErr};
@@ -58,14 +60,14 @@ mod private {
     use crate::iter::{StackExt as _, TreeLike as _};
     use crate::prelude::sync::Arc;
     use crate::{
-        AbsLockTime, Error, MiniscriptKey, RelLockTime, Terminal, ValidationError,
-        ValidationParams, MAX_RECURSION_DEPTH,
+        AbsLockTime, Error, Extension, MiniscriptKey, NoExt, RelLockTime, Terminal,
+        ValidationError, ValidationParams, MAX_RECURSION_DEPTH,
     };
 
     /// The top-level miniscript abstract syntax tree (AST).
-    pub struct Miniscript<Pk: MiniscriptKey, Ctx: ScriptContext> {
+    pub struct Miniscript<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension = NoExt> {
         /// A node in the AST.
-        pub node: Terminal<Pk, Ctx>,
+        pub node: Terminal<Pk, Ctx, Ext>,
         /// The correctness and malleability type information for the AST node.
         pub ty: types::Type,
         /// Additional information helpful for extra analysis.
@@ -74,7 +76,7 @@ mod private {
         phantom: PhantomData<Ctx>,
     }
 
-    impl<Pk: MiniscriptKey, Ctx: ScriptContext> Clone for Miniscript<Pk, Ctx> {
+    impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Clone for Miniscript<Pk, Ctx, Ext> {
         /// We implement clone as a "deep clone" which reconstructs the entire tree.
         ///
         /// If users just want to clone Arcs they can use Arc::clone themselves.
@@ -121,6 +123,7 @@ mod private {
                     Terminal::SortedMulti(ref thresh) => Terminal::SortedMulti(thresh.clone()),
                     Terminal::MultiA(ref thresh) => Terminal::MultiA(thresh.clone()),
                     Terminal::SortedMultiA(ref thresh) => Terminal::SortedMultiA(thresh.clone()),
+                    Terminal::Ext(ref e) => Terminal::Ext(e.clone()),
                 };
 
                 stack.push(Arc::new(Self {
@@ -136,7 +139,7 @@ mod private {
         }
     }
 
-    impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+    impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
         /// The `1` combinator.
         pub const TRUE: Self = Self {
             node: Terminal::True,
@@ -312,7 +315,7 @@ mod private {
         /// Add type information(Type and Extdata) to Miniscript based on
         /// `AstElem` fragment. Dependent on display and clone because of Error
         /// Display code of type_check.
-        pub fn from_ast(t: Terminal<Pk, Ctx>) -> Result<Self, Error> {
+        pub fn from_ast(t: Terminal<Pk, Ctx, Ext>) -> Result<Self, Error> {
             let res = Self {
                 ty: Type::type_check(&t)?,
                 ext: ExtData::type_check(&t),
@@ -337,7 +340,7 @@ mod private {
         ///
         /// You should almost always use `Miniscript::from_ast` instead of this function.
         pub fn from_components_unchecked(
-            node: Terminal<Pk, Ctx>,
+            node: Terminal<Pk, Ctx, Ext>,
             ty: types::Type,
             ext: types::extra_props::ExtData,
         ) -> Self {
@@ -444,6 +447,9 @@ mod private {
                     Terminal::RawPkH(..) if !params.allow_raw_pkh => {
                         return Err(ValidationError::IllegalRawPkh)
                     }
+                    Terminal::Ext(..) if !params.allow_extensions => {
+                        return Err(ValidationError::IllegalExtension)
+                    }
                     Terminal::PkK(ref pk) | Terminal::PkH(ref pk) => {
                         params.validate_pk(pk).map_err(ValidationError::Key)?;
                         multipath_check(pk)?;
@@ -512,17 +518,18 @@ mod private {
 
 pub use private::Miniscript;
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
     /// Extracts the `AstElem` representing the root of the miniscript
-    pub fn into_inner(self) -> Terminal<Pk, Ctx> { self.node }
+    pub fn into_inner(self) -> Terminal<Pk, Ctx, Ext> { self.node }
 
     /// Get a reference to the inner `AstElem` representing the root of miniscript
-    pub fn as_inner(&self) -> &Terminal<Pk, Ctx> { &self.node }
+    pub fn as_inner(&self) -> &Terminal<Pk, Ctx, Ext> { &self.node }
 
     /// Encode as an Elements script
     pub fn encode(&self) -> elements::Script
     where
         Pk: ToPublicKey,
+        Ext: ParseableExt,
     {
         self.node
             .encode(elements::script::Builder::new())
@@ -573,6 +580,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
                         + thresh.iter().map(|pk| Ctx::pk_len(pk)).sum::<usize>() // n keys
                         + thresh.n() // n times CHECKSIGADD
                 }
+                Terminal::Ext(..) => ms.ext.pk_cost,
             }
         }
         len
@@ -609,7 +617,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     }
 
     #[allow(unsafe_code)]
-    fn downcast<NarrowedCtx: ScriptContext>(&self) -> Option<&Miniscript<Pk, NarrowedCtx>> {
+    fn downcast<NarrowedCtx: ScriptContext>(&self) -> Option<&Miniscript<Pk, NarrowedCtx, Ext>> {
         use core::any::TypeId;
         if TypeId::of::<Ctx>() == TypeId::of::<NarrowedCtx>() {
             // SAFETY: this pointer cast is a no-op, as guaranteed by the if guard
@@ -624,8 +632,10 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     fn leaf_hash_internal(&self) -> Option<TapLeafHash>
     where
         Pk: ToPublicKey,
+        Ext: ParseableExt,
     {
-        self.downcast::<Tap>().map(Miniscript::<Pk, Tap>::leaf_hash)
+        self.downcast::<Tap>()
+            .map(Miniscript::<Pk, Tap, Ext>::leaf_hash)
     }
 
     /// Attempt to produce non-malleable satisfying witness for the
@@ -633,6 +643,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     pub fn satisfy<S: satisfy::Satisfier<Pk>>(&self, satisfier: S) -> Result<Vec<Vec<u8>>, Error>
     where
         Pk: ToPublicKey,
+        Ext: ParseableExt,
     {
         // Only satisfactions for default versions (0xc0) are allowed.
         let satisfaction = satisfy::Satisfaction::satisfy(
@@ -652,6 +663,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     ) -> Result<Vec<Vec<u8>>, Error>
     where
         Pk: ToPublicKey,
+        Ext: ParseableExt,
     {
         let satisfaction = satisfy::Satisfaction::satisfy_mall(
             self,
@@ -681,6 +693,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     ) -> satisfy::Satisfaction<satisfy::Placeholder<Pk>>
     where
         Pk: ToPublicKey,
+        Ext: ParseableExt,
     {
         satisfy::Satisfaction::build_template(
             self,
@@ -697,6 +710,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     ) -> satisfy::Satisfaction<satisfy::Placeholder<Pk>>
     where
         Pk: ToPublicKey,
+        Ext: ParseableExt,
     {
         satisfy::Satisfaction::build_template_mall(
             self,
@@ -707,7 +721,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     }
 }
 
-impl<Pk: ToPublicKey> Miniscript<Pk, Tap> {
+impl<Pk: ToPublicKey, Ext: ParseableExt> Miniscript<Pk, Tap, Ext> {
     /// Returns the leaf hash used within a Taproot signature for this script.
     ///
     /// Note that this method is only implemented for Taproot Miniscripts.
@@ -716,7 +730,7 @@ impl<Pk: ToPublicKey> Miniscript<Pk, Tap> {
     }
 }
 
-impl<Ctx: ScriptContext> Miniscript<Ctx::Key, Ctx> {
+impl<Ctx: ScriptContext, Ext: ParseableExt> Miniscript<Ctx::Key, Ctx, Ext> {
     /// Attempt to decode a Miniscript from Script, checking only for consensus compatibility,
     /// and no other checks.
     ///
@@ -792,37 +806,43 @@ impl<Ctx: ScriptContext> Miniscript<Ctx::Key, Ctx> {
 /// `PartialOrd` of `Miniscript` must depend only on node and not the type information.
 ///
 /// The type information and extra properties are implied by the AST.
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> PartialOrd for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> PartialOrd
+    for Miniscript<Pk, Ctx, Ext>
+{
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> { Some(self.cmp(other)) }
 }
 
 /// `Ord` of `Miniscript` must depend only on node and not the type information.
 ///
 /// The type information and extra properties are implied by the AST.
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Ord for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Ord for Miniscript<Pk, Ctx, Ext> {
     fn cmp(&self, other: &Self) -> cmp::Ordering { self.node.cmp(&other.node) }
 }
 
 /// `PartialEq` of `Miniscript` must depend only on node and not the type information.
 ///
 /// The type information and extra properties are implied by the AST.
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> PartialEq for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> PartialEq for Miniscript<Pk, Ctx, Ext> {
     fn eq(&self, other: &Self) -> bool { self.node.eq(&other.node) }
 }
 
 /// `Eq` of `Miniscript` must depend only on node and not the type information.
 ///
 /// The type information and extra properties are implied by the AST.
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Eq for Miniscript<Pk, Ctx> {}
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Eq for Miniscript<Pk, Ctx, Ext> {}
 
 /// `Hash` of `Miniscript` must depend only on node and not the type information.
 ///
 /// The type information and extra properties are implied by the AST.
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> hash::Hash for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> hash::Hash
+    for Miniscript<Pk, Ctx, Ext>
+{
     fn hash<H: hash::Hasher>(&self, state: &mut H) { self.node.hash(state); }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> ForEachKey<Pk> for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> ForEachKey<Pk>
+    for Miniscript<Pk, Ctx, Ext>
+{
     fn for_each_key<'a, F: FnMut(&'a Pk) -> bool>(&'a self, mut pred: F) -> bool {
         for ms in self.pre_order_iter() {
             match ms.node {
@@ -851,26 +871,70 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> ForEachKey<Pk> for Miniscript<Pk, Ct
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+// Keeps keys and hashes, for translations of extensions only.
+struct KeepKeys<E>(PhantomData<E>);
+
+impl<Pk: MiniscriptKey, E> Translator<Pk> for KeepKeys<E> {
+    type TargetPk = Pk;
+    type Error = E;
+
+    fn pk(&mut self, pk: &Pk) -> Result<Pk, E> { Ok(pk.clone()) }
+
+    fn sha256(&mut self, hash: &Pk::Sha256) -> Result<Pk::Sha256, E> { Ok(hash.clone()) }
+
+    fn hash256(&mut self, hash: &Pk::Hash256) -> Result<Pk::Hash256, E> { Ok(hash.clone()) }
+
+    fn ripemd160(&mut self, hash: &Pk::Ripemd160) -> Result<Pk::Ripemd160, E> { Ok(hash.clone()) }
+
+    fn hash160(&mut self, hash: &Pk::Hash160) -> Result<Pk::Hash160, E> { Ok(hash.clone()) }
+}
+
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
     /// Translates a struct from one generic to another where the translation
     /// for Pk is provided by [`Translator`]
     pub fn translate_pk<T>(
         &self,
         t: &mut T,
-    ) -> Result<Miniscript<T::TargetPk, Ctx>, TranslateErr<T::Error>>
+    ) -> Result<Miniscript<T::TargetPk, Ctx, Ext>, TranslateErr<T::Error>>
     where
         T: Translator<Pk>,
     {
         self.translate_pk_ctx(t)
     }
 
+    /// Translates the extensions with [`ExtTranslator`], keeping the keys.
+    pub fn translate_ext<T>(
+        &self,
+        t: &mut T,
+    ) -> Result<Miniscript<Pk, Ctx, T::TargetExt>, TranslateErr<T::Error>>
+    where
+        T: ExtTranslator<Ext>,
+    {
+        self.translate_ctx(&mut KeepKeys(PhantomData), |e| t.ext(e))
+    }
+
     pub(super) fn translate_pk_ctx<CtxQ, T>(
         &self,
         t: &mut T,
-    ) -> Result<Miniscript<T::TargetPk, CtxQ>, TranslateErr<T::Error>>
+    ) -> Result<Miniscript<T::TargetPk, CtxQ, Ext>, TranslateErr<T::Error>>
     where
         CtxQ: ScriptContext,
         T: Translator<Pk>,
+    {
+        self.translate_ctx(t, |e| Ok(e.clone()))
+    }
+
+    /// Translates the keys with `t` and the extensions with `ext`, into the context `CtxQ`.
+    pub(crate) fn translate_ctx<CtxQ, T, QExt, F>(
+        &self,
+        t: &mut T,
+        mut ext: F,
+    ) -> Result<Miniscript<T::TargetPk, CtxQ, QExt>, TranslateErr<T::Error>>
+    where
+        CtxQ: ScriptContext,
+        T: Translator<Pk>,
+        QExt: Extension,
+        F: FnMut(&Ext) -> Result<QExt, TranslateErr<T::Error>>,
     {
         let mut translated = vec![];
         for data in self.post_order_iter() {
@@ -911,6 +975,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
                 Terminal::SortedMultiA(ref thresh) => {
                     Terminal::SortedMultiA(thresh.translate_ref(|k| t.pk(k))?)
                 }
+                Terminal::Ext(ref e) => Terminal::Ext(ext(e)?),
             };
             let new_ms = Miniscript::from_ast(new_term).map_err(TranslateErr::OuterError)?;
             translated.push(Arc::new(new_ms));
@@ -958,6 +1023,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
                 Terminal::SortedMulti(ref thresh) => Terminal::SortedMulti(thresh.clone()),
                 Terminal::MultiA(ref thresh) => Terminal::MultiA(thresh.clone()),
                 Terminal::SortedMultiA(ref thresh) => Terminal::SortedMultiA(thresh.clone()),
+                Terminal::Ext(ref e) => Terminal::Ext(e.clone()),
             };
 
             stack.push(Arc::new(Self::from_components_unchecked(
@@ -972,7 +1038,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     }
 }
 
-impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+impl<Pk: FromStrKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
     /// Attempt to parse a Miniscript, checking only for consensus compatibility,
     /// lack of raw pubkeyhashes, and no other checks.
     ///
@@ -996,10 +1062,45 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     }
 }
 
-impl<Pk: FromStrKey, Ctx: ScriptContext> FromTree for Arc<Miniscript<Pk, Ctx>> {
+impl<Pk: FromStrKey, Ctx: ScriptContext, Ext: Extension> FromTree
+    for Arc<Miniscript<Pk, Ctx, Ext>>
+{
     fn from_tree(root: TreeIterItem) -> Result<Self, Error> {
         Miniscript::from_tree(root).map(Self::new)
     }
+}
+
+// Whether `name` is a base fragment, as parsed by `Miniscript::from_tree`.
+fn is_base_fragment(name: &str) -> bool {
+    matches!(
+        name,
+        "expr_raw_pkh"
+            | "pk"
+            | "pkh"
+            | "pk_k"
+            | "pk_h"
+            | "after"
+            | "older"
+            | "sha256"
+            | "hash256"
+            | "ripemd160"
+            | "hash160"
+            | "1"
+            | "0"
+            | "and_v"
+            | "and_b"
+            | "and_n"
+            | "andor"
+            | "or_b"
+            | "or_d"
+            | "or_c"
+            | "or_i"
+            | "thresh"
+            | "multi"
+            | "sortedmulti"
+            | "multi_a"
+            | "sortedmulti_a"
+    )
 }
 
 // The wrappers and the fragment name of `node`, without `prefix` if `node` is `root`.
@@ -1018,13 +1119,31 @@ fn split_name<'s>(
     })
 }
 
-impl<Pk: FromStrKey, Ctx: ScriptContext> FromTree for Miniscript<Pk, Ctx> {
+// Whether `node`, which is not below an extension, is a fragment of the Miniscript at `root`
+// rather than an argument of a base fragment.
+fn is_fragment(root: TreeIterItem, prefix: &str, node: TreeIterItem) -> bool {
+    if node.index() == root.index() {
+        return true;
+    }
+    match node.parent().map(|parent| split_name(root, prefix, parent)) {
+        Some(Ok((_, "thresh"))) => !node.is_first_child(),
+        Some(Ok((_, name))) => {
+            matches!(
+                name,
+                "and_v" | "and_b" | "and_n" | "andor" | "or_b" | "or_d" | "or_c" | "or_i"
+            )
+        }
+        _ => false,
+    }
+}
+
+impl<Pk: FromStrKey, Ctx: ScriptContext, Ext: Extension> FromTree for Miniscript<Pk, Ctx, Ext> {
     fn from_tree(root: TreeIterItem) -> Result<Self, Error> {
         Self::from_tree_with_root_prefix(root, "")
     }
 }
 
-impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+impl<Pk: FromStrKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
     /// Parses the Miniscript at `root` as [`FromTree::from_tree`] does, ignoring `prefix` at the
     /// start of the name of `root`, as in the bare descriptor `elpk(KEY)`.
     pub(crate) fn from_tree_with_root_prefix(
@@ -1032,12 +1151,15 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
         prefix: &str,
     ) -> Result<Self, Error> {
         #[allow(clippy::type_complexity)]
-        fn binary<Pk: MiniscriptKey, Ctx: ScriptContext>(
+        fn binary<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension>(
             node: expression::TreeIterItem,
-            stack: &mut Vec<Arc<Miniscript<Pk, Ctx>>>,
+            stack: &mut Vec<Arc<Miniscript<Pk, Ctx, Ext>>>,
             name: &'static str,
-            termfn: fn(Arc<Miniscript<Pk, Ctx>>, Arc<Miniscript<Pk, Ctx>>) -> Terminal<Pk, Ctx>,
-        ) -> Result<Miniscript<Pk, Ctx>, Error> {
+            termfn: fn(
+                Arc<Miniscript<Pk, Ctx, Ext>>,
+                Arc<Miniscript<Pk, Ctx, Ext>>,
+            ) -> Terminal<Pk, Ctx, Ext>,
+        ) -> Result<Miniscript<Pk, Ctx, Ext>, Error> {
             node.verify_n_children(name, 2..=2)
                 .map_err(From::from)
                 .map_err(Error::Parse)?;
@@ -1047,8 +1169,37 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
             .map_err(From::from)
             .map_err(Error::Parse)?;
 
+        // Extension fragments are parsed whole here, recording the node index range they
+        // cover; their arguments are not Miniscript fragments. Base fragment names take
+        // precedence, and malformed names are reported by the loop below.
+        let mut exts = vec![];
+        if Ext::HAS_FRAGMENTS {
+            let mut iter = root.pre_order_iter();
+            while let Some(node) = iter.next() {
+                let frag_name = match split_name(root, prefix, node) {
+                    Ok((_, frag_name))
+                        if !is_base_fragment(frag_name) && is_fragment(root, prefix, node) =>
+                    {
+                        frag_name
+                    }
+                    _ => continue,
+                };
+                if let Some(ext) = Ext::from_tree(frag_name, node) {
+                    exts.push((node.index(), node.index() + node.pre_order_iter().len() - 1, ext?));
+                    iter.skip_descendants();
+                }
+            }
+        }
+
         let mut stack = Vec::with_capacity(128);
         for (n, node) in root.pre_order_iter().enumerate().rev() {
+            if exts
+                .last()
+                .is_some_and(|&(start, end, _)| start < node.index() && node.index() <= end)
+            {
+                continue;
+            }
+
             // Before doing anything else, check if this is the inner value of a terminal.
             // In that case, just skip the node. Conveniently, there are no combinators
             // in Miniscript that have a single child that these might be confused with.
@@ -1173,11 +1324,14 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
                     .verify_threshold(|sub| sub.verify_terminal("public_key").map_err(Error::Parse))
                     .map(Terminal::SortedMultiA)
                     .and_then(Self::from_ast),
-                x => {
-                    Err(Error::Parse(crate::ParseError::Tree(crate::ParseTreeError::UnknownName {
-                        name: x.to_owned(),
-                    })))
-                }
+                x => match exts.pop() {
+                    Some((start, _, ext)) if start == node.index() => {
+                        Self::from_ast(Terminal::Ext(ext))
+                    }
+                    _ => Err(Error::Parse(crate::ParseError::Tree(
+                        crate::ParseTreeError::UnknownName { name: x.to_owned() },
+                    ))),
+                },
             }?;
 
             let mut new = Arc::new(new);
@@ -1223,7 +1377,7 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     }
 }
 
-impl<Pk: FromStrKey, Ctx: ScriptContext> str::FromStr for Miniscript<Pk, Ctx> {
+impl<Pk: FromStrKey, Ctx: ScriptContext, Ext: Extension> str::FromStr for Miniscript<Pk, Ctx, Ext> {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Error> {
         let ms = Self::from_str_with_validation_params(s, &Ctx::SANE)?;
@@ -1231,7 +1385,7 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> str::FromStr for Miniscript<Pk, Ctx> {
     }
 }
 
-serde_string_impl_pk!(Miniscript, "a miniscript", Ctx; ScriptContext);
+serde_string_impl_pk!(Miniscript, "a miniscript", Ctx; ScriptContext, Ext; Extension);
 
 /// Provides a Double SHA256 `Hash` type that displays forwards.
 pub mod hash256 {
@@ -2303,5 +2457,104 @@ mod tests {
         assert!(!signed_but_malleable.is_non_malleable());
         assert!(!signed_but_malleable.non_malleable_and_requires_sig());
         assert_eq!(signed_but_malleable.ty.to_string(), "B/ndu");
+    }
+
+    // An extension claiming every name it is offered, with at most one argument. `legacy` is
+    // valid in Segwit v0 only, and every other fragment in Tapscript only.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+    struct Probe(String);
+
+    impl core::fmt::Display for Probe {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result { f.write_str(&self.0) }
+    }
+
+    impl Extension for Probe {
+        fn ty(&self) -> types::Type { types::Type::FALSE }
+
+        fn ext_data(&self) -> types::ExtData { types::ExtData::FALSE }
+
+        fn segwit_v0_allowed(&self) -> bool { self.0 == "legacy" }
+
+        fn tap_allowed(&self) -> bool { self.0 != "legacy" }
+
+        fn from_tree(name: &str, node: TreeIterItem) -> Option<Result<Self, Error>> {
+            Some(Ok(Self(match node.first_child() {
+                Some(arg) => format!("{}({})", name, arg.name()),
+                None => name.to_owned(),
+            })))
+        }
+    }
+
+    type ProbeMs<Ctx> = Miniscript<String, Ctx, Probe>;
+
+    fn has_ext<Ctx: ScriptContext>(ms: &ProbeMs<Ctx>) -> bool {
+        ms.iter()
+            .any(|ms| matches!(ms.as_inner(), Terminal::Ext(_)))
+    }
+
+    #[test]
+    fn extensions_never_take_base_names_or_arguments() {
+        for s in [
+            "and_v(v:pk(A),pk(B))",
+            "andor(0,1,1)",
+            "thresh(1,0,a:0)",
+            "or_i(pk(A),multi_a(1,B))",
+            "pk(nullary)",
+        ] {
+            let ms = ProbeMs::<Tap>::from_str_insane(s).unwrap();
+            assert_eq!(ms.to_string(), s);
+            assert!(!has_ext(&ms), "{}", s);
+        }
+    }
+
+    #[test]
+    fn extensions_parse_at_any_fragment_position() {
+        for s in [
+            "nullary",
+            "and_v(v:nullary,nullary)",
+            "or_b(nullary,a:probe(A))",
+            "thresh(1,nullary,a:nullary)",
+            "andor(nullary,probe(1),nullary)",
+        ] {
+            let ms = ProbeMs::<Tap>::from_str_insane(s).unwrap();
+            assert_eq!(ms.to_string(), s);
+            assert!(has_ext(&ms), "{}", s);
+        }
+        let nullary = ProbeMs::<Tap>::from_ast(Terminal::Ext(Probe("nullary".into()))).unwrap();
+        assert_eq!(ProbeMs::<Tap>::from_str_insane(&nullary.to_string()).unwrap(), nullary);
+    }
+
+    #[test]
+    fn extensions_check_their_context() {
+        fn not_allowed<T>(res: Result<T, Error>) -> bool {
+            matches!(
+                res,
+                Err(Error::ContextError(context::ScriptContextError::ExtensionNotAllowed))
+            )
+        }
+        type CovMs<Pk, Ctx> =
+            Miniscript<Pk, Ctx, crate::CovenantExt<crate::extensions::CovExtArgs>>;
+
+        // Parsing. Segwit v0 parameters reject extensions unless a caller allows them.
+        assert!(ProbeMs::<Tap>::from_str_insane("and_v(v:pk(A),nullary)").is_ok());
+        assert!(not_allowed(ProbeMs::<Tap>::from_str_insane("and_v(v:pk(A),legacy)")));
+        assert!(matches!(
+            ProbeMs::<Segwitv0>::from_str_insane("and_v(v:pk(A),legacy)"),
+            Err(Error::Validation(ValidationError::IllegalExtension))
+        ));
+        let allowed = ValidationParams { allow_extensions: true, ..Segwitv0::CONSENSUS };
+        let parse = |s: &str| ProbeMs::<Segwitv0>::from_str_with_validation_params(s, &allowed);
+        assert!(parse("and_v(v:pk(A),legacy)").is_ok());
+        assert!(not_allowed(parse("and_v(v:pk(A),nullary)")));
+        assert!(not_allowed(ProbeMs::<Legacy>::from_str_insane("legacy")));
+        assert!(not_allowed(ProbeMs::<BareCtx>::from_str_insane("legacy")));
+        // Construction.
+        assert!(ProbeMs::<Segwitv0>::from_ast(Terminal::Ext(Probe("legacy".into()))).is_ok());
+        assert!(not_allowed(ProbeMs::<Tap>::from_ast(Terminal::Ext(Probe("legacy".into())))));
+        // Decoding.
+        let script = CovMs::<XOnlyPublicKey, Tap>::from_str_insane("curr_idx_eq(0)")
+            .unwrap()
+            .encode();
+        assert!(not_allowed(CovMs::<bitcoin::PublicKey, Segwitv0>::decode_consensus(&script)));
     }
 }

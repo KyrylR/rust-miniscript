@@ -15,6 +15,7 @@ use elements::taproot::{
 };
 use elements::{pset, Script};
 
+use crate::extensions::{CovExtArgs, CovenantExt, Extension, ParseableExt};
 use crate::miniscript::context::Tap;
 use crate::prelude::Vec;
 use crate::sync::Arc;
@@ -99,16 +100,16 @@ fn branch_hash(a: TapNodeHash, b: TapNodeHash) -> TapNodeHash {
 ///
 /// Conceptually, this object is a copy of the Taproot tree with each leave annotated
 /// with extra information that can be used to compute its control block.
-pub struct TrSpendInfo<Pk: MiniscriptKey> {
+pub struct TrSpendInfo<Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
     internal_key: UntweakedPublicKey,
     output_key: TweakedPublicKey,
     output_key_parity: Parity,
     /// The nodes of the tree, in pre-order, i.e. left-to-right depth-first order.
-    nodes: Vec<TrSpendInfoNode<Pk>>,
+    nodes: Vec<TrSpendInfoNode<Pk, Ext>>,
 }
 
-impl<Pk: ToPublicKey> TrSpendInfo<Pk> {
-    fn nodes_from_tap_tree(tree: &super::TapTree<Pk>) -> Vec<TrSpendInfoNode<Pk>> {
+impl<Pk: ToPublicKey, Ext: ParseableExt> TrSpendInfo<Pk, Ext> {
+    fn nodes_from_tap_tree(tree: &super::TapTree<Pk, Ext>) -> Vec<TrSpendInfoNode<Pk, Ext>> {
         let mut nodes = vec![];
         let mut parent_stack = ParentStack::new();
         for leaf in tree.leaves() {
@@ -184,7 +185,7 @@ impl<Pk: ToPublicKey> TrSpendInfo<Pk> {
     }
 
     /// Constructs a [`TrSpendInfo`] for a [`super::Tr`].
-    pub fn from_tr(tr: &super::Tr<Pk>) -> Self {
+    pub fn from_tr(tr: &super::Tr<Pk, Ext>) -> Self {
         let internal_key = tr.internal_key().to_x_only_pubkey();
 
         let nodes = match tr.tap_tree() {
@@ -228,7 +229,7 @@ impl<Pk: ToPublicKey> TrSpendInfo<Pk> {
     /// This yields the same leaves in the same order as [`super::Tr::leaves`] on the original
     /// [`super::Tr`]. However, in addition to yielding the leaves and their depths, it also
     /// yields their scripts, leafhashes, and control blocks.
-    pub fn leaves(&self) -> TrSpendInfoIter<'_, Pk> {
+    pub fn leaves(&self) -> TrSpendInfoIter<'_, Pk, Ext> {
         TrSpendInfoIter {
             spend_info: self,
             index: 0,
@@ -262,15 +263,15 @@ impl<Pk: ToPublicKey> TrSpendInfo<Pk> {
 
 /// An internal node of the spend
 #[derive(Debug)]
-struct TrSpendInfoNode<Pk: MiniscriptKey> {
+struct TrSpendInfoNode<Pk: MiniscriptKey, Ext: Extension> {
     sibling_hash: TapNodeHash,
-    leaf_data: Option<LeafData<Pk>>,
+    leaf_data: Option<LeafData<Pk, Ext>>,
 }
 
 #[derive(Debug)]
-struct LeafData<Pk: MiniscriptKey> {
+struct LeafData<Pk: MiniscriptKey, Ext: Extension> {
     script: Script,
-    miniscript: Arc<Miniscript<Pk, Tap>>,
+    miniscript: Arc<Miniscript<Pk, Tap, Ext>>,
     leaf_hash: TapLeafHash,
 }
 
@@ -282,15 +283,15 @@ struct LeafData<Pk: MiniscriptKey> {
 ///
 /// This iterator goes over the leaves in the same order, yielding the data that actually
 /// goes on chain: their scripts, control blocks, etc.
-pub struct TrSpendInfoIter<'sp, Pk: MiniscriptKey> {
-    spend_info: &'sp TrSpendInfo<Pk>,
+pub struct TrSpendInfoIter<'sp, Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
+    spend_info: &'sp TrSpendInfo<Pk, Ext>,
     index: usize,
     merkle_stack: Vec<TapNodeHash>,
     done_left_stack: BitStack128,
 }
 
-impl<'sp, Pk: MiniscriptKey> Iterator for TrSpendInfoIter<'sp, Pk> {
-    type Item = TrSpendInfoIterItem<'sp, Pk>;
+impl<'sp, Pk: MiniscriptKey, Ext: Extension> Iterator for TrSpendInfoIter<'sp, Pk, Ext> {
+    type Item = TrSpendInfoIterItem<'sp, Pk, Ext>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.index < self.spend_info.nodes.len() {
@@ -342,21 +343,21 @@ impl<'sp, Pk: MiniscriptKey> Iterator for TrSpendInfoIter<'sp, Pk> {
 
 /// Item yielded from a [`TrSpendInfoIter`].
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct TrSpendInfoIterItem<'tr, Pk: MiniscriptKey> {
+pub struct TrSpendInfoIterItem<'tr, Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
     script: &'tr Script,
-    miniscript: &'tr Arc<Miniscript<Pk, Tap>>,
+    miniscript: &'tr Arc<Miniscript<Pk, Tap, Ext>>,
     leaf_hash: TapLeafHash,
     control_block: ControlBlock,
 }
 
-impl<'sp, Pk: MiniscriptKey> TrSpendInfoIterItem<'sp, Pk> {
+impl<'sp, Pk: MiniscriptKey, Ext: Extension> TrSpendInfoIterItem<'sp, Pk, Ext> {
     /// The Tapscript of this leaf.
     #[inline]
     pub fn script(&self) -> &'sp Script { self.script }
 
     /// The Tapscript of this leaf, in Miniscript form.
     #[inline]
-    pub fn miniscript(&self) -> &'sp Arc<Miniscript<Pk, Tap>> { self.miniscript }
+    pub fn miniscript(&self) -> &'sp Arc<Miniscript<Pk, Tap, Ext>> { self.miniscript }
 
     /// The depth of the leaf in the tree.
     ///

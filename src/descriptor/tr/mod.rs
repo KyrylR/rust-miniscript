@@ -9,6 +9,7 @@ use sync::Arc;
 
 use super::checksum;
 use crate::expression::{self, FromTree};
+use crate::extensions::{CovExtArgs, CovenantExt, ExtTranslator, Extension, ParseableExt};
 use crate::miniscript::satisfy::{Placeholder, Satisfaction, SchnorrSigType, Witness};
 use crate::miniscript::Miniscript;
 use crate::plan::AssetProvider;
@@ -28,11 +29,11 @@ pub use self::spend_info::{TrSpendInfo, TrSpendInfoIter, TrSpendInfoIterItem};
 pub use self::taptree::{TapTree, TapTreeDepthError, TapTreeIter, TapTreeIterItem};
 
 /// A taproot descriptor
-pub struct Tr<Pk: MiniscriptKey> {
+pub struct Tr<Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
     /// A taproot internal key
     internal_key: Pk,
     /// Optional Taproot Tree with spending conditions
-    tree: Option<TapTree<Pk>>,
+    tree: Option<TapTree<Pk, Ext>>,
     /// Optional spending information associated with the descriptor
     /// This will be [`None`] when the descriptor is not derived.
     /// This information will be cached automatically when it is required
@@ -40,10 +41,10 @@ pub struct Tr<Pk: MiniscriptKey> {
     // The inner `Arc` here is because Rust does not allow us to return a reference
     // to the contents of the `Option` from inside a `MutexGuard`. There is no outer
     // `Arc` because when this structure is cloned, we create a whole new mutex.
-    spend_info: Mutex<Option<Arc<TrSpendInfo<Pk>>>>,
+    spend_info: Mutex<Option<Arc<TrSpendInfo<Pk, Ext>>>>,
 }
 
-impl<Pk: MiniscriptKey> Clone for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> Clone for Tr<Pk, Ext> {
     fn clone(&self) -> Self {
         // When cloning, construct a new Mutex so that distinct clones don't
         // cause blocking between each other. We clone only the internal `Arc`,
@@ -62,19 +63,19 @@ impl<Pk: MiniscriptKey> Clone for Tr<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> PartialEq for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> PartialEq for Tr<Pk, Ext> {
     fn eq(&self, other: &Self) -> bool {
         self.internal_key == other.internal_key && self.tree == other.tree
     }
 }
 
-impl<Pk: MiniscriptKey> Eq for Tr<Pk> {}
+impl<Pk: MiniscriptKey, Ext: Extension> Eq for Tr<Pk, Ext> {}
 
-impl<Pk: MiniscriptKey> PartialOrd for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> PartialOrd for Tr<Pk, Ext> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> { Some(self.cmp(other)) }
 }
 
-impl<Pk: MiniscriptKey> Ord for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> Ord for Tr<Pk, Ext> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         match self.internal_key.cmp(&other.internal_key) {
             cmp::Ordering::Equal => {}
@@ -84,16 +85,16 @@ impl<Pk: MiniscriptKey> Ord for Tr<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> hash::Hash for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> hash::Hash for Tr<Pk, Ext> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.internal_key.hash(state);
         self.tree.hash(state);
     }
 }
 
-impl<Pk: MiniscriptKey> Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> Tr<Pk, Ext> {
     /// Create a new [`Tr`] descriptor from internal key and [`TapTree`]
-    pub fn new(internal_key: Pk, tree: Option<TapTree<Pk>>) -> Result<Self, Error> {
+    pub fn new(internal_key: Pk, tree: Option<TapTree<Pk, Ext>>) -> Result<Self, Error> {
         Tap::check_pk(&internal_key)?;
         Ok(Self { internal_key, tree, spend_info: Mutex::new(None) })
     }
@@ -102,13 +103,13 @@ impl<Pk: MiniscriptKey> Tr<Pk> {
     pub fn internal_key(&self) -> &Pk { &self.internal_key }
 
     /// Obtain the [`TapTree`] of the [`Tr`] descriptor
-    pub fn tap_tree(&self) -> Option<&TapTree<Pk>> { self.tree.as_ref() }
+    pub fn tap_tree(&self) -> Option<&TapTree<Pk, Ext>> { self.tree.as_ref() }
 
     /// Iterates over all the leaves of the tree in depth-first preorder.
     ///
     /// The yielded elements include the Miniscript for each leave as well as its depth
     /// in the tree, which is the data required by PSBT (BIP 371).
-    pub fn leaves(&self) -> TapTreeIter<'_, Pk> {
+    pub fn leaves(&self) -> TapTreeIter<'_, Pk, Ext> {
         match self.tree {
             Some(ref t) => t.leaves(),
             None => TapTreeIter::empty(),
@@ -125,9 +126,10 @@ impl<Pk: MiniscriptKey> Tr<Pk> {
     /// This data is needed to compute the Taproot output, so this method is implicitly
     /// called through [`Self::script_pubkey`], [`Self::address`], etc. It is also needed
     /// to compute the hash needed to sign the output.
-    pub fn spend_info(&self) -> Arc<TrSpendInfo<Pk>>
+    pub fn spend_info(&self) -> Arc<TrSpendInfo<Pk, Ext>>
     where
         Pk: ToPublicKey,
+        Ext: ParseableExt,
     {
         let mut lock = self.spend_info.lock().unwrap();
         match *lock {
@@ -247,7 +249,7 @@ impl<Pk: MiniscriptKey> Tr<Pk> {
     pub fn translate_pk<T>(
         &self,
         translate: &mut T,
-    ) -> Result<Tr<T::TargetPk>, TranslateErr<T::Error>>
+    ) -> Result<Tr<T::TargetPk, Ext>, TranslateErr<T::Error>>
     where
         T: Translator<Pk>,
     {
@@ -259,9 +261,24 @@ impl<Pk: MiniscriptKey> Tr<Pk> {
         let translate_desc = Tr::new(internal_key, tree).map_err(TranslateErr::OuterError)?;
         Ok(translate_desc)
     }
+
+    /// Converts the extensions of the script tree from one type to another.
+    pub fn translate_ext<T>(
+        &self,
+        translate: &mut T,
+    ) -> Result<Tr<Pk, T::TargetExt>, TranslateErr<T::Error>>
+    where
+        T: ExtTranslator<Ext>,
+    {
+        let tree = match &self.tree {
+            Some(tree) => Some(tree.translate_ext(translate)?),
+            None => None,
+        };
+        Ok(Tr { internal_key: self.internal_key.clone(), tree, spend_info: Mutex::new(None) })
+    }
 }
 
-impl<Pk: MiniscriptKey + ToPublicKey> Tr<Pk> {
+impl<Pk: MiniscriptKey + ToPublicKey, Ext: ParseableExt> Tr<Pk, Ext> {
     /// Obtains the corresponding script pubkey for this descriptor.
     pub fn script_pubkey(&self) -> Script {
         Script::new_v1_p2tr_tweaked(self.spend_info().output_key())
@@ -328,7 +345,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Tr<Pk> {
     }
 }
 
-impl<Pk: FromStrKey> core::str::FromStr for Tr<Pk> {
+impl<Pk: FromStrKey, Ext: Extension> core::str::FromStr for Tr<Pk, Ext> {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -337,7 +354,7 @@ impl<Pk: FromStrKey> core::str::FromStr for Tr<Pk> {
     }
 }
 
-impl<Pk: FromStrKey> crate::expression::FromTree for Tr<Pk> {
+impl<Pk: FromStrKey, Ext: Extension> crate::expression::FromTree for Tr<Pk, Ext> {
     fn from_tree(root: expression::TreeIterItem) -> Result<Self, Error> {
         use crate::expression::{Parens, ParseTreeError};
 
@@ -388,7 +405,7 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Tr<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> fmt::Debug for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> fmt::Debug for Tr<Pk, Ext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.tree {
             Some(ref s) => write!(f, "eltr({:?},{:?})", self.internal_key, s),
@@ -397,7 +414,7 @@ impl<Pk: MiniscriptKey> fmt::Debug for Tr<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> fmt::Display for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> fmt::Display for Tr<Pk, Ext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use fmt::Write;
         let mut wrapped_f = checksum::Formatter::new(f);
@@ -410,7 +427,7 @@ impl<Pk: MiniscriptKey> fmt::Display for Tr<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> Liftable<Pk> for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> Liftable<Pk> for Tr<Pk, Ext> {
     fn lift(&self) -> Result<Policy<Pk>, Error> {
         match &self.tree {
             Some(root) => Ok(Policy::Thresh(Threshold::or(
@@ -422,7 +439,7 @@ impl<Pk: MiniscriptKey> Liftable<Pk> for Tr<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> ForEachKey<Pk> for Tr<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> ForEachKey<Pk> for Tr<Pk, Ext> {
     fn for_each_key<'a, F: FnMut(&'a Pk) -> bool>(&'a self, mut pred: F) -> bool {
         let script_keys_res = self
             .leaves()
@@ -438,13 +455,14 @@ fn control_block_len(depth: u8) -> usize {
 
 // Helper function to get a script spend satisfaction
 // try script spend
-fn best_tap_spend<Pk, P>(
-    desc: &Tr<Pk>,
+fn best_tap_spend<Pk, Ext, P>(
+    desc: &Tr<Pk, Ext>,
     provider: &P,
     allow_mall: bool,
 ) -> Satisfaction<Placeholder<Pk>>
 where
     Pk: ToPublicKey,
+    Ext: ParseableExt,
     P: AssetProvider<Pk>,
 {
     let spend_info = desc.spend_info();

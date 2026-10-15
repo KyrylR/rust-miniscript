@@ -232,6 +232,7 @@ pub fn test_desc_satisfy(
                 },
                 Descriptor::Wsh(wsh) => find_sks_ms(wsh.as_inner(), testdata),
                 Descriptor::Tr(_tr) => unreachable!("Tr checked earlier"),
+                Descriptor::LegacyCSFSCov(_) => panic!("legacy covenant spends use test_legacy"),
             };
             let msg = psbt
                 .sighash_msg(0, &mut sighash_cache, None, testdata.pubdata.genesis_hash)

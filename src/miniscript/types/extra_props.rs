@@ -9,7 +9,7 @@ use core::iter::once;
 use super::ScriptContext;
 use crate::miniscript::limits::MAX_PUBKEYS_PER_MULTISIG;
 use crate::prelude::*;
-use crate::{script_num_size, AbsLockTime, MiniscriptKey, RelLockTime, Terminal};
+use crate::{script_num_size, AbsLockTime, Extension, MiniscriptKey, RelLockTime, Terminal};
 
 /// Timelock information for satisfaction of a fragment.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
@@ -946,10 +946,11 @@ impl ExtData {
 
     /// Compute the type of a fragment assuming all the children of
     /// Miniscript have been computed already.
-    pub fn type_check<Pk, Ctx>(fragment: &Terminal<Pk, Ctx>) -> Self
+    pub fn type_check<Pk, Ctx, Ext>(fragment: &Terminal<Pk, Ctx, Ext>) -> Self
     where
         Ctx: ScriptContext,
         Pk: MiniscriptKey,
+        Ext: Extension,
     {
         let ret = match *fragment {
             Terminal::True => Self::TRUE,
@@ -1013,6 +1014,7 @@ impl ExtData {
             Terminal::Thresh(ref thresh) => {
                 Self::threshold(thresh.k(), thresh.n(), |n| thresh.data()[n].ext)
             }
+            Terminal::Ext(ref e) => e.ext_data(),
         };
         ret
     }

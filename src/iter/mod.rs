@@ -21,7 +21,7 @@ pub use tree::{
 
 use crate::prelude::*;
 use crate::sync::Arc;
-use crate::{Miniscript, MiniscriptKey, ScriptContext, Terminal, Threshold};
+use crate::{Extension, Miniscript, MiniscriptKey, ScriptContext, Terminal, Threshold};
 
 /// Extension trait for the stacks used by algorithms which reconstruct a tree
 /// from a [`TreeLike::post_order_iter`].
@@ -76,8 +76,10 @@ impl<T> StackExt<T> for Vec<T> {
     }
 }
 
-impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Miniscript<Pk, Ctx> {
-    type NaryChildren = &'a [Arc<Miniscript<Pk, Ctx>>];
+impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> TreeLike
+    for &'a Miniscript<Pk, Ctx, Ext>
+{
+    type NaryChildren = &'a [Arc<Miniscript<Pk, Ctx, Ext>>];
 
     fn nary_len(tc: &Self::NaryChildren) -> usize { tc.len() }
     fn nary_index(tc: Self::NaryChildren, idx: usize) -> Self { Arc::as_ref(&tc[idx]) }
@@ -85,9 +87,22 @@ impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Miniscript<Pk, 
     fn as_node(&self) -> Tree<Self, Self::NaryChildren> {
         use Terminal::*;
         match self.node {
-            PkK(..) | PkH(..) | RawPkH(..) | After(..) | Older(..) | Sha256(..) | Hash256(..)
-            | Ripemd160(..) | Hash160(..) | True | False | Multi(..) | SortedMulti(..)
-            | MultiA(..) | SortedMultiA(..) => Tree::Nullary,
+            PkK(..)
+            | PkH(..)
+            | RawPkH(..)
+            | After(..)
+            | Older(..)
+            | Sha256(..)
+            | Hash256(..)
+            | Ripemd160(..)
+            | Hash160(..)
+            | True
+            | False
+            | Multi(..)
+            | SortedMulti(..)
+            | MultiA(..)
+            | SortedMultiA(..)
+            | Terminal::Ext(..) => Tree::Nullary,
             Alt(ref sub)
             | Swap(ref sub)
             | Check(ref sub)
@@ -107,8 +122,10 @@ impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Miniscript<Pk, 
     }
 }
 
-impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Arc<Miniscript<Pk, Ctx>> {
-    type NaryChildren = &'a [Arc<Miniscript<Pk, Ctx>>];
+impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> TreeLike
+    for &'a Arc<Miniscript<Pk, Ctx, Ext>>
+{
+    type NaryChildren = &'a [Arc<Miniscript<Pk, Ctx, Ext>>];
 
     fn nary_len(tc: &Self::NaryChildren) -> usize { tc.len() }
     fn nary_index(tc: Self::NaryChildren, idx: usize) -> Self { &tc[idx] }
@@ -116,9 +133,22 @@ impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Arc<Miniscript<
     fn as_node(&self) -> Tree<Self, Self::NaryChildren> {
         use Terminal::*;
         match self.node {
-            PkK(..) | PkH(..) | RawPkH(..) | After(..) | Older(..) | Sha256(..) | Hash256(..)
-            | Ripemd160(..) | Hash160(..) | True | False | Multi(..) | SortedMulti(..)
-            | MultiA(..) | SortedMultiA(..) => Tree::Nullary,
+            PkK(..)
+            | PkH(..)
+            | RawPkH(..)
+            | After(..)
+            | Older(..)
+            | Sha256(..)
+            | Hash256(..)
+            | Ripemd160(..)
+            | Hash160(..)
+            | True
+            | False
+            | Multi(..)
+            | SortedMulti(..)
+            | MultiA(..)
+            | SortedMultiA(..)
+            | Terminal::Ext(..) => Tree::Nullary,
             Alt(ref sub)
             | Swap(ref sub)
             | Check(ref sub)
@@ -138,8 +168,10 @@ impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Arc<Miniscript<
     }
 }
 
-impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Terminal<Pk, Ctx> {
-    type NaryChildren = &'a [Arc<Miniscript<Pk, Ctx>>];
+impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> TreeLike
+    for &'a Terminal<Pk, Ctx, Ext>
+{
+    type NaryChildren = &'a [Arc<Miniscript<Pk, Ctx, Ext>>];
 
     fn nary_len(tc: &Self::NaryChildren) -> usize { tc.len() }
     fn nary_index(tc: Self::NaryChildren, idx: usize) -> Self { tc[idx].as_inner() }
@@ -147,9 +179,22 @@ impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for &'a Terminal<Pk, Ct
     fn as_node(&self) -> Tree<Self, Self::NaryChildren> {
         use Terminal::*;
         match self {
-            PkK(..) | PkH(..) | RawPkH(..) | After(..) | Older(..) | Sha256(..) | Hash256(..)
-            | Ripemd160(..) | Hash160(..) | True | False | Multi(..) | SortedMulti(..)
-            | MultiA(..) | SortedMultiA(..) => Tree::Nullary,
+            PkK(..)
+            | PkH(..)
+            | RawPkH(..)
+            | After(..)
+            | Older(..)
+            | Sha256(..)
+            | Hash256(..)
+            | Ripemd160(..)
+            | Hash160(..)
+            | True
+            | False
+            | Multi(..)
+            | SortedMulti(..)
+            | MultiA(..)
+            | SortedMultiA(..)
+            | Terminal::Ext(..) => Tree::Nullary,
             Alt(ref sub)
             | Swap(ref sub)
             | Check(ref sub)

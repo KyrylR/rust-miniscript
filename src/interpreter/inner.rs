@@ -7,10 +7,15 @@ use elements::schnorr::TweakedPublicKey;
 use elements::taproot::ControlBlock;
 use elements::Witness;
 
-use super::{stack, BitcoinKey, Error, Stack};
-use crate::miniscript::context::{NoChecks, ScriptContext, SigType};
+use super::{stack, BitcoinKey, Error, InterpreterExt, NoChecksMs, Stack};
+use crate::descriptor::csfs_cov::LegacyCSFSCov;
+use crate::extensions::{CovExtArgs, CovenantExt};
+use crate::miniscript::context::{ScriptContext, SigType};
 use crate::prelude::*;
-use crate::{BareCtx, Legacy, Miniscript, Segwitv0, Tap, ToPublicKey, Translator};
+use crate::{
+    BareCtx, Extension, Legacy, Miniscript, NoExt, ParseableExt, Segwitv0, Tap, ToPublicKey,
+    Translator,
+};
 
 /// Attempts to parse a slice as a Bitcoin public key, checking compressedness
 /// if asked to, but otherwise dropping it
@@ -40,9 +45,9 @@ fn pk_from_stack_elem(
 
 // Parse the script with appropriate context to check for context errors like
 // correct usage of x-only keys or multi_a
-fn script_from_stack_elem<Ctx: ScriptContext>(
+fn script_from_stack_elem<Ctx: ScriptContext, Ext: ParseableExt>(
     elem: &stack::Element<'_>,
-) -> Result<Miniscript<Ctx::Key, Ctx>, Error> {
+) -> Result<Miniscript<Ctx::Key, Ctx, Ext>, Error> {
     match *elem {
         stack::Element::Push(sl) => {
             Miniscript::decode_bytes(sl, &Ctx::CONSENSUS).map_err(Error::from)
@@ -50,6 +55,16 @@ fn script_from_stack_elem<Ctx: ScriptContext>(
         stack::Element::Satisfied => Ok(Miniscript::TRUE),
         stack::Element::Dissatisfied => Ok(Miniscript::FALSE),
     }
+}
+
+// Decodes an `elcovwsh` witness script, the Miniscript then the covenant check, in the
+// Segwit v0 context
+fn cov_from_stack_elem(
+    elem: &stack::Element<'_>,
+) -> Option<(LegacyCSFSCov<bitcoin::PublicKey>, elements::Script)> {
+    let bytes = elem.as_push().ok()?;
+    let cov = LegacyCSFSCov::<bitcoin::PublicKey>::decode_bytes(bytes).ok()?;
+    Some((cov, elements::Script::from(bytes.to_vec())))
 }
 
 /// Helper type to indicate the origin of the bare pubkey that the interpereter uses
@@ -69,7 +84,7 @@ pub enum ScriptType {
     Sh,
     Wsh,
     ShWsh,
-    Tr, // Script Spend
+    Tr { tx_env: bool }, // Script Spend, and whether its fragments read the transaction
 }
 
 /// Structure representing a script under evaluation as a Miniscript
@@ -81,7 +96,10 @@ pub(super) enum Inner {
     // that only appropriate outputs are created
     PublicKey(super::BitcoinKey, PubkeyType),
     /// The script being evaluated is an actual script
-    Script(Miniscript<super::BitcoinKey, NoChecks>, ScriptType),
+    Script(NoChecksMs, ScriptType),
+    /// The script being evaluated is an `elcovwsh` witness script: the Miniscript, then the
+    /// covenant check with the key
+    CovScript(bitcoin::PublicKey, NoChecksMs),
 }
 
 // The `Script` returned by this method is always generated/cloned ... when
@@ -179,7 +197,17 @@ pub(super) fn from_txdata<'txin>(
         } else {
             match wit_stack.pop() {
                 Some(elem) => {
-                    let miniscript = script_from_stack_elem::<Segwitv0>(&elem)?;
+                    if let Some((cov, script)) = cov_from_stack_elem(&elem) {
+                        let scripthash = sha256::Hash::hash(script.as_bytes());
+                        return if *spk == bitcoin::ScriptBuf::new_p2wsh(&scripthash.into()) {
+                            let miniscript = cov.as_inner().to_no_checks_ms();
+                            // The whole witness script is the scriptCode of Miniscript signatures.
+                            Ok((Inner::CovScript(*cov.pk(), miniscript), wit_stack, Some(script)))
+                        } else {
+                            Err(Error::IncorrectWScriptHash)
+                        };
+                    }
+                    let miniscript = script_from_stack_elem::<Segwitv0, NoExt>(&elem)?;
                     let script = miniscript.encode();
                     let miniscript = miniscript.to_no_checks_ms();
                     let scripthash = sha256::Hash::hash(script.as_bytes());
@@ -230,15 +258,16 @@ pub(super) fn from_txdata<'txin>(
                             ctrl_blk.leaf_version.as_u8(),
                         ));
                     }
-                    let tap_script = script_from_stack_elem::<Tap>(&tap_script)?;
-                    let ms = tap_script.to_no_checks_ms();
+                    let tap_script =
+                        script_from_stack_elem::<Tap, CovenantExt<CovExtArgs>>(&tap_script)?;
+                    let (ms, tx_env) = tap_script.to_no_checks_ms_and_tx_env();
                     // Creating new contexts is cheap
                     let secp = elements::secp256k1_zkp::Secp256k1::verification_only();
                     let tap_script = tap_script.encode();
                     let output_key = TweakedPublicKey::new(output_key);
                     if ctrl_blk.verify_taproot_commitment(&secp, &output_key, &tap_script) {
                         Ok((
-                            Inner::Script(ms, ScriptType::Tr),
+                            Inner::Script(ms, ScriptType::Tr { tx_env }),
                             wit_stack,
                             // Tapscript is returned as a "scriptcode". This is a hack, but avoids adding yet
                             // another enum just for taproot, and this function is not a publicly exposed API,
@@ -298,7 +327,8 @@ pub(super) fn from_txdata<'txin>(
                                     Err(Error::NonEmptyScriptSig)
                                 } else {
                                     // parse wsh with Segwitv0 context
-                                    let miniscript = script_from_stack_elem::<Segwitv0>(&elem)?;
+                                    let miniscript =
+                                        script_from_stack_elem::<Segwitv0, NoExt>(&elem)?;
                                     let script = miniscript.encode();
                                     let miniscript = miniscript.to_no_checks_ms();
                                     let scripthash = sha256::Hash::hash(script.as_bytes());
@@ -321,7 +351,7 @@ pub(super) fn from_txdata<'txin>(
                     }
                 }
                 // normal p2sh parsed in Legacy context
-                let miniscript = script_from_stack_elem::<Legacy>(&elem)?;
+                let miniscript = script_from_stack_elem::<Legacy, NoExt>(&elem)?;
                 let script = miniscript.encode();
                 let miniscript = miniscript.to_no_checks_ms();
                 if wit_stack.is_empty() {
@@ -360,11 +390,18 @@ pub(super) fn from_txdata<'txin>(
 // However, NoChecks context does not know whether to parse the key as 33 bytes or 32 bytes
 // While converting into NoChecks we store explicitly in TypedHash160 enum.
 pub(super) trait ToNoChecks {
-    fn to_no_checks_ms(&self) -> Miniscript<BitcoinKey, NoChecks>;
+    /// Converts the Miniscript, and returns whether any of its fragments reads the transaction.
+    fn to_no_checks_ms_and_tx_env(&self) -> (NoChecksMs, bool);
+
+    fn to_no_checks_ms(&self) -> NoChecksMs { self.to_no_checks_ms_and_tx_env().0 }
 }
 
-impl<Ctx: ScriptContext> ToNoChecks for Miniscript<bitcoin::PublicKey, Ctx> {
-    fn to_no_checks_ms(&self) -> Miniscript<BitcoinKey, NoChecks> {
+impl<Ctx, Ext> ToNoChecks for Miniscript<bitcoin::PublicKey, Ctx, Ext>
+where
+    Ctx: ScriptContext,
+    Ext: Extension + Into<InterpreterExt>,
+{
+    fn to_no_checks_ms_and_tx_env(&self) -> (NoChecksMs, bool) {
         struct TranslateFullPk;
 
         impl Translator<bitcoin::PublicKey> for TranslateFullPk {
@@ -378,13 +415,24 @@ impl<Ctx: ScriptContext> ToNoChecks for Miniscript<bitcoin::PublicKey, Ctx> {
             translate_hash_clone!(bitcoin::PublicKey);
         }
 
-        self.translate_pk_ctx(&mut TranslateFullPk)
-            .expect("Translation should succeed")
+        let mut tx_env = false;
+        let ms = self
+            .translate_ctx(&mut TranslateFullPk, |ext| {
+                let ext: InterpreterExt = ext.clone().into();
+                tx_env |= ext.needs_tx_env();
+                Ok(ext)
+            })
+            .expect("Translation should succeed");
+        (ms, tx_env)
     }
 }
 
-impl<Ctx: ScriptContext> ToNoChecks for Miniscript<bitcoin::key::XOnlyPublicKey, Ctx> {
-    fn to_no_checks_ms(&self) -> Miniscript<BitcoinKey, NoChecks> {
+impl<Ctx, Ext> ToNoChecks for Miniscript<bitcoin::key::XOnlyPublicKey, Ctx, Ext>
+where
+    Ctx: ScriptContext,
+    Ext: Extension + Into<InterpreterExt>,
+{
+    fn to_no_checks_ms_and_tx_env(&self) -> (NoChecksMs, bool) {
         struct TranslateXOnlyPk;
 
         impl Translator<bitcoin::key::XOnlyPublicKey> for TranslateXOnlyPk {
@@ -397,8 +445,15 @@ impl<Ctx: ScriptContext> ToNoChecks for Miniscript<bitcoin::key::XOnlyPublicKey,
 
             translate_hash_clone!(bitcoin::key::XOnlyPublicKey);
         }
-        self.translate_pk_ctx(&mut TranslateXOnlyPk)
-            .expect("Translation should succeed")
+        let mut tx_env = false;
+        let ms = self
+            .translate_ctx(&mut TranslateXOnlyPk, |ext| {
+                let ext: InterpreterExt = ext.clone().into();
+                tx_env |= ext.needs_tx_env();
+                Ok(ext)
+            })
+            .expect("Translation should succeed");
+        (ms, tx_env)
     }
 }
 
@@ -692,7 +747,7 @@ mod tests {
         assert_eq!(script_code, Some(comp.pkh_spk.clone()));
     }
 
-    fn ms_inner_script(ms: &str) -> (Miniscript<BitcoinKey, NoChecks>, elements::Script) {
+    fn ms_inner_script(ms: &str) -> (NoChecksMs, elements::Script) {
         let ms = Miniscript::<bitcoin::PublicKey, Segwitv0>::from_str_insane(ms).unwrap();
         let spk = ms.encode();
         let miniscript = ms.to_no_checks_ms();
@@ -792,6 +847,52 @@ mod tests {
             .into_script());
         let err = from_txdata(&spk, &script_sig, &wit_stack).unwrap_err();
         assert_eq!(&err.to_string(), "segwit spend had nonempty scriptsig");
+    }
+
+    #[test]
+    fn script_cov_wsh() {
+        let key = fixed_test_data().pk_comp;
+        let cov = |ms: &str| {
+            let desc = format!("elcovwsh({},{})", key, ms);
+            LegacyCSFSCov::<bitcoin::PublicKey>::from_str(&desc).unwrap()
+        };
+        let cov_pk = cov(&format!("pk({})", key));
+        let witness_script = cov_pk.inner_script();
+        let wit_stack = Witness::from_slice(&[witness_script.to_bytes()]);
+        let blank_script = elements::Script::new();
+
+        // the Miniscript signatures sign the whole witness script
+        let (inner, stack, script_code) =
+            from_txdata(&cov_pk.script_pubkey(), &blank_script, &wit_stack).expect("parse txdata");
+        assert_eq!(inner, Inner::CovScript(key, cov_pk.as_inner().to_no_checks_ms()));
+        assert_eq!(stack, Stack::from(vec![]));
+        assert_eq!(script_code, Some(witness_script));
+
+        // the witness script of another covenant
+        let err = from_txdata(&cov("1").script_pubkey(), &blank_script, &wit_stack).unwrap_err();
+        assert_eq!(&err.to_string(), "witness script did not match scriptpubkey");
+    }
+
+    #[test]
+    fn tx_env_fragments() {
+        type TapMs = Miniscript<bitcoin::key::XOnlyPublicKey, Tap, CovenantExt<CovExtArgs>>;
+        let key = fixed_test_data().pk_comp;
+        let xonly = key.inner.x_only_public_key().0;
+        let msg = "f38b23e7d84506eb8eb477792ba607f908fe8a64ac9ae8dc0e760096e1550562";
+        let tx_env = |ms: &str| {
+            TapMs::from_str_insane(ms)
+                .unwrap()
+                .to_no_checks_ms_and_tx_env()
+                .1
+        };
+
+        assert!(tx_env(&format!("and_v(v:pk({}),curr_idx_eq(0))", xonly)));
+        assert!(!tx_env(&format!("pk({})", xonly)));
+        assert!(!tx_env(&format!("csfs({},{})", xonly, msg)));
+
+        let cov = format!("elcovwsh({},ver_eq(2))", key);
+        let cov = LegacyCSFSCov::<bitcoin::PublicKey>::from_str(&cov).unwrap();
+        assert!(!cov.as_inner().to_no_checks_ms_and_tx_env().1);
     }
 
     #[test]

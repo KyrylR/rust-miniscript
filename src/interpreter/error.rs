@@ -35,8 +35,13 @@ pub enum Error {
     CouldNotEvaluate,
     /// We expected a push (including a `OP_1` but no other numeric pushes)
     ExpectedPush,
+    /// A covenant fragment failed, as the script would.
+    Extension(crate::extensions::EvalError),
     /// The preimage to the hash function must be exactly 32 bytes.
     HashPreimageLengthMismatch,
+    /// The items below the Miniscript satisfaction of an `elcovwsh` spend are not a signature
+    /// and the 11 signature hash preimage items with their sizes.
+    IncorrectCovenantWitness,
     /// Incorrect scriptPubKey (pay-to-pubkeyhash) for the provided public key
     IncorrectPubkeyHash,
     /// Incorrect scriptPubKey for the provided redeem script
@@ -47,6 +52,8 @@ pub enum Error {
     IncorrectWScriptHash,
     /// MultiSig missing at least `1` witness elements out of `k + 1` required
     InsufficientSignaturesMultiSig,
+    /// The covenant signature of an `elcovwsh` spend does not sign its preimage items.
+    InvalidCovenantPreimage(bitcoin::PublicKey),
     /// Invalid Sighash type
     InvalidSchnorrSighashType(Vec<u8>),
     /// ecdsa Signature failed to verify
@@ -57,6 +64,9 @@ pub enum Error {
     NonStandardSighash(Vec<u8>),
     /// Miniscript error
     Miniscript(crate::Error),
+    /// An `elcovwsh` spend has no function to check its covenant signature, as with
+    /// [`super::Interpreter::iter_custom`].
+    MissingCovenantVerifier,
     /// MultiSig requires 1 extra zero element apart from the `k` signatures
     MissingExtraZeroMultiSig,
     /// Script abortion because of incorrect dissatisfaction for multisig.
@@ -132,8 +142,12 @@ impl fmt::Display for Error {
                 write!(f, "unsupported Taproot leaf version 0x{:02x}", version)
             }
             Self::ExpectedPush => f.write_str("expected push in script"),
+            Self::Extension(ref e) => write!(f, "covenant evaluation: {}", e),
             Self::CouldNotEvaluate => f.write_str("Interpreter Error: Could not evaluate"),
             Self::HashPreimageLengthMismatch => f.write_str("Hash preimage should be 32 bytes"),
+            Self::IncorrectCovenantWitness => {
+                f.write_str("covenant signature or preimage items missing or of the wrong size")
+            }
             Self::IncorrectPubkeyHash => f.write_str("public key did not match scriptpubkey"),
             Self::IncorrectScriptHash => f.write_str("redeem script did not match scriptpubkey"),
             Self::IncorrectWPubkeyHash => {
@@ -141,6 +155,9 @@ impl fmt::Display for Error {
             }
             Self::IncorrectWScriptHash => f.write_str("witness script did not match scriptpubkey"),
             Self::InsufficientSignaturesMultiSig => f.write_str("Insufficient signatures for CMS"),
+            Self::InvalidCovenantPreimage(pk) => {
+                write!(f, "covenant signature with pk {} does not sign the preimage items", pk)
+            }
             Self::InvalidSchnorrSighashType(ref sig) => {
                 write!(f, "Invalid sighash type for schnorr signature '{:x}'", sig.as_hex())
             }
@@ -152,6 +169,9 @@ impl fmt::Display for Error {
             Self::NonEmptyWitness => f.write_str("legacy spend had nonempty witness"),
             Self::NonEmptyScriptSig => f.write_str("segwit spend had nonempty scriptsig"),
             Self::Miniscript(ref e) => write!(f, "parse error: {}", e),
+            Self::MissingCovenantVerifier => {
+                f.write_str("no function to check the covenant signature of an elcovwsh spend")
+            }
             Self::MissingExtraZeroMultiSig => f.write_str("CMS missing extra zero"),
             Self::MultiSigEvaluationError => {
                 f.write_str("CMS script aborted, incorrect satisfaction/dissatisfaction")
@@ -196,15 +216,18 @@ impl error::Error for Error {
             | CouldNotEvaluate
             | ExpectedPush
             | HashPreimageLengthMismatch
+            | IncorrectCovenantWitness
             | IncorrectPubkeyHash
             | IncorrectScriptHash
             | IncorrectWPubkeyHash
             | IncorrectWScriptHash
             | InsufficientSignaturesMultiSig
+            | InvalidCovenantPreimage(_)
             | InvalidEcdsaSignature(_)
             | InvalidSchnorrSignature(_)
             | InvalidSchnorrSighashType(_)
             | NonStandardSighash(_)
+            | MissingCovenantVerifier
             | MissingExtraZeroMultiSig
             | MultiSigEvaluationError
             | NonEmptyWitness
@@ -223,6 +246,7 @@ impl error::Error for Error {
             | UnexpectedStackElementPush
             | VerifyFailed => None,
             ControlBlockParse(e) => Some(e),
+            Extension(e) => Some(e),
             Miniscript(e) => Some(e),
             Secp(e) => Some(e),
             SchnorrSig(e) => Some(e),

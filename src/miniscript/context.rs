@@ -14,7 +14,9 @@ use crate::miniscript::limits::{
     MAX_STACK_SIZE, MAX_STANDARD_P2WSH_SCRIPT_SIZE, MAX_STANDARD_P2WSH_STACK_ITEMS,
 };
 use crate::prelude::*;
-use crate::{hash256, Error, ForEachKey, Miniscript, MiniscriptKey, Terminal, ValidationParams};
+use crate::{
+    hash256, Error, Extension, ForEachKey, Miniscript, MiniscriptKey, Terminal, ValidationParams,
+};
 
 /// Error for Script Context
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -60,6 +62,8 @@ pub enum ScriptContextError {
     StackSizeLimitExceeded { actual: usize, limit: usize },
     /// MultiA is only allowed in post tapscript
     MultiANotAllowed,
+    /// An extension fragment that is invalid in the script context
+    ExtensionNotAllowed,
 }
 
 #[cfg(feature = "std")]
@@ -82,7 +86,8 @@ impl error::Error for ScriptContextError {
             | ImpossibleSatisfaction
             | TaprootMultiDisabled
             | StackSizeLimitExceeded { .. }
-            | MultiANotAllowed => None,
+            | MultiANotAllowed
+            | ExtensionNotAllowed => None,
         }
     }
 }
@@ -155,6 +160,9 @@ impl fmt::Display for ScriptContextError {
             Self::MultiANotAllowed => {
                 write!(f, "Multi a(CHECKSIGADD) only allowed post tapscript")
             }
+            Self::ExtensionNotAllowed => {
+                write!(f, "extension fragment not allowed in this script context")
+            }
         }
     }
 }
@@ -206,7 +214,9 @@ where
     fn check_pk<Pk: MiniscriptKey>(pk: &Pk) -> Result<(), ScriptContextError>;
 
     /// Depending on script context, the size of a satifaction witness may slightly differ.
-    fn max_satisfaction_size<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Option<usize>;
+    fn max_satisfaction_size<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Option<usize>;
     /// Depending on script Context, some of the Terminals might not
     /// be valid under the current consensus rules.
     /// Or some of the script resource limits may have been exceeded.
@@ -217,8 +227,8 @@ where
     /// In LegacyP2SH context, scripts above 520 bytes are invalid.
     /// Post Tapscript upgrade, this would have to consider other nodes.
     /// This does *NOT* recursively check the miniscript fragments.
-    fn check_global_consensus_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_global_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
@@ -231,8 +241,8 @@ where
     /// scripts over 3600 bytes are invalid.
     /// Post Tapscript upgrade, this would have to consider other nodes.
     /// This does *NOT* recursively check the miniscript fragments.
-    fn check_global_policy_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_global_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
@@ -241,8 +251,8 @@ where
     /// It is possible that some paths of miniscript may exceed resource limits
     /// and our current satisfier and lifting analysis would not work correctly.
     /// For example, satisfaction path(Legacy/Segwitv0) may require more than 201 opcodes.
-    fn check_local_consensus_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_local_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
@@ -252,16 +262,16 @@ where
     /// and our current satisfier and lifting analysis would not work correctly.
     /// For example, satisfaction path in Legacy context scriptSig more
     /// than 1650 bytes
-    fn check_local_policy_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_local_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
 
     /// Check the consensus + policy(if not disabled) rules that are not based
     /// satisfaction
-    fn check_global_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_global_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Self::check_global_consensus_validity(ms)?;
         Self::check_global_policy_validity(ms)?;
@@ -270,8 +280,8 @@ where
 
     /// Check the consensus + policy(if not disabled) rules including the
     /// ones for satisfaction
-    fn check_local_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Self::check_global_consensus_validity(ms)?;
         Self::check_global_policy_validity(ms)?;
@@ -281,7 +291,9 @@ where
     }
 
     /// Check whether the top-level is type B
-    fn top_level_type_check<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Result<(), Error> {
+    fn top_level_type_check<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Result<(), Error> {
         // (Ab)use `for_each_key` to record the number of derivation paths a multipath key has.
         #[derive(PartialEq)]
         enum MultipathLenChecker {
@@ -316,7 +328,9 @@ where
     }
 
     /// Other top level checks that are context specific
-    fn other_top_level_checks<Pk: MiniscriptKey>(_ms: &Miniscript<Pk, Self>) -> Result<(), Error> {
+    fn other_top_level_checks<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
@@ -329,7 +343,9 @@ where
     // that are only applicable at the top-level
     // We can also combine the top-level check for Base::B here
     // even though it does not depend on context, but helps in cleaner code
-    fn top_level_checks<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Result<(), Error> {
+    fn top_level_checks<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Result<(), Error> {
         Self::top_level_type_check(ms)?;
         Self::other_top_level_checks(ms)
     }
@@ -371,6 +387,7 @@ impl ScriptContext for Legacy {
     const CONSENSUS: ValidationParams = ValidationParams {
         allow_compressed_keys: true,
         allow_dup_if: false,
+        allow_extensions: false,
         allow_uncompressed_keys: true,
         allow_multi_a: false,
         allow_or_i: false,
@@ -400,8 +417,8 @@ impl ScriptContext for Legacy {
         }
     }
 
-    fn check_global_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_global_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // 1. Check the node first, throw an error on the language itself
         let node_checked = match ms.node {
@@ -415,6 +432,7 @@ impl ScriptContext for Legacy {
             Terminal::MultiA(..) | Terminal::SortedMultiA(..) => {
                 Err(ScriptContextError::MultiANotAllowed)
             }
+            Terminal::Ext(..) => Err(ScriptContextError::ExtensionNotAllowed),
             _ => Ok(()),
         };
         // 2. After fragment and param check, validate the script size finally
@@ -433,8 +451,8 @@ impl ScriptContext for Legacy {
         }
     }
 
-    fn check_local_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         match ms.ext.sat_op_count() {
             None => Err(ScriptContextError::ImpossibleSatisfaction),
@@ -448,8 +466,8 @@ impl ScriptContext for Legacy {
         }
     }
 
-    fn check_local_policy_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // Legacy scripts permit upto 1000 stack elements, 520 bytes consensus limits
         // on P2SH size, it is not possible to reach the 1000 elements limit and hence
@@ -466,7 +484,9 @@ impl ScriptContext for Legacy {
         }
     }
 
-    fn max_satisfaction_size<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Option<usize> {
+    fn max_satisfaction_size<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Option<usize> {
         ms.ext.sat_data.map(|data| data.max_script_sig_size)
     }
 
@@ -491,6 +511,7 @@ impl ScriptContext for Segwitv0 {
     type Key = bitcoin::PublicKey;
 
     const CONSENSUS: ValidationParams = ValidationParams {
+        allow_extensions: false,
         allow_compressed_keys: true,
         allow_uncompressed_keys: false,
         allow_multi_a: false,
@@ -522,8 +543,8 @@ impl ScriptContext for Segwitv0 {
         }
     }
 
-    fn check_global_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_global_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // 1. Check the node first, throw an error on the language itself
         let node_checked = match ms.node {
@@ -536,6 +557,9 @@ impl ScriptContext for Segwitv0 {
             }
             Terminal::MultiA(..) | Terminal::SortedMultiA(..) => {
                 Err(ScriptContextError::MultiANotAllowed)
+            }
+            Terminal::Ext(ref e) if !e.segwit_v0_allowed() => {
+                Err(ScriptContextError::ExtensionNotAllowed)
             }
             _ => Ok(()),
         };
@@ -555,8 +579,8 @@ impl ScriptContext for Segwitv0 {
         }
     }
 
-    fn check_local_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         match ms.ext.sat_op_count() {
             None => Err(ScriptContextError::ImpossibleSatisfaction),
@@ -570,8 +594,8 @@ impl ScriptContext for Segwitv0 {
         }
     }
 
-    fn check_global_policy_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_global_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         if ms.ext.pk_cost > MAX_STANDARD_P2WSH_SCRIPT_SIZE {
             return Err(ScriptContextError::MaxWitnessScriptSizeExceeded {
@@ -582,8 +606,8 @@ impl ScriptContext for Segwitv0 {
         Ok(())
     }
 
-    fn check_local_policy_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // We don't need to know if this is actually a p2wsh as the standard satisfaction for
         // other Segwitv0 defined programs all require (much) less than 100 elements.
@@ -601,7 +625,9 @@ impl ScriptContext for Segwitv0 {
         }
     }
 
-    fn max_satisfaction_size<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Option<usize> {
+    fn max_satisfaction_size<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Option<usize> {
         ms.ext.sat_data.map(|data| data.max_witness_stack_size)
     }
 
@@ -651,8 +677,8 @@ impl ScriptContext for Tap {
         }
     }
 
-    fn check_global_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_global_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // 1. Check the node first, throw an error on the language itself
         let node_checked = match ms.node {
@@ -665,6 +691,9 @@ impl ScriptContext for Tap {
             }
             Terminal::Multi(..) | Terminal::SortedMulti(..) => {
                 Err(ScriptContextError::TaprootMultiDisabled)
+            }
+            Terminal::Ext(ref e) if !e.tap_allowed() => {
+                Err(ScriptContextError::ExtensionNotAllowed)
             }
             _ => Ok(()),
         };
@@ -689,8 +718,8 @@ impl ScriptContext for Tap {
         }
     }
 
-    fn check_local_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // Taproot introduces the concept of sigops budget.
         // All valid miniscripts satisfy the sigops constraint
@@ -712,20 +741,22 @@ impl ScriptContext for Tap {
         Ok(())
     }
 
-    fn check_global_policy_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_global_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // No script rules, rules are subject to entire tx rules
         Ok(())
     }
 
-    fn check_local_policy_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_local_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
 
-    fn max_satisfaction_size<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Option<usize> {
+    fn max_satisfaction_size<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Option<usize> {
         ms.ext.sat_data.map(|data| data.max_witness_stack_size)
     }
 
@@ -749,6 +780,7 @@ impl ScriptContext for BareCtx {
     const CONSENSUS: ValidationParams = ValidationParams {
         allow_compressed_keys: true,
         allow_dup_if: false,
+        allow_extensions: false,
         allow_uncompressed_keys: true,
         allow_multi_a: false,
         allow_or_i: false,
@@ -778,8 +810,8 @@ impl ScriptContext for BareCtx {
         }
     }
 
-    fn check_global_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_global_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         // 1. Check the node first, throw an error on the language itself
         let node_checked = match ms.node {
@@ -793,6 +825,7 @@ impl ScriptContext for BareCtx {
             Terminal::MultiA(..) | Terminal::SortedMultiA(..) => {
                 Err(ScriptContextError::MultiANotAllowed)
             }
+            Terminal::Ext(..) => Err(ScriptContextError::ExtensionNotAllowed),
             _ => Ok(()),
         };
         // 2. After fragment and param check, validate the script size finally
@@ -811,8 +844,8 @@ impl ScriptContext for BareCtx {
         }
     }
 
-    fn check_local_consensus_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         match ms.ext.sat_op_count() {
             None => Err(ScriptContextError::ImpossibleSatisfaction),
@@ -826,7 +859,9 @@ impl ScriptContext for BareCtx {
         }
     }
 
-    fn other_top_level_checks<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Result<(), Error> {
+    fn other_top_level_checks<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Result<(), Error> {
         match &ms.node {
             Terminal::Check(ref ms) => match &ms.node {
                 Terminal::RawPkH(_pkh) => Ok(()),
@@ -840,7 +875,9 @@ impl ScriptContext for BareCtx {
         }
     }
 
-    fn max_satisfaction_size<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Option<usize> {
+    fn max_satisfaction_size<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Option<usize> {
         // For bare outputs the script appears in the scriptpubkey; its cost
         // is the same as for a legacy scriptsig.
         ms.ext.sat_data.map(|data| data.max_script_sig_size)
@@ -882,31 +919,33 @@ impl ScriptContext for NoChecks {
     // No checks in NoChecks
     fn check_pk<Pk: MiniscriptKey>(_pk: &Pk) -> Result<(), ScriptContextError> { Ok(()) }
 
-    fn check_global_policy_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_global_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
 
-    fn check_global_consensus_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_global_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
 
-    fn check_local_policy_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_local_policy_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
 
-    fn check_local_consensus_validity<Pk: MiniscriptKey>(
-        _ms: &Miniscript<Pk, Self>,
+    fn check_local_consensus_validity<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Ok(())
     }
 
-    fn max_satisfaction_size<Pk: MiniscriptKey>(_ms: &Miniscript<Pk, Self>) -> Option<usize> {
+    fn max_satisfaction_size<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Option<usize> {
         panic!("Tried to compute a satisfaction size bound on a no-checks ecdsa miniscript")
     }
 
@@ -919,16 +958,16 @@ impl ScriptContext for NoChecks {
         "NochecksEcdsa"
     }
 
-    fn check_global_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_global_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Self::check_global_consensus_validity(ms)?;
         Self::check_global_policy_validity(ms)?;
         Ok(())
     }
 
-    fn check_local_validity<Pk: MiniscriptKey>(
-        ms: &Miniscript<Pk, Self>,
+    fn check_local_validity<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
     ) -> Result<(), ScriptContextError> {
         Self::check_global_consensus_validity(ms)?;
         Self::check_global_policy_validity(ms)?;
@@ -937,15 +976,21 @@ impl ScriptContext for NoChecks {
         Ok(())
     }
 
-    fn top_level_type_check<Pk: MiniscriptKey>(_: &Miniscript<Pk, Self>) -> Result<(), Error> {
+    fn top_level_type_check<Pk: MiniscriptKey, Ext: Extension>(
+        _: &Miniscript<Pk, Self, Ext>,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
-    fn other_top_level_checks<Pk: MiniscriptKey>(_ms: &Miniscript<Pk, Self>) -> Result<(), Error> {
+    fn other_top_level_checks<Pk: MiniscriptKey, Ext: Extension>(
+        _ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
-    fn top_level_checks<Pk: MiniscriptKey>(ms: &Miniscript<Pk, Self>) -> Result<(), Error> {
+    fn top_level_checks<Pk: MiniscriptKey, Ext: Extension>(
+        ms: &Miniscript<Pk, Self, Ext>,
+    ) -> Result<(), Error> {
         Self::top_level_type_check(ms)?;
         Self::other_top_level_checks(ms)
     }

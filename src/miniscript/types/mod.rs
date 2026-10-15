@@ -19,7 +19,7 @@ pub use self::correctness::{Base, Correctness, Input};
 pub use self::extra_props::ExtData;
 pub use self::malleability::{Dissat, Malleability};
 use super::ScriptContext;
-use crate::{MiniscriptKey, Terminal};
+use crate::{Extension, MiniscriptKey, Terminal};
 
 /// Detailed type of a typechecker error
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -459,10 +459,11 @@ impl Type {
 impl Type {
     /// Compute the type of a fragment assuming all the children of
     /// Miniscript have been computed already.
-    pub fn type_check<Pk, Ctx>(fragment: &Terminal<Pk, Ctx>) -> Result<Self, Error>
+    pub fn type_check<Pk, Ctx, Ext>(fragment: &Terminal<Pk, Ctx, Ext>) -> Result<Self, Error>
     where
         Pk: MiniscriptKey,
         Ctx: ScriptContext,
+        Ext: Extension,
     {
         let wrap_err = |result: Result<Self, ErrorKind>| {
             result.map_err(|kind| Error { fragment_string: fragment.to_string(), error: kind })
@@ -530,6 +531,7 @@ impl Type {
                 let res = Self::threshold(thresh.k(), thresh.iter().map(|ms| &ms.ty));
                 res.map_err(|kind| Error { fragment_string: fragment.to_string(), error: kind })
             }
+            Terminal::Ext(ref e) => Ok(e.ty()),
         };
         if let Ok(ref ret) = ret {
             ret.sanity_checks()

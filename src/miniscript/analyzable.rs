@@ -7,9 +7,9 @@
 
 use crate::miniscript::types::Malleability;
 use crate::prelude::*;
-use crate::{Miniscript, MiniscriptKey, ScriptContext, Terminal};
+use crate::{Extension, Miniscript, MiniscriptKey, ScriptContext, Terminal};
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
     /// Whether all spend paths of miniscript require a signature.
     ///
     /// Returns `false` for a malleable miniscript. The "s" property only

@@ -10,11 +10,11 @@ use crate::iter::{Tree, TreeLike};
 use crate::miniscript::types::Type;
 use crate::miniscript::Terminal;
 use crate::prelude::sync::Arc;
-use crate::{Miniscript, MiniscriptKey, ScriptContext};
+use crate::{Extension, Miniscript, MiniscriptKey, ScriptContext};
 
 #[derive(Clone)]
-enum DisplayNode<'a, Pk: MiniscriptKey, Ctx: ScriptContext> {
-    Node(Type, &'a Terminal<Pk, Ctx>),
+enum DisplayNode<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> {
+    Node(Type, &'a Terminal<Pk, Ctx, Ext>),
     ThresholdK(usize),
     Key(&'a Pk),
     RawKeyHash(&'a hash160::Hash),
@@ -27,13 +27,15 @@ enum DisplayNode<'a, Pk: MiniscriptKey, Ctx: ScriptContext> {
 }
 
 #[derive(Clone)]
-enum NaryChildren<'a, Pk: MiniscriptKey, Ctx: ScriptContext> {
-    Nodes(usize, &'a [Arc<Miniscript<Pk, Ctx>>]),
+enum NaryChildren<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> {
+    Nodes(usize, &'a [Arc<Miniscript<Pk, Ctx, Ext>>]),
     Keys(usize, &'a [Pk]),
 }
 
-impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for DisplayNode<'a, Pk, Ctx> {
-    type NaryChildren = NaryChildren<'a, Pk, Ctx>;
+impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> TreeLike
+    for DisplayNode<'a, Pk, Ctx, Ext>
+{
+    type NaryChildren = NaryChildren<'a, Pk, Ctx, Ext>;
 
     fn nary_len(tc: &Self::NaryChildren) -> usize {
         match tc {
@@ -61,7 +63,7 @@ impl<'a, Pk: MiniscriptKey, Ctx: ScriptContext> TreeLike for DisplayNode<'a, Pk,
     fn as_node(&self) -> Tree<Self, Self::NaryChildren> {
         match self {
             DisplayNode::Node(_, ref node) => match node {
-                Terminal::True | Terminal::False => Tree::Nullary,
+                Terminal::True | Terminal::False | Terminal::Ext(..) => Tree::Nullary,
                 Terminal::PkK(ref pk) | Terminal::PkH(ref pk) => Tree::Unary(DisplayNode::Key(pk)),
                 Terminal::RawPkH(ref pkh) => Tree::Unary(DisplayNode::RawKeyHash(pkh)),
                 Terminal::After(ref t) => Tree::Unary(DisplayNode::After(t)),
@@ -153,7 +155,7 @@ enum DisplayTypes {
     AllBadFirst,
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Terminal<Pk, Ctx, Ext> {
     fn conditional_fmt(&self, f: &mut fmt::Formatter, display_types: DisplayTypes) -> fmt::Result {
         let initial_type = match display_types {
             DisplayTypes::None => Type::FALSE,
@@ -195,7 +197,10 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Terminal<Pk, Ctx> {
                                 fmt::Display::fmt(&ty, f)?;
                                 f.write_str("]")?;
                             }
-                            f.write_str(node.fragment_name())?;
+                            match node {
+                                Self::Ext(ref e) => fmt::Display::fmt(e, f)?,
+                                _ => f.write_str(node.fragment_name())?,
+                            }
 
                             if !item.is_complete {
                                 f.write_str("(")?;
@@ -278,6 +283,8 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Terminal<Pk, Ctx> {
             Self::SortedMulti(..) => "sortedmulti",
             Self::MultiA(..) => "multi_a",
             Self::SortedMultiA(..) => "sortedmulti_a",
+            // Displayed by the extension itself.
+            Self::Ext(..) => "ext",
         }
     }
 
@@ -289,20 +296,24 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Terminal<Pk, Ctx> {
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> fmt::Debug for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> fmt::Debug
+    for Miniscript<Pk, Ctx, Ext>
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.as_inner()
             .conditional_fmt(f, DisplayTypes::All(self.ty))
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> fmt::Display for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> fmt::Display
+    for Miniscript<Pk, Ctx, Ext>
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.as_inner().conditional_fmt(f, DisplayTypes::None)
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> fmt::Debug for Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> fmt::Debug for Terminal<Pk, Ctx, Ext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let display_types = if let Ok(ty) = Type::type_check(self) {
             DisplayTypes::All(ty)
@@ -313,17 +324,19 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> fmt::Debug for Terminal<Pk, Ctx> {
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> fmt::Display for Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> fmt::Display
+    for Terminal<Pk, Ctx, Ext>
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.conditional_fmt(f, DisplayTypes::None)
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> PartialOrd for Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> PartialOrd for Terminal<Pk, Ctx, Ext> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> { Some(self.cmp(other)) }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Ord for Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Ord for Terminal<Pk, Ctx, Ext> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         // First try matching directly on the fragment name to avoid the
         // complexity of building an iterator.
@@ -337,6 +350,10 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Ord for Terminal<Pk, Ctx> {
                     .zip(DisplayNode::Node(Type::FALSE, other).pre_order_iter())
                 {
                     let me_you_cmp = match (me, you) {
+                        (
+                            DisplayNode::Node(_, Self::Ext(me)),
+                            DisplayNode::Node(_, Self::Ext(you)),
+                        ) => me.cmp(you),
                         (DisplayNode::Node(_, me), DisplayNode::Node(_, you)) => {
                             me.fragment_name().cmp(you.fragment_name())
                         }

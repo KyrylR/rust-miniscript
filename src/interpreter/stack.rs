@@ -80,6 +80,9 @@ impl<'txin> From<Vec<Element<'txin>>> for Stack<'txin> {
 }
 
 impl<'txin> Stack<'txin> {
+    /// The element `index` places above the bottom of the stack.
+    pub fn get(&self, index: usize) -> Option<&Element<'txin>> { self.0.get(index) }
+
     /// Whether the stack is empty
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 

@@ -20,18 +20,22 @@ use bitcoin::{secp256k1, Weight, WitnessVersion};
 use elements::{secp256k1_zkp, Script, TxIn};
 use sync::Arc;
 
+use self::csfs_cov::{LegacyCSFSCov, LegacyCovSatisfier};
 use crate::expression::FromTree as _;
+use crate::extensions::{CovExtArgs, CovenantExt, ExtTranslator, Extension, ParseableExt};
 use crate::miniscript::decode::Terminal;
 use crate::miniscript::limits::MAX_PUBKEYS_PER_MULTISIG;
 use crate::miniscript::{satisfy, Legacy, Miniscript, ScriptContext as _, Segwitv0, Tap};
 use crate::plan::{AssetProvider, Plan};
 use crate::prelude::*;
+use crate::util::varint_len;
 use crate::{
     expression, hash256, BareCtx, Error, ForEachKey, FromStrKey, MiniscriptKey, ParseError,
     Satisfier, Threshold, ToPublicKey, TranslateErr, Translator,
 };
 
 mod bare;
+pub mod csfs_cov;
 mod iter;
 pub mod pegin;
 mod segwitv0;
@@ -62,8 +66,11 @@ pub use self::key_map::KeyMap;
 pub use self::wallet_policy::{KeyInfo, WalletPolicy, WalletPolicyError};
 
 /// Script descriptor
+///
+/// `Ext` is the extension type of the Taproot leaves. By default, they may hold the covenant
+/// fragments of [`CovenantExt`] with concrete arguments.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Descriptor<Pk: MiniscriptKey> {
+pub enum Descriptor<Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
     /// A raw scriptpubkey (including pay-to-pubkey) under Legacy context
     Bare(Bare<Pk>),
     /// Pay-to-PubKey-Hash
@@ -75,37 +82,44 @@ pub enum Descriptor<Pk: MiniscriptKey> {
     /// Pay-to-Witness-ScriptHash with Segwitv0 context
     Wsh(Wsh<Pk>),
     /// Pay-to-Taproot
-    Tr(Tr<Pk>),
+    Tr(Tr<Pk, Ext>),
+    /// Legacy covenant, `elcovwsh`
+    LegacyCSFSCov(LegacyCSFSCov<Pk>),
 }
 
-impl<Pk: MiniscriptKey> From<Bare<Pk>> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> From<Bare<Pk>> for Descriptor<Pk, Ext> {
     #[inline]
     fn from(inner: Bare<Pk>) -> Self { Self::Bare(inner) }
 }
 
-impl<Pk: MiniscriptKey> From<Pkh<Pk>> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> From<Pkh<Pk>> for Descriptor<Pk, Ext> {
     #[inline]
     fn from(inner: Pkh<Pk>) -> Self { Self::Pkh(inner) }
 }
 
-impl<Pk: MiniscriptKey> From<Wpkh<Pk>> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> From<Wpkh<Pk>> for Descriptor<Pk, Ext> {
     #[inline]
     fn from(inner: Wpkh<Pk>) -> Self { Self::Wpkh(inner) }
 }
 
-impl<Pk: MiniscriptKey> From<Sh<Pk>> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> From<Sh<Pk>> for Descriptor<Pk, Ext> {
     #[inline]
     fn from(inner: Sh<Pk>) -> Self { Self::Sh(inner) }
 }
 
-impl<Pk: MiniscriptKey> From<Wsh<Pk>> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> From<Wsh<Pk>> for Descriptor<Pk, Ext> {
     #[inline]
     fn from(inner: Wsh<Pk>) -> Self { Self::Wsh(inner) }
 }
 
-impl<Pk: MiniscriptKey> From<Tr<Pk>> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> From<Tr<Pk, Ext>> for Descriptor<Pk, Ext> {
     #[inline]
-    fn from(inner: Tr<Pk>) -> Self { Self::Tr(inner) }
+    fn from(inner: Tr<Pk, Ext>) -> Self { Self::Tr(inner) }
+}
+
+impl<Pk: MiniscriptKey, Ext: Extension> From<LegacyCSFSCov<Pk>> for Descriptor<Pk, Ext> {
+    #[inline]
+    fn from(inner: LegacyCSFSCov<Pk>) -> Self { Self::LegacyCSFSCov(inner) }
 }
 
 /// Descriptor Type of the descriptor
@@ -127,6 +141,8 @@ pub enum DescriptorType {
     ShWpkh,
     /// Tr Descriptor
     Tr,
+    /// Legacy covenant descriptor
+    Cov,
 }
 
 impl DescriptorType {
@@ -137,12 +153,14 @@ impl DescriptorType {
         use self::DescriptorType::*;
         match self {
             Tr => Some(WitnessVersion::V1),
-            Wpkh | ShWpkh | Wsh | ShWsh => Some(WitnessVersion::V0),
+            Wpkh | ShWpkh | Wsh | ShWsh | Cov => Some(WitnessVersion::V0),
             Bare | Sh | Pkh => None,
         }
     }
 }
 
+// The constructors have the default extension type, which their arguments would mostly leave to
+// inference; `From` builds descriptors of any extension type.
 impl<Pk: MiniscriptKey> Descriptor<Pk> {
     // Keys
 
@@ -236,9 +254,11 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
     pub fn new_tr(key: Pk, script: Option<tr::TapTree<Pk>>) -> Result<Self, Error> {
         Ok(Self::Tr(Tr::new(key, script)?))
     }
+}
 
+impl<Pk: MiniscriptKey, Ext: Extension> Descriptor<Pk, Ext> {
     /// An iterator over all the keys referenced in the descriptor.
-    pub fn iter_pk(&self) -> PkIter<'_, Pk> {
+    pub fn iter_pk(&self) -> PkIter<'_, Pk, Ext> {
         match *self {
             Self::Bare(ref bare) => PkIter::from_miniscript_bare(bare.as_inner()),
             Self::Pkh(ref pk) => PkIter::from_key(pk.as_inner().clone()),
@@ -250,6 +270,7 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
             },
             Self::Wsh(ref wsh) => PkIter::from_miniscript_segwit(wsh.as_inner()),
             Self::Tr(ref tr) => PkIter::from_tr(tr),
+            Self::LegacyCSFSCov(ref cov) => PkIter::from_legacy_cov(cov),
         }
     }
 
@@ -266,7 +287,7 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
     ///
     /// To obtain the individual leaves of the tree, call [`TapTree::leaves`] on the
     /// returned value.
-    pub fn tap_tree(&self) -> Option<&TapTree<Pk>> {
+    pub fn tap_tree(&self) -> Option<&TapTree<Pk, Ext>> {
         if let Self::Tr(ref tr) = self {
             tr.tap_tree()
         } else {
@@ -278,7 +299,7 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
     ///
     /// If the descriptor is not a Taproot descriptor, **or** if the descriptor is a
     /// Taproot descriptor containing only a keyspend, returns an empty iterator.
-    pub fn tap_tree_iter(&self) -> tr::TapTreeIter<'_, Pk> {
+    pub fn tap_tree_iter(&self) -> tr::TapTreeIter<'_, Pk, Ext> {
         if let Self::Tr(ref tr) = self {
             if let Some(tree) = tr.tap_tree() {
                 return tree.leaves();
@@ -300,6 +321,7 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
             },
             Self::Wsh(..) => DescriptorType::Wsh,
             Self::Tr(..) => DescriptorType::Tr,
+            Self::LegacyCSFSCov(..) => DescriptorType::Cov,
         }
     }
 
@@ -351,6 +373,7 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.max_weight_to_satisfy()?,
             Self::Sh(ref sh) => sh.max_weight_to_satisfy()?,
             Self::Tr(ref tr) => tr.max_weight_to_satisfy()?,
+            Self::LegacyCSFSCov(ref cov) => cov.max_weight_to_satisfy()?,
         };
         Ok(weight)
     }
@@ -377,6 +400,11 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.max_satisfaction_weight()?,
             Self::Sh(ref sh) => sh.max_satisfaction_weight()?,
             Self::Tr(ref tr) => tr.max_satisfaction_weight()?,
+            // As for `Wsh`: the weight to satisfy, plus the scriptSig length byte and the length
+            // of the empty stack that it leaves out.
+            Self::LegacyCSFSCov(ref cov) => {
+                cov.max_weight_to_satisfy()?.to_wu() as usize + 4 + varint_len(0)
+            }
         };
         Ok(weight)
     }
@@ -385,7 +413,7 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
     pub fn translate_pk<T>(
         &self,
         t: &mut T,
-    ) -> Result<Descriptor<T::TargetPk>, TranslateErr<T::Error>>
+    ) -> Result<Descriptor<T::TargetPk, Ext>, TranslateErr<T::Error>>
     where
         T: Translator<Pk>,
     {
@@ -396,12 +424,33 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
             Self::Sh(ref sh) => Descriptor::Sh(sh.translate_pk(t)?),
             Self::Wsh(ref wsh) => Descriptor::Wsh(wsh.translate_pk(t)?),
             Self::Tr(ref tr) => Descriptor::Tr(tr.translate_pk(t)?),
+            Self::LegacyCSFSCov(ref cov) => Descriptor::LegacyCSFSCov(cov.translate_pk(t)?),
+        };
+        Ok(desc)
+    }
+
+    /// Converts the extensions of the Taproot leaves from one type to another.
+    pub fn translate_ext<T>(
+        &self,
+        t: &mut T,
+    ) -> Result<Descriptor<Pk, T::TargetExt>, TranslateErr<T::Error>>
+    where
+        T: ExtTranslator<Ext>,
+    {
+        let desc = match *self {
+            Self::Bare(ref bare) => Descriptor::Bare(bare.clone()),
+            Self::Pkh(ref pk) => Descriptor::Pkh(pk.clone()),
+            Self::Wpkh(ref pk) => Descriptor::Wpkh(pk.clone()),
+            Self::Sh(ref sh) => Descriptor::Sh(sh.clone()),
+            Self::Wsh(ref wsh) => Descriptor::Wsh(wsh.clone()),
+            Self::Tr(ref tr) => Descriptor::Tr(tr.translate_ext(t)?),
+            Self::LegacyCSFSCov(ref cov) => Descriptor::LegacyCSFSCov(cov.clone()),
         };
         Ok(desc)
     }
 }
 
-impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
+impl<Pk: MiniscriptKey + ToPublicKey, Ext: ParseableExt> Descriptor<Pk, Ext> {
     /// Computes the unblinded Elements address of the descriptor, if one exists
     ///
     /// Some descriptors like elpk() don't have an address. For blinded addresses
@@ -440,6 +489,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => Ok(wsh.address(blinder, params)),
             Self::Sh(ref sh) => Ok(sh.address(blinder, params)),
             Self::Tr(ref tr) => Ok(tr.address(blinder, params)),
+            Self::LegacyCSFSCov(ref cov) => Ok(cov.address(blinder, params)),
         }
     }
 
@@ -452,6 +502,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.script_pubkey(),
             Self::Sh(ref sh) => sh.script_pubkey(),
             Self::Tr(ref tr) => tr.script_pubkey(),
+            Self::LegacyCSFSCov(ref cov) => cov.script_pubkey(),
         }
     }
 
@@ -470,6 +521,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(_) => Script::new(),
             Self::Sh(ref sh) => sh.unsigned_script_sig(),
             Self::Tr(_) => Script::new(),
+            Self::LegacyCSFSCov(_) => Script::new(),
         }
     }
 
@@ -487,6 +539,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => Ok(wsh.inner_script()),
             Self::Sh(ref sh) => Ok(sh.inner_script()),
             Self::Tr(_) => Err(Error::TrNoScriptCode),
+            Self::LegacyCSFSCov(ref cov) => Ok(cov.inner_script()),
         }
     }
 
@@ -505,12 +558,16 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => Ok(wsh.ecdsa_sighash_script_code()),
             Self::Sh(ref sh) => Ok(sh.ecdsa_sighash_script_code()),
             Self::Tr(_) => Err(Error::TrNoScriptCode),
+            Self::LegacyCSFSCov(ref cov) => Ok(cov.ecdsa_sighash_script_code()),
         }
     }
 
     /// Returns satisfying non-malleable witness and scriptSig to spend an
     /// output controlled by the given descriptor if it possible to
     /// construct one using the satisfier S.
+    ///
+    /// For a legacy covenant, the satisfier must provide the transaction environment and the
+    /// covenant signature.
     pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
@@ -522,6 +579,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.get_satisfaction(satisfier),
             Self::Sh(ref sh) => sh.get_satisfaction(satisfier),
             Self::Tr(ref tr) => tr.get_satisfaction(&satisfier),
+            Self::LegacyCSFSCov(ref cov) => legacy_cov_satisfaction(cov, &satisfier, false),
         }
     }
 
@@ -539,6 +597,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.get_satisfaction_mall(satisfier),
             Self::Sh(ref sh) => sh.get_satisfaction_mall(satisfier),
             Self::Tr(ref tr) => tr.get_satisfaction_mall(&satisfier),
+            Self::LegacyCSFSCov(ref cov) => legacy_cov_satisfaction(cov, &satisfier, true),
         }
     }
 
@@ -556,13 +615,32 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
+// Satisfies `cov` with the transaction environment and the covenant signature of `satisfier`.
+fn legacy_cov_satisfaction<Pk: ToPublicKey, S: Satisfier<Pk>>(
+    cov: &LegacyCSFSCov<Pk>,
+    satisfier: &S,
+    allow_mall: bool,
+) -> Result<(Vec<Vec<u8>>, Script), Error> {
+    let env = satisfier.lookup_tx_env().ok_or(Error::CouldNotSatisfy)?;
+    let (_, hash_type) = satisfier
+        .lookup_legacy_covenant_sig(cov.pk())
+        .ok_or(csfs_cov::Error::MissingCovenantSignature)?;
+    let cov_satisfier = LegacyCovSatisfier::new(env.clone(), hash_type)?;
+    let satisfaction = if allow_mall {
+        cov.get_satisfaction_mall(&cov_satisfier, satisfier)?
+    } else {
+        cov.get_satisfaction(&cov_satisfier, satisfier)?
+    };
+    Ok(satisfaction)
+}
+
+impl<Pk: MiniscriptKey + ToPublicKey, Ext: ParseableExt> Descriptor<Pk, Ext> {
     /// Returns a plan if the provided assets are sufficient to produce a non-malleable satisfaction
     ///
     /// If the assets aren't sufficient for generating a Plan, the descriptor is returned
     #[deprecated(since = "TBD", note = "use into_plan instead")]
     #[allow(clippy::result_large_err)] // our "error type" is the original descriptor
-    pub fn plan<P>(self, provider: &P) -> Result<Plan<Pk>, Self>
+    pub fn plan<P>(self, provider: &P) -> Result<Plan<Pk, Ext>, Self>
     where
         P: AssetProvider<Pk>,
     {
@@ -571,9 +649,10 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
 
     /// Returns a plan if the provided assets are sufficient to produce a non-malleable satisfaction
     ///
-    /// If the assets aren't sufficient for generating a Plan, the descriptor is returned
+    /// If the assets aren't sufficient for generating a Plan, the descriptor is returned. Legacy
+    /// covenants, whose witness holds transaction data, are always returned.
     #[allow(clippy::result_large_err)] // our "error type" is the original descriptor
-    pub fn into_plan<P>(self, provider: &P) -> Result<Plan<Pk>, Self>
+    pub fn into_plan<P>(self, provider: &P) -> Result<Plan<Pk, Ext>, Self>
     where
         P: AssetProvider<Pk>,
     {
@@ -584,6 +663,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.plan_satisfaction(provider),
             Self::Sh(ref sh) => sh.plan_satisfaction(provider),
             Self::Tr(ref tr) => tr.plan_satisfaction(provider),
+            Self::LegacyCSFSCov(_) => return Err(self),
         };
 
         if let satisfy::Witness::Stack(stack) = satisfaction.stack {
@@ -603,7 +683,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     /// If the assets aren't sufficient for generating a Plan, the descriptor is returned
     #[deprecated(since = "TBD", note = "use into_plan_mall instead")]
     #[allow(clippy::result_large_err)] // our "error type" is the original descriptor
-    pub fn plan_mall<P>(self, provider: &P) -> Result<Plan<Pk>, Self>
+    pub fn plan_mall<P>(self, provider: &P) -> Result<Plan<Pk, Ext>, Self>
     where
         P: AssetProvider<Pk>,
     {
@@ -612,9 +692,10 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
 
     /// Returns a plan if the provided assets are sufficient to produce a malleable satisfaction
     ///
-    /// If the assets aren't sufficient for generating a Plan, the descriptor is returned
+    /// If the assets aren't sufficient for generating a Plan, the descriptor is returned. Legacy
+    /// covenants, whose witness holds transaction data, are always returned.
     #[allow(clippy::result_large_err)] // our "error type" is the original descriptor
-    pub fn into_plan_mall<P>(self, provider: &P) -> Result<Plan<Pk>, Self>
+    pub fn into_plan_mall<P>(self, provider: &P) -> Result<Plan<Pk, Ext>, Self>
     where
         P: AssetProvider<Pk>,
     {
@@ -625,6 +706,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.plan_satisfaction_mall(provider),
             Self::Sh(ref sh) => sh.plan_satisfaction_mall(provider),
             Self::Tr(ref tr) => tr.plan_satisfaction_mall(provider),
+            Self::LegacyCSFSCov(_) => return Err(self),
         };
 
         if let satisfy::Witness::Stack(stack) = satisfaction.stack {
@@ -641,7 +723,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> ForEachKey<Pk> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> ForEachKey<Pk> for Descriptor<Pk, Ext> {
     fn for_each_key<'a, F: FnMut(&'a Pk) -> bool>(&'a self, pred: F) -> bool {
         match *self {
             Self::Bare(ref bare) => bare.for_each_key(pred),
@@ -650,6 +732,7 @@ impl<Pk: MiniscriptKey> ForEachKey<Pk> for Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.for_each_key(pred),
             Self::Sh(ref sh) => sh.for_each_key(pred),
             Self::Tr(ref tr) => tr.for_each_key(pred),
+            Self::LegacyCSFSCov(ref cov) => cov.for_each_key(pred),
         }
     }
 }
@@ -661,21 +744,23 @@ impl<Pk: MiniscriptKey> ForEachKey<Pk> for Descriptor<Pk> {
 /// descriptor instead of returning an error.
 #[derive(Debug)]
 #[must_use]
-pub enum DerivationResult {
+pub enum DerivationResult<Ext: Extension = CovenantExt<CovExtArgs>> {
     /// Derivation succeeded.
-    Ok(Descriptor<DefiniteDescriptorKey>),
+    Ok(Descriptor<DefiniteDescriptorKey, Ext>),
     /// The descriptor has no wildcard. Carries the original for fallback.
-    WithoutWildcard(Descriptor<DescriptorPublicKey>),
+    WithoutWildcard(Descriptor<DescriptorPublicKey, Ext>),
     /// An error other than `NonDefiniteKeyError::NoWildcard`.
     Error(NonDefiniteKeyError),
 }
 
-impl DerivationResult {
+impl<Ext: Extension> DerivationResult<Ext> {
     /// Converts into a `Result`.
     ///
     /// Use [`or_fallback`](DerivationResult::or_fallback) if you want
     /// `NonDefiniteKeyError::NoWildcard` errors to be recovered automatically.
-    pub fn into_result(self) -> Result<Descriptor<DefiniteDescriptorKey>, NonDefiniteKeyError> {
+    pub fn into_result(
+        self,
+    ) -> Result<Descriptor<DefiniteDescriptorKey, Ext>, NonDefiniteKeyError> {
         match self {
             Self::Ok(d) => Ok(d),
             Self::WithoutWildcard(_) => Err(NonDefiniteKeyError::NoWildcard),
@@ -685,7 +770,9 @@ impl DerivationResult {
 
     /// Converts into a `Result`, recovering from `NonDefiniteKeyError::NoWildcard` by calling
     /// [`into_definite`](Descriptor::into_definite) on the original descriptor.
-    pub fn or_fallback(self) -> Result<Descriptor<DefiniteDescriptorKey>, NonDefiniteKeyError> {
+    pub fn or_fallback(
+        self,
+    ) -> Result<Descriptor<DefiniteDescriptorKey, Ext>, NonDefiniteKeyError> {
         match self {
             Self::Ok(d) => Ok(d),
             Self::WithoutWildcard(original) => original.into_definite(),
@@ -695,10 +782,10 @@ impl DerivationResult {
 
     /// Unwraps the result, panicking on non-recoverable errors. Ignores
     /// `NonDefiniteKeyError::NoWildcard` errors by calling [`or_fallback`](DerivationResult::or_fallback).
-    pub fn unwrap(self) -> Descriptor<DefiniteDescriptorKey> { self.or_fallback().unwrap() }
+    pub fn unwrap(self) -> Descriptor<DefiniteDescriptorKey, Ext> { self.or_fallback().unwrap() }
 }
 
-impl Descriptor<DescriptorPublicKey> {
+impl<Ext: Extension> Descriptor<DescriptorPublicKey, Ext> {
     /// Whether or not the descriptor has any wildcards i.e. `/*`.
     pub fn has_wildcard(&self) -> bool { self.for_any_key(|key| key.has_wildcard()) }
 
@@ -723,7 +810,9 @@ impl Descriptor<DescriptorPublicKey> {
     /// # Errors
     /// - If the descriptor contains wildcards
     /// - If the descriptor contains multi-path derivations
-    pub fn into_definite(&self) -> Result<Descriptor<DefiniteDescriptorKey>, NonDefiniteKeyError> {
+    pub fn into_definite(
+        &self,
+    ) -> Result<Descriptor<DefiniteDescriptorKey, Ext>, NonDefiniteKeyError> {
         if self.has_wildcard() {
             return Err(NonDefiniteKeyError::Wildcard);
         }
@@ -752,7 +841,7 @@ impl Descriptor<DescriptorPublicKey> {
     /// - If index >= 2^31
     /// - If the descriptor contains multi-path derivations
     #[allow(deprecated)]
-    pub fn derive_at_index(&self, index: u32) -> DerivationResult {
+    pub fn derive_at_index(&self, index: u32) -> DerivationResult<Ext> {
         if !self.has_wildcard() {
             return DerivationResult::WithoutWildcard(self.clone());
         }
@@ -778,7 +867,7 @@ impl Descriptor<DescriptorPublicKey> {
     pub fn at_derivation_index(
         &self,
         index: u32,
-    ) -> Result<Descriptor<DefiniteDescriptorKey>, NonDefiniteKeyError> {
+    ) -> Result<Descriptor<DefiniteDescriptorKey, Ext>, NonDefiniteKeyError> {
         struct AtIndex(u32);
         impl Translator<DescriptorPublicKey> for AtIndex {
             type TargetPk = DefiniteDescriptorKey;
@@ -827,7 +916,7 @@ impl Descriptor<DescriptorPublicKey> {
         &self,
         secp: &secp256k1::Secp256k1<C>,
         index: u32,
-    ) -> Result<Descriptor<bitcoin::PublicKey>, NonDefiniteKeyError> {
+    ) -> Result<Descriptor<bitcoin::PublicKey, Ext>, NonDefiniteKeyError> {
         Ok(self.at_derivation_index(index)?.derived_descriptor(secp))
     }
 
@@ -835,6 +924,9 @@ impl Descriptor<DescriptorPublicKey> {
     ///
     /// Internally turns every secret key found into the corresponding public key and then returns a
     /// a descriptor that only contains public keys and a map to lookup the secret key given a public key.
+    ///
+    /// The arguments do not determine the extension type, so name it when calling, as in
+    /// `Descriptor::<DescriptorPublicKey>::parse_descriptor`.
     pub fn parse_descriptor<C: secp256k1::Signing>(
         secp: &secp256k1::Secp256k1<C>,
         s: &str,
@@ -898,7 +990,7 @@ impl Descriptor<DescriptorPublicKey> {
             }
         }
 
-        let descriptor = Descriptor::<String>::from_str(s)?;
+        let descriptor = Descriptor::<String, Ext>::from_str(s)?;
         let descriptor = descriptor
             .translate_pk(&mut keymap_pk)
             .map_err(TranslateErr::flatten)?;
@@ -959,12 +1051,16 @@ impl Descriptor<DescriptorPublicKey> {
     /// descriptor at that index. If the descriptor is non-derivable then it will simply check the
     /// script pubkey against the descriptor and return it if it matches (in this case the index
     /// returned will be meaningless).
+    #[allow(clippy::type_complexity)]
     pub fn find_derivation_index_for_spk<C: secp256k1::Verification>(
         &self,
         secp: &secp256k1::Secp256k1<C>,
         script_pubkey: &Script,
         range: Range<u32>,
-    ) -> Result<Option<(u32, Descriptor<bitcoin::PublicKey>)>, NonDefiniteKeyError> {
+    ) -> Result<Option<(u32, Descriptor<bitcoin::PublicKey, Ext>)>, NonDefiniteKeyError>
+    where
+        Ext: ParseableExt,
+    {
         if !self.has_wildcard() {
             let concrete = self.into_definite()?.derived_descriptor(secp);
             if &concrete.script_pubkey() == script_pubkey {
@@ -1080,7 +1176,9 @@ impl Descriptor<DescriptorPublicKey> {
     }
 }
 
-impl TryFrom<Descriptor<DescriptorPublicKey>> for Descriptor<DefiniteDescriptorKey> {
+impl<Ext: Extension> TryFrom<Descriptor<DescriptorPublicKey, Ext>>
+    for Descriptor<DefiniteDescriptorKey, Ext>
+{
     type Error = NonDefiniteKeyError;
 
     /// Attempts to convert a non-wildcard [`Descriptor<DescriptorPublicKey>`] into a
@@ -1088,12 +1186,12 @@ impl TryFrom<Descriptor<DescriptorPublicKey>> for Descriptor<DefiniteDescriptorK
     ///
     /// This is equivalent to calling [`Descriptor::into_definite`] and will fail if the
     /// descriptor contains wildcards or multi-path derivations.
-    fn try_from(desc: Descriptor<DescriptorPublicKey>) -> Result<Self, Self::Error> {
+    fn try_from(desc: Descriptor<DescriptorPublicKey, Ext>) -> Result<Self, Self::Error> {
         desc.into_definite()
     }
 }
 
-impl Descriptor<DefiniteDescriptorKey> {
+impl<Ext: Extension> Descriptor<DefiniteDescriptorKey, Ext> {
     /// Convert all the public keys in the descriptor to [`bitcoin::PublicKey`] by deriving them or
     /// otherwise converting them. All [`bitcoin::secp256k1::XOnlyPublicKey`]s are converted to by adding a
     /// default(0x02) y-coordinate.
@@ -1115,7 +1213,7 @@ impl Descriptor<DefiniteDescriptorKey> {
     pub fn derived_descriptor<C: secp256k1::Verification>(
         &self,
         secp: &secp256k1::Secp256k1<C>,
-    ) -> Descriptor<bitcoin::PublicKey> {
+    ) -> Descriptor<bitcoin::PublicKey, Ext> {
         struct Derivator<'a, C: secp256k1::Verification>(&'a secp256k1::Secp256k1<C>);
 
         impl<C: secp256k1::Verification> Translator<DefiniteDescriptorKey> for Derivator<'_, C> {
@@ -1166,7 +1264,7 @@ impl Descriptor<DefiniteDescriptorKey> {
     }
 }
 
-impl<Pk: FromStrKey> crate::expression::FromTree for Descriptor<Pk> {
+impl<Pk: FromStrKey, Ext: Extension> crate::expression::FromTree for Descriptor<Pk, Ext> {
     /// Parse an expression tree into a descriptor.
     fn from_tree(top: expression::TreeIterItem) -> Result<Self, Error> {
         Ok(match (top.name(), top.n_children()) {
@@ -1175,12 +1273,13 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Descriptor<Pk> {
             ("elsh", 1) => Self::Sh(Sh::from_tree(top)?),
             ("elwsh", 1) => Self::Wsh(Wsh::from_tree(top)?),
             ("eltr", _) => Self::Tr(Tr::from_tree(top)?),
+            ("elcovwsh", _) => Self::LegacyCSFSCov(LegacyCSFSCov::from_tree(top)?),
             _ => Self::Bare(Bare::from_tree(top)?),
         })
     }
 }
 
-impl<Pk: FromStrKey> FromStr for Descriptor<Pk> {
+impl<Pk: FromStrKey, Ext: Extension> FromStr for Descriptor<Pk, Ext> {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Error> {
         let top = expression::Tree::from_str(s)?;
@@ -1196,7 +1295,7 @@ impl<Pk: FromStrKey> FromStr for Descriptor<Pk> {
     }
 }
 
-impl<Pk: MiniscriptKey> fmt::Debug for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> fmt::Debug for Descriptor<Pk, Ext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Bare(ref sub) => fmt::Debug::fmt(sub, f),
@@ -1205,11 +1304,12 @@ impl<Pk: MiniscriptKey> fmt::Debug for Descriptor<Pk> {
             Self::Sh(ref sub) => fmt::Debug::fmt(sub, f),
             Self::Wsh(ref sub) => fmt::Debug::fmt(sub, f),
             Self::Tr(ref tr) => fmt::Debug::fmt(tr, f),
+            Self::LegacyCSFSCov(ref cov) => fmt::Debug::fmt(cov, f),
         }
     }
 }
 
-impl<Pk: MiniscriptKey> fmt::Display for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> fmt::Display for Descriptor<Pk, Ext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Bare(ref sub) => fmt::Display::fmt(sub, f),
@@ -1218,11 +1318,12 @@ impl<Pk: MiniscriptKey> fmt::Display for Descriptor<Pk> {
             Self::Sh(ref sub) => fmt::Display::fmt(sub, f),
             Self::Wsh(ref sub) => fmt::Display::fmt(sub, f),
             Self::Tr(ref tr) => fmt::Display::fmt(tr, f),
+            Self::LegacyCSFSCov(ref cov) => fmt::Display::fmt(cov, f),
         }
     }
 }
 
-serde_string_impl_pk!(Descriptor, "a script descriptor");
+serde_string_impl_pk!(Descriptor, "a script descriptor", Ext; Extension);
 
 macro_rules! write_descriptor {
     ($fmt:expr, $s:literal $(, $args:expr)*) => {
@@ -2030,7 +2131,7 @@ mod tests {
         let private =
             bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Bitcoin, &[42; 32]).unwrap();
         let text = format!("wpkh({}/0/*)", private);
-        let error = Descriptor::parse_descriptor(&secp, &text)
+        let error = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &text)
             .unwrap_err()
             .to_string();
         assert!(!error.contains(&private.to_string()));
@@ -2040,7 +2141,7 @@ mod tests {
     #[test]
     fn test_parse_descriptor() {
         let secp = &secp256k1::Secp256k1::signing_only();
-        let (descriptor, key_map) = Descriptor::parse_descriptor(secp, "elwpkh(tprv8ZgxMBicQKsPcwcD4gSnMti126ZiETsuX7qwrtMypr6FBwAP65puFn4v6c3jrN9VwtMRMph6nyT63NrfUL4C3nBzPcduzVSuHD7zbX2JKVc/44'/0'/0'/0/*)").unwrap();
+        let (descriptor, key_map) = Descriptor::<DescriptorPublicKey>::parse_descriptor(secp, "elwpkh(tprv8ZgxMBicQKsPcwcD4gSnMti126ZiETsuX7qwrtMypr6FBwAP65puFn4v6c3jrN9VwtMRMph6nyT63NrfUL4C3nBzPcduzVSuHD7zbX2JKVc/44'/0'/0'/0/*)").unwrap();
         assert_eq!(descriptor.to_string(), "elwpkh([2cbe2a6d/44'/0'/0']tpubDCvNhURocXGZsLNqWcqD3syHTqPXrMSTwi8feKVwAcpi29oYKsDD3Vex7x2TDneKMVN23RbLprfxB69v94iYqdaYHsVz3kPR37NQXeqouVz/0/*)#pznhhta9");
         assert_eq!(key_map.len(), 1);
 
@@ -2049,7 +2150,7 @@ mod tests {
             ($secp: ident,$($desc: expr),*) => {
                 use crate::{ParseError, ParseTreeError};
                 $(
-                    match Descriptor::parse_descriptor($secp, $desc) {
+                    match Descriptor::<DescriptorPublicKey>::parse_descriptor($secp, $desc) {
                         Err(Error::Parse(ParseError::Tree(ParseTreeError::Checksum(_)))) => {},
                         Err(e) => panic!("Expected bad checksum for {}, got '{}'", $desc, e),
                         _ => panic!("Invalid checksum treated as valid: {}", $desc),
@@ -2071,8 +2172,8 @@ mod tests {
             "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))##uklept69"
         );
 
-        Descriptor::parse_descriptor(secp, "elsh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#9s2ngs7u").expect("Valid descriptor with checksum");
-        Descriptor::parse_descriptor(secp, "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#uklept69").expect("Valid descriptor with checksum");
+        Descriptor::<DescriptorPublicKey>::parse_descriptor(secp, "elsh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#9s2ngs7u").expect("Valid descriptor with checksum");
+        Descriptor::<DescriptorPublicKey>::parse_descriptor(secp, "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#uklept69").expect("Valid descriptor with checksum");
     }
 
     #[test]
@@ -2163,7 +2264,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     #[test]
     fn test_find_derivation_index_for_spk() {
         let secp = secp256k1::Secp256k1::verification_only();
-        let descriptor = Descriptor::from_str("eltr([73c5da0a/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)").unwrap();
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str("eltr([73c5da0a/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)").unwrap();
         // Elements Taproot output for `/0/1`; it differs from the BIP 86 vector because
         // Elements uses its own Taproot tagged hashes.
         let script_at_0_1 =
@@ -2267,7 +2368,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     #[test]
     fn multipath_descriptors() {
         // We can parse a multipath descriptors, and make it into separate single-path descriptors.
-        let desc = Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<7';8h;20>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/<0;1;987>/*)))").unwrap();
+        let desc = Descriptor::<DescriptorPublicKey>::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<7';8h;20>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/<0;1;987>/*)))").unwrap();
         assert!(desc.is_multipath());
         assert_eq!(desc.into_single_descriptors().unwrap(), vec![
             Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/7'/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/0/*)))").unwrap(),
@@ -2276,7 +2377,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         ]);
 
         // Even if only one of the keys is multipath.
-        let desc = Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
+        let desc = Descriptor::<DescriptorPublicKey>::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
         assert!(desc.is_multipath());
         assert_eq!(desc.into_single_descriptors().unwrap(), vec![
             Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/0/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap(),
@@ -2284,7 +2385,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         ]);
 
         // We can detect regular single-path descriptors.
-        let notmulti_desc = Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
+        let notmulti_desc = Descriptor::<DescriptorPublicKey>::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
         assert!(!notmulti_desc.is_multipath());
         assert_eq!(notmulti_desc.clone().into_single_descriptors().unwrap(), vec![notmulti_desc]);
 

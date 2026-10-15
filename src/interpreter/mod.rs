@@ -15,6 +15,8 @@ use bitcoin::hashes::{hash160, ripemd160, sha256};
 use bitcoin::{absolute, relative, Sequence};
 use elements::{secp256k1_zkp as secp256k1, sighash, TxOut, Witness};
 
+use crate::descriptor::csfs_cov;
+use crate::extensions::TxEnv;
 use crate::miniscript::context::{NoChecks, SigType};
 use crate::miniscript::ScriptContext;
 use crate::prelude::*;
@@ -22,21 +24,28 @@ use crate::{
     elementssig_from_rawsig, hash256, Descriptor, ElementsSig, Miniscript, Terminal, ToPublicKey,
 };
 
+mod covenant;
 mod error;
 mod inner;
 mod stack;
 
+use self::covenant::InterpreterExt;
 pub use self::error::Error;
 use self::error::PkEvalErrInner;
-use self::stack::Stack;
+pub use self::stack::{Element, Stack};
 use crate::MiniscriptKey;
+
+// The Miniscript being interpreted: keys of any context, and the extension fragments of the
+// context that it was decoded in.
+type NoChecksMs = Miniscript<BitcoinKey, NoChecks, InterpreterExt>;
 
 /// An iterable Miniscript-structured representation of the spending of a coin
 pub struct Interpreter<'txin> {
     inner: inner::Inner,
     stack: Stack<'txin>,
     /// For non-Taproot spends, the scriptCode; for Taproot script-spends, this
-    /// is the leaf script; for key-spends it is `None`.
+    /// is the leaf script; for key-spends it is `None`. For `elcovwsh` spends,
+    /// this is the scriptCode of the Miniscript signatures, the whole witness script.
     script_code: Option<elements::Script>,
     sequence: Sequence,
     lock_time: absolute::LockTime,
@@ -154,8 +163,13 @@ impl<'txin> Interpreter<'txin> {
     }
 
     /// Same as [`Interpreter::iter`], but allows for a custom verification function.
+    /// Use [`Iter::with_tx_env`] for fragments that inspect the transaction.
     /// See [Self::iter_assume_sigs] for a simpler API without information about Prevouts
     /// but skips the signature verification
+    ///
+    /// For an `elcovwsh` spend, the iterator returns [`Error::MissingCovenantVerifier`] at once.
+    /// Its covenant signature and the signatures of its Miniscript sign different scriptCodes,
+    /// which a [`KeySigPair`] does not identify. See [`Interpreter::iter_custom_with_covenant`].
     pub fn iter_custom<'iter>(
         &'iter self,
         verify_sig: Box<dyn FnMut(&KeySigPair) -> bool + 'iter>,
@@ -167,19 +181,43 @@ impl<'txin> Interpreter<'txin> {
             } else {
                 None
             },
-            state: if let inner::Inner::Script(ref script, _) = self.inner {
-                vec![NodeEvaluationState { node: script, n_evaluated: 0, n_satisfied: 0 }]
-            } else {
-                vec![]
+            state: match self.inner {
+                inner::Inner::Script(ref script, _) | inner::Inner::CovScript(_, ref script) => {
+                    vec![NodeEvaluationState { node: script, n_evaluated: 0, n_satisfied: 0 }]
+                }
+                inner::Inner::PublicKey(..) => vec![],
             },
             // Cloning the references to elements of stack should be fine as it allows
             // call interpreter.iter() without mutating interpreter
             stack: self.stack.clone(),
             sequence: self.sequence,
             lock_time: self.lock_time,
+            tx_env: None,
+            covenant_key: if let inner::Inner::CovScript(pk, _) = self.inner {
+                Some(pk)
+            } else {
+                None
+            },
+            verify_covenant_sig: None,
             has_errored: false,
             sig_type: self.sig_type(),
         }
+    }
+
+    /// Same as [`Interpreter::iter_custom`], but also checks the covenant signature of an
+    /// `elcovwsh` spend, with `verify_covenant_sig`.
+    ///
+    /// The covenant signature signs the script after the `OP_CODESEPARATOR` of the witness
+    /// script as scriptCode. The signatures of the Miniscript, which `verify_sig` checks, sign
+    /// the whole witness script.
+    pub fn iter_custom_with_covenant<'iter>(
+        &'iter self,
+        verify_sig: Box<dyn FnMut(&KeySigPair) -> bool + 'iter>,
+        verify_covenant_sig: Box<dyn FnMut(&KeySigPair) -> bool + 'iter>,
+    ) -> Iter<'txin, 'iter> {
+        let mut iter = self.iter_custom(verify_sig);
+        iter.verify_covenant_sig = Some(verify_covenant_sig);
+        iter
     }
 
     /// Verify a signature for a given transaction and prevout information
@@ -190,6 +228,9 @@ impl<'txin> Interpreter<'txin> {
     /// - the input index is out of range
     /// - Insufficient sighash information is present
     /// - sighash single without corresponding output
+    ///
+    /// For an `elcovwsh` spend, this checks the signatures of the Miniscript, whose scriptCode
+    /// is the whole witness script, and so rejects the covenant signature.
     // TODO: Create a good first issue to change this to error
     // TODO: Requires refactor to remove the script_code logic in order to use the new sighash API.
     pub fn verify_sig<C: secp256k1::Verification, T: Borrow<TxOut>>(
@@ -199,6 +240,22 @@ impl<'txin> Interpreter<'txin> {
         input_idx: usize,
         prevouts: &sighash::Prevouts<T>,
         genesis_hash: elements::BlockHash,
+        sig: &KeySigPair,
+    ) -> bool {
+        let script_code = self.script_code.as_ref();
+        self.verify_sig_with(secp, tx, input_idx, prevouts, genesis_hash, script_code, sig)
+    }
+
+    // `verify_sig`, with `script_code` in place of the scriptCode or leaf script of the spend
+    #[allow(clippy::too_many_arguments)]
+    fn verify_sig_with<C: secp256k1::Verification, T: Borrow<TxOut>>(
+        &self,
+        secp: &secp256k1::Secp256k1<C>,
+        tx: &elements::Transaction,
+        input_idx: usize,
+        prevouts: &sighash::Prevouts<T>,
+        genesis_hash: elements::BlockHash,
+        script_code: Option<&elements::Script>,
         sig: &KeySigPair,
     ) -> bool {
         fn get_prevout<'u, T: Borrow<TxOut>>(
@@ -224,7 +281,7 @@ impl<'txin> Interpreter<'txin> {
                 if input_idx >= tx.input.len() {
                     return false;
                 }
-                let script_pubkey = self.script_code.as_ref().expect("Legacy have script code");
+                let script_pubkey = script_code.expect("Legacy have script code");
                 let sighash = if self.is_legacy() {
                     cache.legacy_sighash(input_idx, script_pubkey, ecdsa_sig.1)
                 } else if self.is_segwit_v0() {
@@ -251,7 +308,7 @@ impl<'txin> Interpreter<'txin> {
                         genesis_hash,
                     )
                 } else if self.is_taproot_v1_script_spend() {
-                    let tap_script = self.script_code.as_ref().expect(
+                    let tap_script = script_code.expect(
                         "Internal Hack: Saving leaf script instead\
                         of script code for script spend",
                     );
@@ -296,6 +353,12 @@ impl<'txin> Interpreter<'txin> {
     /// - For legacy outputs, no information about prevouts is required
     /// - For segwitv0 outputs, prevout at corresponding index with correct amount must be provided
     /// - For taproot outputs, information about all prevouts and the chain's genesis hash must be supplied
+    ///
+    /// Covenant fragments, which inspect the transaction, need all prevouts.
+    ///
+    /// For an `elcovwsh` spend, the covenant signature is checked against the script after the
+    /// `OP_CODESEPARATOR` of the witness script, and the signatures of the Miniscript against
+    /// the whole witness script.
     pub fn iter<'iter, C: secp256k1::Verification, T: Borrow<TxOut>>(
         &'iter self,
         secp: &'iter secp256k1::Secp256k1<C>,
@@ -304,14 +367,32 @@ impl<'txin> Interpreter<'txin> {
         prevouts: &'iter sighash::Prevouts<T>, // actually a 'prevouts, but 'prevouts: 'iter
         genesis_hash: elements::BlockHash,     // required for the Elements BIP341 sighash
     ) -> Iter<'txin, 'iter> {
-        self.iter_custom(Box::new(move |sig| {
+        let mut iter = self.iter_custom(Box::new(move |sig| {
             self.verify_sig(secp, tx, input_idx, prevouts, genesis_hash, sig)
-        }))
+        }));
+        if iter.covenant_key.is_some() {
+            let script_code = csfs_cov::script::script_code();
+            iter.verify_covenant_sig = Some(Box::new(move |sig: &KeySigPair| {
+                let script_code = Some(&script_code);
+                self.verify_sig_with(secp, tx, input_idx, prevouts, genesis_hash, script_code, sig)
+            }));
+        }
+        if let inner::Inner::Script(_, inner::ScriptType::Tr { tx_env: true }) = self.inner {
+            if let sighash::Prevouts::All(prevouts) = prevouts {
+                iter.tx_env = TxEnv::from_iter(tx, prevouts.iter().map(Borrow::borrow), input_idx);
+            }
+        }
+        iter
     }
 
-    /// Creates an iterator over the satisfied spending conditions without checking signatures
+    /// Creates an iterator over the satisfied spending conditions without checking transaction
+    /// signatures
+    ///
+    /// Signatures of other messages are still checked: those of `csfs` fragments, and the
+    /// covenant signature of an `elcovwsh` spend over the preimage items of its witness. Only the
+    /// transaction signature by the covenant key shows that these items are of the transaction.
     pub fn iter_assume_sigs<'iter>(&'iter self) -> Iter<'txin, 'iter> {
-        self.iter_custom(Box::new(|_| true))
+        self.iter_custom_with_covenant(Box::new(|_| true), Box::new(|_| true))
     }
 
     /// Outputs a "descriptor" string which reproduces the spent coins
@@ -344,11 +425,12 @@ impl<'txin> Interpreter<'txin> {
             inner::Inner::Script(ref ms, inner::ScriptType::Sh) => format!("elsh({})", ms),
             inner::Inner::Script(ref ms, inner::ScriptType::Wsh) => format!("elwsh({})", ms),
             inner::Inner::Script(ref ms, inner::ScriptType::ShWsh) => format!("elsh(wsh({}))", ms),
-            inner::Inner::Script(ref ms, inner::ScriptType::Tr) => {
+            inner::Inner::Script(ref ms, inner::ScriptType::Tr { .. }) => {
                 // Hidden paths are still under discussion, once the spec is finalized, we can support
                 // rawnode and raw leaf.
                 format!("eltr(hidden_paths_not_yet_supported,{})", ms)
             }
+            inner::Inner::CovScript(ref pk, ref ms) => format!("elcovwsh({},{})", pk, ms),
         }
     }
 
@@ -364,7 +446,8 @@ impl<'txin> Interpreter<'txin> {
             inner::Inner::Script(_, inner::ScriptType::Sh) => true,
             inner::Inner::Script(_, inner::ScriptType::Wsh) => false,
             inner::Inner::Script(_, inner::ScriptType::ShWsh) => false, // lol "sorta"
-            inner::Inner::Script(_, inner::ScriptType::Tr) => false,
+            inner::Inner::Script(_, inner::ScriptType::Tr { .. }) => false,
+            inner::Inner::CovScript(..) => false,
         }
     }
 
@@ -380,7 +463,8 @@ impl<'txin> Interpreter<'txin> {
             inner::Inner::Script(_, inner::ScriptType::Sh) => false,
             inner::Inner::Script(_, inner::ScriptType::Wsh) => true,
             inner::Inner::Script(_, inner::ScriptType::ShWsh) => true, // lol "sorta"
-            inner::Inner::Script(_, inner::ScriptType::Tr) => false,
+            inner::Inner::Script(_, inner::ScriptType::Tr { .. }) => false,
+            inner::Inner::CovScript(..) => true,
         }
     }
 
@@ -396,7 +480,8 @@ impl<'txin> Interpreter<'txin> {
             inner::Inner::Script(_, inner::ScriptType::Sh) => false,
             inner::Inner::Script(_, inner::ScriptType::Wsh) => false,
             inner::Inner::Script(_, inner::ScriptType::ShWsh) => false,
-            inner::Inner::Script(_, inner::ScriptType::Tr) => false,
+            inner::Inner::Script(_, inner::ScriptType::Tr { .. }) => false,
+            inner::Inner::CovScript(..) => false,
         }
     }
 
@@ -412,7 +497,8 @@ impl<'txin> Interpreter<'txin> {
             inner::Inner::Script(_, inner::ScriptType::Sh) => false,
             inner::Inner::Script(_, inner::ScriptType::Wsh) => false,
             inner::Inner::Script(_, inner::ScriptType::ShWsh) => false,
-            inner::Inner::Script(_, inner::ScriptType::Tr) => true,
+            inner::Inner::Script(_, inner::ScriptType::Tr { .. }) => true,
+            inner::Inner::CovScript(..) => false,
         }
     }
 
@@ -420,7 +506,7 @@ impl<'txin> Interpreter<'txin> {
     pub fn sig_type(&self) -> SigType {
         match self.inner {
             inner::Inner::PublicKey(_, inner::PubkeyType::Tr) => SigType::Schnorr,
-            inner::Inner::Script(_, inner::ScriptType::Tr) => SigType::Schnorr,
+            inner::Inner::Script(_, inner::ScriptType::Tr { .. }) => SigType::Schnorr,
             inner::Inner::PublicKey(_, inner::PubkeyType::Pk)
             | inner::Inner::PublicKey(_, inner::PubkeyType::Pkh)
             | inner::Inner::PublicKey(_, inner::PubkeyType::Wpkh)
@@ -428,7 +514,8 @@ impl<'txin> Interpreter<'txin> {
             | inner::Inner::Script(_, inner::ScriptType::Bare)
             | inner::Inner::Script(_, inner::ScriptType::Sh)
             | inner::Inner::Script(_, inner::ScriptType::Wsh)
-            | inner::Inner::Script(_, inner::ScriptType::ShWsh) => SigType::Ecdsa,
+            | inner::Inner::Script(_, inner::ScriptType::ShWsh)
+            | inner::Inner::CovScript(..) => SigType::Ecdsa,
         }
     }
 
@@ -500,7 +587,7 @@ pub enum SatisfiedConstraint {
 ///depending on evaluation of the children.
 struct NodeEvaluationState<'intp> {
     ///The node which is being evaluated
-    node: &'intp Miniscript<BitcoinKey, NoChecks>,
+    node: &'intp NoChecksMs,
     ///number of children evaluated
     n_evaluated: usize,
     ///number of children satisfied
@@ -525,6 +612,12 @@ pub struct Iter<'intp, 'txin: 'intp> {
     stack: Stack<'txin>,
     sequence: Sequence,
     lock_time: absolute::LockTime,
+    tx_env: Option<TxEnv<'txin, 'txin>>,
+    // The key of an `elcovwsh` spend, until its covenant check succeeds
+    covenant_key: Option<bitcoin::PublicKey>,
+    // Checks the covenant signature, which does not sign the scriptCode of `verify_sig`
+    #[allow(clippy::type_complexity)]
+    verify_covenant_sig: Option<Box<dyn FnMut(&KeySigPair) -> bool + 'intp>>,
     has_errored: bool,
     sig_type: SigType,
 }
@@ -554,10 +647,17 @@ impl<'intp, 'txin: 'intp> Iter<'intp, 'txin>
 where
     NoChecks: ScriptContext,
 {
+    /// Supplies the transaction and spent outputs for covenant evaluation with a custom
+    /// signature verifier. The environment must describe the input being interpreted.
+    pub fn with_tx_env(mut self, env: TxEnv<'txin, 'txin>) -> Self {
+        self.tx_env = Some(env);
+        self
+    }
+
     /// Helper function to push a NodeEvaluationState on state stack
     fn push_evaluation_state(
         &mut self,
-        node: &'intp Miniscript<BitcoinKey, NoChecks>,
+        node: &'intp NoChecksMs,
         n_evaluated: usize,
         n_satisfied: usize,
     ) {
@@ -567,6 +667,9 @@ where
 
     /// Helper function to step the iterator
     fn iter_next(&mut self) -> Option<Result<SatisfiedConstraint, Error>> {
+        if self.covenant_key.is_some() && self.verify_covenant_sig.is_none() {
+            return Some(Err(Error::MissingCovenantVerifier));
+        }
         while let Some(node_state) = self.state.pop() {
             //non-empty stack
             match node_state.node.node {
@@ -658,6 +761,15 @@ where
                     let res = self.stack.evaluate_ripemd160(hash);
                     if res.is_some() {
                         return res;
+                    }
+                }
+                Terminal::Ext(ref ext) => {
+                    debug_assert_eq!(node_state.n_evaluated, 0);
+                    debug_assert_eq!(node_state.n_satisfied, 0);
+                    match ext.evaluate(&mut self.stack, self.tx_env.as_ref()) {
+                        Ok(true) => self.stack.push(stack::Element::Satisfied),
+                        Ok(false) => self.stack.push(stack::Element::Dissatisfied),
+                        Err(e) => return Some(Err(e)),
                     }
                 }
                 Terminal::Alt(ref sub) | Terminal::Swap(ref sub) | Terminal::Check(ref sub) => {
@@ -994,8 +1106,27 @@ where
         }
 
         //state empty implies that either the execution has terminated or we have a
-        //Pk based descriptor
-        if let Some(pk) = self.public_key {
+        //Pk based descriptor or a Covenant descriptor
+        if let (Some(key), Some(verify_sig)) =
+            (self.covenant_key, self.verify_covenant_sig.as_mut())
+        {
+            // The witness script verifies the result of the Miniscript, which keeps the
+            // covenant items below its witness, then checks the covenant.
+            if self.stack.pop() != Some(stack::Element::Satisfied) {
+                return Some(Err(Error::ScriptSatisfactionError));
+            }
+            let items = self.stack.split_off(0);
+            match covenant::check(key, &items, verify_sig) {
+                Ok(key_sig) => {
+                    //Covenant check successful, set covenant_key to None to
+                    //terminate the next() function in the subsequent call
+                    self.covenant_key = None;
+                    self.stack.push(stack::Element::Satisfied);
+                    Some(Ok(SatisfiedConstraint::PublicKey { key_sig }))
+                }
+                Err(e) => Some(Err(e)),
+            }
+        } else if let Some(pk) = self.public_key {
             if let Some(stack::Element::Push(sig)) = self.stack.pop() {
                 if let Ok(key_sig) = verify_sersig(&mut self.verify_sig, pk, sig) {
                     //Signature check successful, set public_key to None to
@@ -1129,7 +1260,7 @@ mod tests {
         fn from_stack<'txin, 'elem>(
             verify_fn: Box<dyn FnMut(&KeySigPair) -> bool + 'elem>,
             stack: Stack<'txin>,
-            ms: &'elem Miniscript<BitcoinKey, NoChecks>,
+            ms: &'elem NoChecksMs,
         ) -> Iter<'elem, 'txin> {
             Iter {
                 verify_sig: verify_fn,
@@ -1138,6 +1269,9 @@ mod tests {
                 state: vec![NodeEvaluationState { node: ms, n_evaluated: 0, n_satisfied: 0 }],
                 sequence: Sequence::from_height(1002),
                 lock_time: absolute::LockTime::from_height(1002).unwrap(),
+                tx_env: None,
+                covenant_key: None,
+                verify_covenant_sig: None,
                 has_errored: false,
                 sig_type: SigType::Ecdsa,
             }
@@ -1591,13 +1725,13 @@ mod tests {
 
     // By design there is no support for parse a miniscript with BitcoinKey
     // because it does not implement FromStr
-    fn no_checks_ms(ms: &str) -> Miniscript<BitcoinKey, NoChecks> {
+    fn no_checks_ms(ms: &str) -> NoChecksMs {
         // Parsing should allow raw hashes in the interpreter
         let elem: Miniscript<bitcoin::PublicKey, NoChecks> = ms.parse().unwrap();
         elem.to_no_checks_ms()
     }
 
-    fn x_only_no_checks_ms(ms: &str) -> Miniscript<BitcoinKey, NoChecks> {
+    fn x_only_no_checks_ms(ms: &str) -> NoChecksMs {
         let elem: Miniscript<bitcoin::XOnlyPublicKey, NoChecks> = ms.parse().unwrap();
         elem.to_no_checks_ms()
     }

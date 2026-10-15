@@ -13,23 +13,29 @@ use bitcoin::hex::DisplayHex as _;
 use crate::prelude::*;
 
 /// Atom of a tokenized version of a script
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(missing_docs)]
 pub enum Token {
     BoolAnd,
     BoolOr,
     Add,
+    Sub,
     Equal,
     NumEqual,
     CheckSig,
     CheckSigAdd,
+    CheckSigFromStack,
     CheckMultiSig,
     CheckSequenceVerify,
     CheckLockTimeVerify,
     FromAltStack,
     ToAltStack,
     Drop,
+    Nip,
     Dup,
+    Depth,
+    Pick,
+    Dup2,
     If,
     IfDup,
     NotIf,
@@ -38,22 +44,50 @@ pub enum Token {
     ZeroNotEqual,
     Size,
     Swap,
+    Cat,
+    Invert,
+    And,
+    Or,
+    Xor,
     Verify,
     Ripemd160,
     Hash160,
     Sha256,
     Hash256,
+    CurrInp,
+    InpAsset,
+    InpValue,
+    InpSpk,
+    InpIssue,
+    OutAsset,
+    OutValue,
+    OutSpk,
+    Add64,
+    Sub64,
+    Mul64,
+    Div64,
+    Neg64,
+    Le64,
+    Leq64,
+    Ge64,
+    Geq64,
+    ScriptNumToLe64,
+    Le64ToScriptNum,
+    NumNeg1,
     Num(u32),
+    Bytes8([u8; 8]),
     Hash20([u8; 20]),
     Bytes32([u8; 32]),
     Bytes33([u8; 33]),
     Bytes65([u8; 65]),
+    Push(Vec<u8>),
 }
 
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             Self::Num(n) => write!(f, "#{}", n),
+            Self::Bytes8(b) => write!(f, "{}", b.as_hex()),
             Self::Hash20(b) => write!(f, "{}", b.as_hex()),
             Self::Bytes32(b) => write!(f, "{}", b.as_hex()),
             Self::Bytes33(b) => write!(f, "{}", b.as_hex()),
@@ -84,6 +118,12 @@ impl TokenIter {
 
     /// Returns true if iterator is empty.
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
+
+    /// The remaining tokens in script order, so the next token is the last one.
+    pub fn as_slice(&self) -> &[Token] { &self.0 }
+
+    /// Consumes all tokens from position `len` of [`Self::as_slice`] onward.
+    pub fn truncate(&mut self, len: usize) { self.0.truncate(len) }
 }
 
 impl Iterator for TokenIter {
@@ -185,8 +225,9 @@ pub fn lex(script: &'_ script::Script) -> Result<Vec<Token>, Error> {
                 match ret.last() {
                     Some(op @ &Token::Equal)
                     | Some(op @ &Token::CheckSig)
+                    | Some(op @ &Token::CheckSigFromStack)
                     | Some(op @ &Token::CheckMultiSig) => {
-                        return Err(Error::NonMinimalVerify(*op));
+                        return Err(Error::NonMinimalVerify(op.clone()));
                     }
                     _ => {}
                 }
@@ -206,6 +247,8 @@ pub fn lex(script: &'_ script::Script) -> Result<Vec<Token>, Error> {
             }
             script::Instruction::PushBytes(bytes) => {
                 if let Ok(bytes) = bytes.as_bytes().try_into() {
+                    ret.push(Token::Bytes8(bytes));
+                } else if let Ok(bytes) = bytes.as_bytes().try_into() {
                     ret.push(Token::Hash20(bytes));
                 } else if let Ok(bytes) = bytes.as_bytes().try_into() {
                     ret.push(Token::Bytes32(bytes));
@@ -219,10 +262,16 @@ pub fn lex(script: &'_ script::Script) -> Result<Vec<Token>, Error> {
                         Ok(v) if v >= 0 => {
                             ret.push(Token::Num(v as u32));
                         }
+                        _ if matches!(ret.last(), Some(Token::Pick | Token::Cat)) => {
+                            ret.push(Token::Push(bytes.as_bytes().to_vec()));
+                        }
                         Ok(n) => return Err(Error::NegativeInt { bytes: bytes.to_owned(), n }),
                         Err(err) => return Err(Error::InvalidInt { bytes: bytes.to_owned(), err }),
                     }
                 }
+            }
+            script::Instruction::Op(opcodes::all::OP_PUSHNUM_NEG1) => {
+                ret.push(Token::NumNeg1);
             }
             script::Instruction::Op(opcodes::all::OP_PUSHBYTES_0) => {
                 ret.push(Token::Num(0));
@@ -275,7 +324,49 @@ pub fn lex(script: &'_ script::Script) -> Result<Vec<Token>, Error> {
             script::Instruction::Op(opcodes::all::OP_PUSHNUM_16) => {
                 ret.push(Token::Num(16));
             }
-            script::Instruction::Op(op) => return Err(Error::InvalidOpcode(op)),
+            // Elements opcodes, which Bitcoin leaves disabled or undefined.
+            script::Instruction::Op(op) => {
+                use elements::opcodes::all as el;
+
+                let token = match elements::opcodes::All::from(op.to_u8()) {
+                    el::OP_SUB => Token::Sub,
+                    el::OP_NIP => Token::Nip,
+                    el::OP_2DUP => Token::Dup2,
+                    el::OP_CAT => Token::Cat,
+                    el::OP_DEPTH => Token::Depth,
+                    el::OP_PICK => Token::Pick,
+                    el::OP_INVERT => Token::Invert,
+                    el::OP_AND => Token::And,
+                    el::OP_OR => Token::Or,
+                    el::OP_XOR => Token::Xor,
+                    el::OP_CHECKSIGFROMSTACK => Token::CheckSigFromStack,
+                    el::OP_CHECKSIGFROMSTACKVERIFY => {
+                        ret.push(Token::CheckSigFromStack);
+                        Token::Verify
+                    }
+                    el::OP_PUSHCURRENTINPUTINDEX => Token::CurrInp,
+                    el::OP_INSPECTINPUTASSET => Token::InpAsset,
+                    el::OP_INSPECTINPUTVALUE => Token::InpValue,
+                    el::OP_INSPECTINPUTSCRIPTPUBKEY => Token::InpSpk,
+                    el::OP_INSPECTINPUTISSUANCE => Token::InpIssue,
+                    el::OP_INSPECTOUTPUTASSET => Token::OutAsset,
+                    el::OP_INSPECTOUTPUTVALUE => Token::OutValue,
+                    el::OP_INSPECTOUTPUTSCRIPTPUBKEY => Token::OutSpk,
+                    el::OP_ADD64 => Token::Add64,
+                    el::OP_SUB64 => Token::Sub64,
+                    el::OP_MUL64 => Token::Mul64,
+                    el::OP_DIV64 => Token::Div64,
+                    el::OP_NEG64 => Token::Neg64,
+                    el::OP_LESSTHAN64 => Token::Le64,
+                    el::OP_LESSTHANOREQUAL64 => Token::Leq64,
+                    el::OP_GREATERTHAN64 => Token::Ge64,
+                    el::OP_GREATERTHANOREQUAL64 => Token::Geq64,
+                    el::OP_SCRIPTNUMTOLE64 => Token::ScriptNumToLe64,
+                    el::OP_LE64TOSCRIPTNUM => Token::Le64ToScriptNum,
+                    _ => return Err(Error::InvalidOpcode(op)),
+                };
+                ret.push(token);
+            }
         };
     }
     Ok(ret)

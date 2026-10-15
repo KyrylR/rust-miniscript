@@ -26,7 +26,7 @@ use crate::miniscript::{Miniscript, ScriptContext};
 use crate::sync::Arc;
 #[cfg(all(not(feature = "std"), not(test)))]
 use crate::Vec;
-use crate::{Error, MiniscriptKey, Terminal, Threshold};
+use crate::{Error, Extension, MiniscriptKey, Terminal, Threshold};
 
 /// Policy entailment algorithm maximum number of terminals allowed.
 const ENTAILMENT_MAX_TERMINALS: usize = 20;
@@ -61,6 +61,8 @@ pub enum LiftError {
     BranchExceedResourceLimits,
     /// Cannot lift raw descriptors.
     RawDescriptorLift,
+    /// Cannot lift extension fragments.
+    ExtensionLift,
 }
 
 impl fmt::Display for LiftError {
@@ -73,6 +75,7 @@ impl fmt::Display for LiftError {
                 "Cannot lift policies containing one branch that exceeds resource limits",
             ),
             Self::RawDescriptorLift => f.write_str("Cannot lift raw descriptors"),
+            Self::ExtensionLift => f.write_str("Cannot lift extension fragments"),
         }
     }
 }
@@ -83,12 +86,13 @@ impl error::Error for LiftError {
         match self {
             Self::HeightTimelockCombination
             | Self::BranchExceedResourceLimits
-            | Self::RawDescriptorLift => None,
+            | Self::RawDescriptorLift
+            | Self::ExtensionLift => None,
         }
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Miniscript<Pk, Ctx, Ext> {
     /// Lifting corresponds to conversion of a miniscript into a [`Semantic`]
     /// policy for human readable or machine analysis. However, naively lifting
     /// miniscripts can result in incorrect interpretations that don't
@@ -107,7 +111,9 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Liftable<Pk> for Miniscript<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: Extension> Liftable<Pk>
+    for Miniscript<Pk, Ctx, Ext>
+{
     fn lift(&self) -> Result<Semantic<Pk>, Error> {
         // check whether the root miniscript can have a spending path that is
         // a combination of heightlock and timelock
@@ -122,6 +128,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Liftable<Pk> for Miniscript<Pk, Ctx>
                 Terminal::RawPkH(ref _pkh) => {
                     return Err(Error::LiftError(LiftError::RawDescriptorLift))
                 }
+                Terminal::Ext(..) => return Err(Error::LiftError(LiftError::ExtensionLift)),
                 Terminal::After(t) => Arc::new(Semantic::After(t)),
                 Terminal::Older(t) => Arc::new(Semantic::Older(t)),
                 Terminal::Sha256(ref h) => Arc::new(Semantic::Sha256(h.clone())),
@@ -173,7 +180,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Liftable<Pk> for Miniscript<Pk, Ctx>
     }
 }
 
-impl<Pk: MiniscriptKey> Liftable<Pk> for Descriptor<Pk> {
+impl<Pk: MiniscriptKey, Ext: Extension> Liftable<Pk> for Descriptor<Pk, Ext> {
     fn lift(&self) -> Result<Semantic<Pk>, Error> {
         match *self {
             Self::Bare(ref bare) => bare.lift(),
@@ -182,6 +189,11 @@ impl<Pk: MiniscriptKey> Liftable<Pk> for Descriptor<Pk> {
             Self::Wsh(ref wsh) => wsh.lift(),
             Self::Sh(ref sh) => sh.lift(),
             Self::Tr(ref tr) => tr.lift(),
+            Self::LegacyCSFSCov(ref cov) => Ok(Semantic::Thresh(Threshold::and(
+                Arc::new(Semantic::Key(cov.pk().clone())),
+                Arc::new(cov.as_inner().lift()?),
+            ))
+            .normalized()),
         }
     }
 }
@@ -240,7 +252,7 @@ mod tests {
     use crate::prelude::*;
     use crate::RelLockTime;
     #[cfg(feature = "compiler")]
-    use crate::{descriptor::TapTree, Tap};
+    use crate::{descriptor::TapTree, NoExt, Tap};
 
     type ConcretePol = Concrete<String>;
     type SemanticPol = Semantic<String>;
@@ -375,9 +387,9 @@ mod tests {
             let descriptor = policy.compile_tr(Some(unspendable_key.clone())).unwrap();
 
             let ms_compilation: Miniscript<String, Tap> = ms_str!("multi_a(2,A,B,C,D)");
-            let tree: TapTree<String> = TapTree::leaf(ms_compilation);
+            let tree: TapTree<String, NoExt> = TapTree::leaf(ms_compilation);
             let expected_descriptor =
-                Descriptor::new_tr(unspendable_key.clone(), Some(tree)).unwrap();
+                Descriptor::Tr(Tr::new(unspendable_key.clone(), Some(tree)).unwrap());
             assert_eq!(descriptor, expected_descriptor);
         }
 
@@ -394,7 +406,7 @@ mod tests {
             let tree = TapTree::combine(left, right).unwrap();
 
             let expected_descriptor =
-                Descriptor::new_tr(unspendable_key.clone(), Some(tree)).unwrap();
+                Descriptor::Tr(Tr::new(unspendable_key.clone(), Some(tree)).unwrap());
             assert_eq!(descriptor, expected_descriptor);
         }
 
@@ -476,7 +488,7 @@ mod tests {
             )
             .unwrap();
 
-            let expected_descriptor = Descriptor::new_tr("E".to_string(), Some(tree)).unwrap();
+            let expected_descriptor = Descriptor::Tr(Tr::new("E".to_string(), Some(tree)).unwrap());
             assert_eq!(descriptor, expected_descriptor);
         }
     }
@@ -495,7 +507,7 @@ mod tests {
                 .compile_tr_private_experimental(Some(unspendable_key.clone()))
                 .unwrap();
             let expected_desc = Descriptor::Tr(
-                Tr::<String>::from_str(
+                Tr::<String, NoExt>::from_str(
                     "eltr(UNSPEND ,{
                 {
                     {and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(B),pk(C)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H)),and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(C)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H))},
@@ -521,7 +533,7 @@ mod tests {
                 .unwrap();
             println!("{}", desc);
             let expected_desc = Descriptor::Tr(
-                Tr::<String>::from_str(
+                Tr::<String, NoExt>::from_str(
                     "eltr(UNSPEND,
                     {{
                         {and_v(v:and_v(v:pk(A),pk(D)),pk(E)),and_v(v:and_v(v:pk(A),pk(C)),pk(E))},

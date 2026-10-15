@@ -11,8 +11,8 @@ use crate::miniscript::limits::{MAX_PUBKEYS_IN_CHECKSIGADD, MAX_PUBKEYS_PER_MULT
 use crate::plan::AssetProvider;
 use crate::prelude::*;
 use crate::{
-    AbsLockTime, Miniscript, MiniscriptKey, RelLockTime, ScriptContext, Terminal, Threshold,
-    ToPublicKey,
+    AbsLockTime, Miniscript, MiniscriptKey, ParseableExt, RelLockTime, ScriptContext, Terminal,
+    Threshold, ToPublicKey,
 };
 
 pub(super) struct SatDissat<Pk: MiniscriptKey> {
@@ -300,8 +300,8 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
     /// If the `malleable` flag is set to true, more efficient satisfactions may be found,
     /// but which a 3rd party may be able to replace with less efficient versions. (This
     /// flag does not affect dissatisfactions.)
-    pub(super) fn sat_dissat<Ctx, Sat>(
-        node: &Miniscript<Pk, Ctx>,
+    pub(super) fn sat_dissat<Ctx, Sat, Ext>(
+        node: &Miniscript<Pk, Ctx, Ext>,
         stfr: &Sat,
         malleable: bool,
         root_has_sig: bool,
@@ -310,6 +310,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
     where
         Ctx: ScriptContext,
         Sat: AssetProvider<Pk>,
+        Ext: ParseableExt,
     {
         let min_fn = if malleable {
             Self::minimum_mall
@@ -348,6 +349,10 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
                 Terminal::Hash160(ref h) => Self::hash160(stfr, h),
                 Terminal::Sha256(ref h) => Self::sha256(stfr, h),
                 Terminal::Hash256(ref h) => Self::hash256(stfr, h),
+                Terminal::Ext(ref e) => {
+                    let (sat, dissat) = e.sat_dissat(stfr, root_has_sig);
+                    SatDissat { dissat, sat }
+                }
                 // These four wrappers have no effect on either satisfaction nor dissatisfaction
                 Terminal::Alt(_)
                 | Terminal::Swap(_)

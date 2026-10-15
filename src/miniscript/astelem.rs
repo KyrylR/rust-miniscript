@@ -11,20 +11,23 @@ use bitcoin::absolute;
 use bitcoin::hashes::Hash;
 use elements::{opcodes, script};
 
+use crate::extensions::ParseableExt;
 use crate::miniscript::context::SigType;
 use crate::miniscript::ScriptContext;
 use crate::util::MsKeyBuilder;
 use crate::{Miniscript, MiniscriptKey, Terminal, ToPublicKey};
 
 /// Helper trait to add a `push_astelem` method to `script::Builder`
-trait PushAstElem<Pk: MiniscriptKey, Ctx: ScriptContext> {
-    fn push_astelem(self, ast: &Miniscript<Pk, Ctx>) -> Self
+trait PushAstElem<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: ParseableExt> {
+    fn push_astelem(self, ast: &Miniscript<Pk, Ctx, Ext>) -> Self
     where
         Pk: ToPublicKey;
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> PushAstElem<Pk, Ctx> for script::Builder {
-    fn push_astelem(self, ast: &Miniscript<Pk, Ctx>) -> Self
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: ParseableExt> PushAstElem<Pk, Ctx, Ext>
+    for script::Builder
+{
+    fn push_astelem(self, ast: &Miniscript<Pk, Ctx, Ext>) -> Self
     where
         Pk: ToPublicKey,
     {
@@ -32,7 +35,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> PushAstElem<Pk, Ctx> for script::Bui
     }
 }
 
-impl<Pk: MiniscriptKey, Ctx: ScriptContext> Terminal<Pk, Ctx> {
+impl<Pk: MiniscriptKey, Ctx: ScriptContext, Ext: ParseableExt> Terminal<Pk, Ctx, Ext> {
     /// Encode the element as a fragment of Elements Script. The inverse
     /// function, from Script to an AST element, is implemented in the
     /// `parse` module.
@@ -192,6 +195,7 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Terminal<Pk, Ctx> {
                     .push_int(thresh.k() as i64)
                     .push_opcode(opcodes::all::OP_NUMEQUAL)
             }
+            Self::Ext(ref e) => e.encode(builder),
         }
     }
 }

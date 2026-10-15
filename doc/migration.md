@@ -33,7 +33,9 @@ Formatting a parsed descriptor already includes its checksum.
 
 `Translator<P>` declares its output key and error types through the associated
 types `TargetPk` and `Error`. They are no longer extra trait parameters.
-Call the `translate_pk` method without importing `TranslatePk`.
+`ExtTranslator<PExt>` likewise declares `TargetExt` and `Error`. Call the
+`translate_pk` and `translate_ext` methods without importing `TranslatePk` or
+`TranslateExt`.
 
 `MiniscriptKey`, `ToPublicKey`, `ForEachKey`, `SigType` and `hash256` are
 defined by this crate instead of being re-exports from `bitcoin_miniscript`. A
@@ -120,6 +122,31 @@ The crate-wide error no longer wraps Bitcoin address parsing or P2SH constructio
 errors. Elements descriptor address methods do not produce these errors. Handle
 Bitcoin federation address errors through the pegin API.
 
+## Covenant extension storage
+
+`CovenantExt` variants contain boxed payloads. Use `Box::new(fragment)` when
+constructing a variant directly. Parsed extensions allocate this storage only
+for covenant fragments, keeping ordinary Miniscript nodes compact.
+
+## Message signatures
+
+`csfs` messages must be exactly 32 bytes, matching the Schnorr message API of the
+secp256k1 dependency. Older descriptor text accepted up to 80 bytes, though
+script decoding and interpretation did not support the other lengths.
+
+`csfs` signatures and price attestations can be replayed in another transaction.
+They do not make a spending branch safe by themselves. Combine them with a
+transaction signature such as `pk` to pass the default safety checks.
+
+## Compiled descriptors
+
+Policy compilation returns `Descriptor<Pk, NoExt>`, because the compiler emits
+ordinary Miniscript. Descriptor-consuming PSET methods accept this directly.
+When calling generic `parse_descriptor`, specify the key type, for example
+`Descriptor::<DescriptorPublicKey>::parse_descriptor`, to select the default
+covenant extension type. `NoExt` excludes extensions from Taproot Miniscript
+leaves; it does not disable the separate `elcovwsh` descriptor variant.
+
 ## Blinding key derivation
 
 Bare-key tweaks and SLIP-77 blinding key derivation return `Result`. Propagate
@@ -128,11 +155,58 @@ is invalid. Confidential descriptor methods wrap this error in
 `confidential::Error::BlindingKeyDerivation`. No replacement scalar or retry
 is used.
 
+## Introspection constructors
+
+`CovOps` has checked constructors instead of public variants. Use `asset_eq`,
+`value_eq`, `spk_eq`, `is_exp_asset` and `is_exp_value` to reject constants of
+the wrong type before script encoding. Null asset constants are rejected. Null value
+constants encode as explicit zero and decode in that form.
+`IdxExpr::Const` and `CovOps::curr_idx_eq` take `IdxConst`, whose constructor
+rejects values above `i32::MAX`. `CovOps::idx_eq` returns a `Result`. It and the
+other `CovOps` constructors and `Arith::new` reject operands nested deeper than
+script decoding allows.
+`idx_eq(i,curr_idx)` decodes from script as the equivalent `curr_idx_eq(i)`.
+Likewise, `inp_v(curr_idx)` decodes as `curr_inp_v`, and `inp_asset(curr_idx)`,
+`inp_value(curr_idx)` and `inp_spk(curr_idx)` decode as `curr_inp_asset`,
+`curr_inp_value` and `curr_inp_spk`.
+
+## Legacy covenant signatures
+
+`Satisfier::lookup_legacy_covenant_sig` supplies the signature over
+`LegacyCovSatisfier::sighash`. Use `CovenantSignature { key, signature }` from
+`descriptor::csfs_cov` in a tuple with the inner-script satisfier. Ordinary
+`lookup_ecdsa_sig` signatures sign the full witness script, as computed by
+`PsbtExt::sighash_msg`. The two signatures are distinct even for the same key.
+
+PSETs hold only one partial signature per key. The finalizer reserves the
+covenant key's entry for the covenant signature. It can use another inner
+spending path, but cannot finalize a path requiring that same key's inner
+signature. Direct satisfaction supports both signatures through the separate
+lookups.
+
 ## Interpreter constraints
 
 Unlike in rust-miniscript, `KeySigPair` and `SatisfiedConstraint` do not
 implement `Hash`, because the rust-elements signature types do not.
 
-`Interpreter::iter` now takes the Elements transaction, input index,
-prevouts, and genesis hash instead of the 0.5 `TxEnv`. Supply the matching
-prevouts and genesis hash when verifying Taproot signatures.
+## Issuance expressions
+
+`inp_issue_v` and `inp_reissue_v` check that `INSPECTINPUTISSUANCE` returned
+an issuance before selecting its amount. Without that check, an absent issuance
+lets the following stack operations consume witness data instead. Descriptors
+containing these expressions now produce different scripts and addresses.
+The decoder rejects the old unguarded encoding. Retain the original script
+and spending procedure for outputs created with that encoding.
+
+## Interpreter environments
+
+`Interpreter::iter` takes the Elements genesis hash and derives its transaction
+environment from `Prevouts::All`. Custom verifiers and `iter_assume_sigs` can
+supply one with `Iter::with_tx_env`. A missing environment produces
+`TxEnvNotPresent` when a fragment inspects the transaction.
+
+Implement `Satisfier::lookup_tx_env` instead of the separate transaction, spent
+output and input-index lookups. Access individual spent outputs through
+`TxEnv::spent_utxo`. `LegacyCovSatisfier` supplies the legacy covenant preimage
+items previously supplied by individual `lookup_nversion` through
+`lookup_sighashu32` methods.

@@ -189,7 +189,8 @@ mod tests {
 
         let want_sk = single.key;
         let descriptor_s = format!("elwpkh({})", descriptor_sk_s);
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let pk = want_sk.public_key(&secp);
         let request = KeyRequest::Pubkey(pk);
@@ -222,7 +223,8 @@ mod tests {
 
         let want_sk = xpriv.to_priv();
         let descriptor_s = format!("elwpkh([{}]{})", xpriv_fingerprint, xpriv);
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let pk = want_sk.public_key(&secp);
         let request = KeyRequest::Pubkey(pk);
@@ -257,7 +259,8 @@ mod tests {
 
         let want_sk = child.to_priv();
         let descriptor_s = format!("elwpkh({}/44')", s);
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let pk = want_sk.public_key(&secp);
         let request = KeyRequest::Pubkey(pk);
@@ -295,7 +298,8 @@ mod tests {
 
         let want_sk = child.to_priv();
         let descriptor_s = format!("elwpkh({}/44'/0'/0'/0/*)", s);
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let key_source = (master_fingerprint, derivation_path);
         let request = KeyRequest::Bip32(key_source);
@@ -313,7 +317,8 @@ mod tests {
 
         // Create a keymap with one key
         let descriptor_s = "elwpkh(cMk8gWmj1KpjdYnAWwsEDekodMYhbyYBhG8gMtCCxucJ98JzcNij)";
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor_s).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, descriptor_s).unwrap();
 
         // Request a different public key that doesn't exist in the keymap
         let different_sk =
@@ -342,7 +347,8 @@ mod tests {
 
         // Also test with KeyMap
         let descriptor_s = "elwpkh(xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi)";
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor_s).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, descriptor_s).unwrap();
 
         // While requesting an x-only key from an individual xpriv, that's an error.
         // But from a keymap, which might have both x-only keys and regular xprivs,
@@ -376,7 +382,8 @@ mod tests {
 
         // Also test with KeyMap; as in the previous test, the error turns to None.
         let descriptor_s = "elwpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/<0;1>/*)";
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor_s).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, descriptor_s).unwrap();
 
         let result = keymap.get_key(request.clone(), &secp).unwrap();
         assert!(result.is_none(), "Should return None when fingerprint doesn't match");
@@ -434,7 +441,9 @@ mod tests {
                 .unwrap()
                 .to_priv();
 
-            let (_, keymap) = Descriptor::parse_descriptor(&secp, test_case.descriptor).unwrap();
+            let (_, keymap) =
+                Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, test_case.descriptor)
+                    .unwrap();
 
             let (fingerprint, derivation_path) = test_case.key_request;
             let key_request = KeyRequest::Bip32((
@@ -457,7 +466,8 @@ mod tests {
 
         // descriptor with a fixed derivation index of `0`.
         let descriptor = "elwpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/0)";
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, descriptor).unwrap();
 
         // the key_request has the correct `key_origin`, but the requested derivation index (`5`) does not match the
         // descriptor's fixed derivation index (`0`), so the descriptor does not own this key.
@@ -488,7 +498,8 @@ mod tests {
         let descriptor = format!("eltr({master_xprv}/{account_path}/0/*)");
         let request_path: DerivationPath = format!("{account_path}/9/7").parse().unwrap();
         let key_request = KeyRequest::Bip32((fp, request_path));
-        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor).unwrap();
+        let (_, keymap) =
+            Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &descriptor).unwrap();
         let result = keymap
             .get_key(key_request, &secp)
             .expect("key lookup should not fail");

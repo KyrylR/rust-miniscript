@@ -34,6 +34,8 @@ impl<Pk: MiniscriptKey> ItemSize for Placeholder<Pk> {
                 let block_len = cb.serialize().len();
                 block_len + varint_len(block_len)
             }
+            Self::CsfsSig(..) => 65,
+            Self::Data(data) => data.len() + varint_len(data.len()),
         }
     }
 }
