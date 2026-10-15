@@ -26,7 +26,10 @@ mod spend_info;
 mod taptree;
 
 pub use self::spend_info::{TrSpendInfo, TrSpendInfoIter, TrSpendInfoIterItem};
+use self::taptree::TapLeaf;
 pub use self::taptree::{TapTree, TapTreeDepthError, TapTreeIter, TapTreeIterItem};
+#[cfg(feature = "simplicity")]
+use crate::simplicity::SimplicityLeaf;
 
 /// A taproot descriptor
 pub struct Tr<Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
@@ -149,7 +152,8 @@ impl<Pk: MiniscriptKey, Ext: Extension> Tr<Pk, Ext> {
     /// sighash suffix.
     ///
     /// # Errors
-    /// When the descriptor is impossible to satisfy (ex: sh(OP_FALSE)).
+    /// When the descriptor is impossible to satisfy (ex: sh(OP_FALSE)), or has a Simplicity
+    /// leaf.
     ///
     /// Use `.unwrap_or(Weight::MAX)` if you want to avoid the error path here.
     pub fn max_weight_to_satisfy(&self) -> Result<Weight, Error> {
@@ -166,32 +170,26 @@ impl<Pk: MiniscriptKey, Ext: Extension> Tr<Pk, Ext> {
             // script path spend..
             Some(tree) => tree,
         };
-
-        let wu = tree
-            .leaves()
-            .filter_map(|leaf| {
-                let script_size = leaf.miniscript().script_size();
-                let max_sat_elems = leaf.miniscript().max_satisfaction_witness_elements().ok()?;
-                let max_sat_size = leaf.miniscript().max_satisfaction_size().ok()?;
-                let control_block_size = control_block_len(leaf.depth());
-
-                // stack varint difference (+1 for ctrl block, witness script already included)
-                let stack_varint_diff = varint_len(max_sat_elems + 1) - varint_len(0);
-
-                Some(
-                    stack_varint_diff +
-                    // size of elements to satisfy script
-                    max_sat_size +
-                    // second to last element: script
-                    varint_len(script_size) +
-                    script_size +
-                    // last element: control block
-                    varint_len(control_block_size) +
-                    control_block_size,
-                )
-            })
-            .max()
-            .ok_or(Error::ImpossibleSatisfaction)?;
+        let mut maximum = None;
+        for leaf in tree.leaves() {
+            let ms = leaf.miniscript().ok_or(Error::UnboundedSimplicityLeaf)?;
+            let (Ok(max_sat_elems), Ok(max_sat_size)) =
+                (ms.max_satisfaction_witness_elements(), ms.max_satisfaction_size())
+            else {
+                continue;
+            };
+            let script_size = ms.script_size();
+            let control_block_size = control_block_len(leaf.depth());
+            // Witness elements already include the script, but not the control block.
+            let wu = varint_len(max_sat_elems + 1) - varint_len(0)
+                + max_sat_size
+                + varint_len(script_size)
+                + script_size
+                + varint_len(control_block_size)
+                + control_block_size;
+            maximum = maximum.max(Some(wu));
+        }
+        let wu = maximum.ok_or(Error::ImpossibleSatisfaction)?;
 
         Ok(Weight::from_wu(wu as u64))
     }
@@ -204,7 +202,8 @@ impl<Pk: MiniscriptKey, Ext: Extension> Tr<Pk, Ext> {
     /// scriptSig and witness stack length.
     ///
     /// # Errors
-    /// When the descriptor is impossible to satisfy (ex: sh(OP_FALSE)).
+    /// When the descriptor is impossible to satisfy (ex: sh(OP_FALSE)), or has a Simplicity
+    /// leaf.
     #[deprecated(
         since = "10.0.0",
         note = "Use max_weight_to_satisfy instead. The method to count bytes was redesigned and the results will differ from max_weight_to_satisfy. For more details check rust-bitcoin/rust-miniscript#476."
@@ -217,30 +216,26 @@ impl<Pk: MiniscriptKey, Ext: Extension> Tr<Pk, Ext> {
             // script path spend..
             Some(tree) => tree,
         };
-
-        tree.leaves()
-            .filter_map(|leaf| {
-                let script_size = leaf.miniscript().script_size();
-                let max_sat_elems = leaf.miniscript().max_satisfaction_witness_elements().ok()?;
-                let max_sat_size = leaf.miniscript().max_satisfaction_size().ok()?;
-                let control_block_size = control_block_len(leaf.depth());
-                Some(
-                    // scriptSig len byte
-                    4 +
-                    // witness field stack len (+2 for control block & script)
-                    varint_len(max_sat_elems + 2) +
-                    // size of elements to satisfy script
-                    max_sat_size +
-                    // second to last element: script
-                    varint_len(script_size) +
-                    script_size +
-                    // last element: control block
-                    varint_len(control_block_size) +
-                    control_block_size,
-                )
-            })
-            .max()
-            .ok_or(Error::ImpossibleSatisfaction)
+        let mut maximum = None;
+        for leaf in tree.leaves() {
+            let ms = leaf.miniscript().ok_or(Error::UnboundedSimplicityLeaf)?;
+            let (Ok(max_sat_elems), Ok(max_sat_size)) =
+                (ms.max_satisfaction_witness_elements(), ms.max_satisfaction_size())
+            else {
+                continue;
+            };
+            let script_size = ms.script_size();
+            let control_block_size = control_block_len(leaf.depth());
+            let wu = 4
+                + varint_len(max_sat_elems + 2)
+                + max_sat_size
+                + varint_len(script_size)
+                + script_size
+                + varint_len(control_block_size)
+                + control_block_size;
+            maximum = maximum.max(Some(wu));
+        }
+        maximum.ok_or(Error::ImpossibleSatisfaction)
     }
 
     /// Converts keys from one type of public key to another.
@@ -379,6 +374,13 @@ impl<Pk: FromStrKey, Ext: Extension> crate::expression::FromTree for Tr<Pk, Ext>
         // while let construction needed because we modify the iterator inside the loop
         // (by calling skip_descendants to skip over the contents of the tapscripts).
         while let Some(node) = tap_tree_iter.next() {
+            #[cfg(feature = "simplicity")]
+            if node.parens() == Parens::Curly && node.name() == "sim" {
+                let leaf = SimplicityLeaf::from_tree(node)?;
+                tree_builder.push_leaf(TapLeaf::Simplicity(Arc::new(leaf)));
+                tap_tree_iter.skip_descendants();
+                continue;
+            }
             if node.parens() == Parens::Curly {
                 if !node.name().is_empty() {
                     return Err(Error::Parse(ParseError::Tree(ParseTreeError::IncorrectName {
@@ -397,7 +399,7 @@ impl<Pk: FromStrKey, Ext: Extension> crate::expression::FromTree for Tr<Pk, Ext>
                     .validate(&ValidationParams { allow_raw_pkh: false, ..Tap::CONSENSUS })
                     .map_err(Error::Validation)?;
 
-                tree_builder.push_leaf(script);
+                tree_builder.push_leaf(TapLeaf::Miniscript(Arc::new(script)));
                 tap_tree_iter.skip_descendants();
             }
         }
@@ -439,11 +441,13 @@ impl<Pk: MiniscriptKey, Ext: Extension> Liftable<Pk> for Tr<Pk, Ext> {
     }
 }
 
+/// Simplicity leaves are skipped: their commitments hide the keys of their programs.
 impl<Pk: MiniscriptKey, Ext: Extension> ForEachKey<Pk> for Tr<Pk, Ext> {
     fn for_each_key<'a, F: FnMut(&'a Pk) -> bool>(&'a self, mut pred: F) -> bool {
         let script_keys_res = self
             .leaves()
-            .all(|leaf| leaf.miniscript().for_each_key(&mut pred));
+            .filter_map(|leaf| leaf.miniscript())
+            .all(|ms| ms.for_each_key(&mut pred));
         script_keys_res && pred(&self.internal_key)
     }
 }
@@ -489,10 +493,14 @@ where
         };
         let mut min_wit_len = None;
         for leaf in spend_info.leaves() {
+            let ms = match leaf.miniscript() {
+                Some(ms) => ms,
+                None => continue, // A Simplicity leaf, whose program and witness are not known
+            };
             let mut satisfaction = if allow_mall {
-                leaf.miniscript().build_template_mall(provider)
+                ms.build_template_mall(provider)
             } else {
-                leaf.miniscript().build_template(provider)
+                ms.build_template(provider)
             };
             let Witness::Stack(ref mut wit) = satisfaction.stack else {
                 continue;

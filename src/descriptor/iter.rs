@@ -81,7 +81,8 @@ impl<'desc, Pk: MiniscriptKey, Ext: Extension> Iterator for PkIter<'desc, Pk, Ex
                 return Some(item);
             }
             if let Some(iter) = self.taptree_iter.as_mut().and_then(Iterator::next) {
-                self.ms_iter_taproot = Some(iter.miniscript().iter_pk());
+                // Simplicity leaves hide the keys of their programs.
+                self.ms_iter_taproot = iter.miniscript().map(|ms| ms.iter_pk());
             } else {
                 break;
             }

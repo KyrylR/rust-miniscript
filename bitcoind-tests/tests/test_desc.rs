@@ -185,10 +185,13 @@ pub fn test_desc_satisfy(
                 .leaves()
                 .flat_map(|leaf| {
                     let leaf_hash = leaf.compute_tap_leaf_hash();
-                    leaf.miniscript().iter_pk().filter_map(move |pk| {
-                        let i = x_only_pks.iter().position(|&x| x.to_public_key() == pk);
-                        i.map(|idx| (xonly_keypairs[idx], leaf_hash))
-                    })
+                    leaf.miniscript()
+                        .into_iter()
+                        .flat_map(|ms| ms.iter_pk())
+                        .filter_map(move |pk| {
+                            let i = x_only_pks.iter().position(|&x| x.to_public_key() == pk);
+                            i.map(|idx| (xonly_keypairs[idx], leaf_hash))
+                        })
                 })
                 .collect();
             for (keypair, leaf_hash) in x_only_keypairs_reqd {
@@ -329,6 +332,18 @@ fn test_descs(cl: &ElementsD, testdata: &TestData) {
     // K!: Compressed key with corresponding secret key unknown
     // X: X-only key available
     // X!: X-only key with corresponding secret key unknown
+
+    // Spend known paths while retaining an opaque CMR branch in the commitment.
+    let cmr = "0526eb603a8936dba018b14794dee96a87a6fd76987dd867c3e5a1773932fdfe";
+    let witness = test_desc_satisfy(cl, testdata, &format!("tr(X,sim{{asm({cmr})}})")).unwrap();
+    assert_eq!(witness.len(), 1);
+    for tree in [
+        format!("{{pk(X1),sim{{asm({cmr})}}}}"),
+        format!("{{sim{{asm({cmr})}},pk(X1)}}"),
+    ] {
+        let witness = test_desc_satisfy(cl, testdata, &format!("tr(X!,{tree})")).unwrap();
+        assert_eq!(witness.len(), 3);
+    }
 
     // Test 1: Simple spend with internal key
     let wit = test_desc_satisfy(cl, testdata, "tr(X)").unwrap();

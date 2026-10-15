@@ -3,15 +3,16 @@
 use core::fmt;
 
 use elements::taproot::{LeafVersion, TapLeafHash, TAPROOT_CONTROL_MAX_NODE_COUNT};
+use elements::Script;
 
 use crate::extensions::{CovExtArgs, CovenantExt, ExtTranslator, Extension, ParseableExt};
 use crate::miniscript::context::Tap;
-use crate::policy::{Liftable, Semantic};
+use crate::policy::{LiftError, Liftable, Semantic};
 use crate::prelude::Vec;
+#[cfg(feature = "simplicity")]
+use crate::simplicity::SimplicityLeaf;
 use crate::sync::Arc;
 use crate::{Miniscript, MiniscriptKey, Threshold, ToPublicKey, TranslateErr, Translator};
-
-type LeafDepth<Pk, Ext> = (u8, Arc<Miniscript<Pk, Tap, Ext>>);
 
 /// Tried to construct Taproot tree which was too deep.
 #[derive(PartialEq, Eq, Debug)]
@@ -27,16 +28,86 @@ impl fmt::Display for TapTreeDepthError {
 #[cfg(feature = "std")]
 impl std::error::Error for TapTreeDepthError {}
 
+/// The script of a Taproot leaf.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum TapLeaf<Pk: MiniscriptKey, Ext: Extension> {
+    Miniscript(Arc<Miniscript<Pk, Tap, Ext>>),
+    #[cfg(feature = "simplicity")]
+    Simplicity(Arc<SimplicityLeaf>),
+}
+
+impl<Pk: MiniscriptKey, Ext: Extension> TapLeaf<Pk, Ext> {
+    pub(super) fn miniscript(&self) -> Option<&Arc<Miniscript<Pk, Tap, Ext>>> {
+        match self {
+            Self::Miniscript(ms) => Some(ms),
+            #[cfg(feature = "simplicity")]
+            Self::Simplicity(_) => None,
+        }
+    }
+
+    #[cfg(feature = "simplicity")]
+    pub(super) fn simplicity(&self) -> Option<&SimplicityLeaf> {
+        match self {
+            Self::Miniscript(_) => None,
+            Self::Simplicity(sim) => Some(sim),
+        }
+    }
+
+    pub(super) fn leaf_version(&self) -> LeafVersion {
+        match self {
+            Self::Miniscript(_) => LeafVersion::default(),
+            #[cfg(feature = "simplicity")]
+            Self::Simplicity(_) => SimplicityLeaf::leaf_version(),
+        }
+    }
+}
+
+impl<Pk: ToPublicKey, Ext: ParseableExt> TapLeaf<Pk, Ext> {
+    pub(super) fn encode(&self) -> Script {
+        match self {
+            Self::Miniscript(ms) => ms.encode(),
+            #[cfg(feature = "simplicity")]
+            Self::Simplicity(sim) => sim.script(),
+        }
+    }
+}
+
+impl<Pk: MiniscriptKey, Ext: Extension> fmt::Display for TapLeaf<Pk, Ext> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Miniscript(ms) => fmt::Display::fmt(ms, f),
+            #[cfg(feature = "simplicity")]
+            Self::Simplicity(sim) => fmt::Display::fmt(sim, f),
+        }
+    }
+}
+
+impl<Pk: MiniscriptKey, Ext: Extension> fmt::Debug for TapLeaf<Pk, Ext> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Miniscript(ms) => fmt::Debug::fmt(ms, f),
+            #[cfg(feature = "simplicity")]
+            Self::Simplicity(sim) => fmt::Debug::fmt(sim, f),
+        }
+    }
+}
+
 /// A Taproot Tree representation.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TapTree<Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
-    depths_leaves: Vec<LeafDepth<Pk, Ext>>,
+    depths_leaves: Vec<(u8, TapLeaf<Pk, Ext>)>,
 }
 
 impl<Pk: MiniscriptKey, Ext: Extension> TapTree<Pk, Ext> {
     /// Creates a `TapTree` leaf from a Miniscript.
     pub fn leaf<A: Into<Arc<Miniscript<Pk, Tap, Ext>>>>(ms: A) -> Self {
-        Self { depths_leaves: vec![(0, ms.into())] }
+        Self { depths_leaves: vec![(0, TapLeaf::Miniscript(ms.into()))] }
+    }
+
+    /// Creates a `TapTree` leaf from a Simplicity program commitment.
+    #[cfg(feature = "simplicity")]
+    pub fn simplicity_leaf(leaf: SimplicityLeaf) -> Self {
+        Self { depths_leaves: vec![(0, TapLeaf::Simplicity(Arc::new(leaf)))] }
     }
 
     /// Creates a `TapTree` by combining `left` and `right` tree nodes.
@@ -47,14 +118,14 @@ impl<Pk: MiniscriptKey, Ext: Extension> TapTree<Pk, Ext> {
             if usize::from(*depth) > TAPROOT_CONTROL_MAX_NODE_COUNT - 1 {
                 return Err(TapTreeDepthError);
             }
-            depths_leaves.push((*depth + 1, Arc::clone(leaf)));
+            depths_leaves.push((*depth + 1, leaf.clone()));
         }
         Ok(Self { depths_leaves })
     }
 
     /// Iterates over all the leaves of the tree in depth-first preorder.
     ///
-    /// The yielded elements include the Miniscript for each leave as well as its depth
+    /// The yielded elements include the script for each leave as well as its depth
     /// in the tree, which is the data required by PSBT (BIP 371).
     pub fn leaves(&self) -> TapTreeIter<'_, Pk, Ext> { TapTreeIter::from_tree(self) }
 
@@ -86,7 +157,12 @@ impl<Pk: MiniscriptKey, Ext: Extension> TapTree<Pk, Ext> {
     ) -> Result<TapTree<QPk, QExt>, E> {
         let mut ret = TapTree { depths_leaves: Vec::with_capacity(self.depths_leaves.len()) };
         for (depth, leaf) in &self.depths_leaves {
-            let leaf = Arc::new(translate(leaf)?);
+            let leaf = match leaf {
+                TapLeaf::Miniscript(ms) => TapLeaf::Miniscript(Arc::new(translate(ms)?)),
+                // A commitment exposes no keys or extensions.
+                #[cfg(feature = "simplicity")]
+                TapLeaf::Simplicity(sim) => TapLeaf::Simplicity(Arc::clone(sim)),
+            };
             ret.depths_leaves.push((*depth, leaf));
         }
 
@@ -98,7 +174,10 @@ impl<Pk: MiniscriptKey, Ext: Extension> Liftable<Pk> for TapTree<Pk, Ext> {
     fn lift(&self) -> Result<Semantic<Pk>, crate::Error> {
         let thresh_vec = self
             .leaves()
-            .map(|item| item.miniscript().lift().map(Arc::new))
+            .map(|item| {
+                let ms = item.miniscript().ok_or(LiftError::SimplicityLift)?;
+                ms.lift().map(Arc::new)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let thresh = Threshold::new(1, thresh_vec).expect("no size limit on Semantic threshold");
         Ok(Semantic::Thresh(thresh).normalized())
@@ -108,7 +187,7 @@ impl<Pk: MiniscriptKey, Ext: Extension> Liftable<Pk> for TapTree<Pk, Ext> {
 fn fmt_helper<Pk: MiniscriptKey, Ext: Extension>(
     view: &TapTree<Pk, Ext>,
     f: &mut fmt::Formatter,
-    mut fmt_ms: impl FnMut(&mut fmt::Formatter, &Miniscript<Pk, Tap, Ext>) -> fmt::Result,
+    mut fmt_leaf: impl FnMut(&mut fmt::Formatter, &TapLeaf<Pk, Ext>) -> fmt::Result,
 ) -> fmt::Result {
     let mut child_counts = Vec::<u8>::with_capacity(TAPROOT_CONTROL_MAX_NODE_COUNT);
 
@@ -124,7 +203,7 @@ fn fmt_helper<Pk: MiniscriptKey, Ext: Extension>(
             child_counts.push(0);
         }
 
-        fmt_ms(f, item.miniscript())?;
+        fmt_leaf(f, item.leaf)?;
 
         if let Some(child_count) = child_counts.last_mut() {
             *child_count += 1;
@@ -143,19 +222,19 @@ fn fmt_helper<Pk: MiniscriptKey, Ext: Extension>(
 
 impl<Pk: MiniscriptKey, Ext: Extension> fmt::Display for TapTree<Pk, Ext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt_helper(self, f, |f, ms| write!(f, "{}", ms))
+        fmt_helper(self, f, |f, leaf| write!(f, "{}", leaf))
     }
 }
 
 impl<Pk: MiniscriptKey, Ext: Extension> fmt::Debug for TapTree<Pk, Ext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt_helper(self, f, |f, ms| write!(f, "{:?}", ms))
+        fmt_helper(self, f, |f, leaf| write!(f, "{:?}", leaf))
     }
 }
 
 /// Iterator over the leaves of a Taptree.
 ///
-/// Yields a pair of (depth, miniscript) in a depth first walk
+/// Yields a pair of (depth, leaf) in a depth first walk
 /// For example, this tree:
 ///                                     - N0 -
 ///                                    /     \\
@@ -168,7 +247,7 @@ impl<Pk: MiniscriptKey, Ext: Extension> fmt::Debug for TapTree<Pk, Ext> {
 ///
 #[derive(Debug, Clone)]
 pub struct TapTreeIter<'tr, Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
-    inner: core::slice::Iter<'tr, LeafDepth<Pk, Ext>>,
+    inner: core::slice::Iter<'tr, (u8, TapLeaf<Pk, Ext>)>,
 }
 
 impl<'tr, Pk: MiniscriptKey, Ext: Extension> TapTreeIter<'tr, Pk, Ext> {
@@ -185,7 +264,7 @@ impl<'tr, Pk: MiniscriptKey, Ext: Extension> Iterator for TapTreeIter<'tr, Pk, E
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .next()
-            .map(|&(depth, ref node)| TapTreeIterItem { depth, node })
+            .map(|&(depth, ref leaf)| TapTreeIterItem { depth, leaf })
     }
 }
 
@@ -193,7 +272,7 @@ impl<'tr, Pk: MiniscriptKey, Ext: Extension> DoubleEndedIterator for TapTreeIter
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner
             .next_back()
-            .map(|&(depth, ref node)| TapTreeIterItem { depth, node })
+            .map(|&(depth, ref leaf)| TapTreeIterItem { depth, leaf })
     }
 }
 
@@ -212,17 +291,24 @@ impl<'tr, Pk: MiniscriptKey, Ext: Extension> core::iter::FusedIterator
 /// then the iterator will yield nothing.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TapTreeIterItem<'tr, Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
-    node: &'tr Arc<Miniscript<Pk, Tap, Ext>>,
+    pub(super) leaf: &'tr TapLeaf<Pk, Ext>,
     depth: u8,
 }
 
 impl<'tr, Pk: MiniscriptKey, Ext: Extension> TapTreeIterItem<'tr, Pk, Ext> {
-    /// The Tapscript in the leaf.
+    /// The Tapscript in the leaf, or `None` for a Simplicity leaf.
     ///
     /// To obtain an [`elements::Script`] from this node, call [`Miniscript::encode`]
     /// on the returned value.
     #[inline]
-    pub fn miniscript(&self) -> &'tr Arc<Miniscript<Pk, Tap, Ext>> { self.node }
+    pub fn miniscript(&self) -> Option<&'tr Arc<Miniscript<Pk, Tap, Ext>>> {
+        self.leaf.miniscript()
+    }
+
+    /// The program commitment in the leaf, or `None` for a Tapscript leaf.
+    #[cfg(feature = "simplicity")]
+    #[inline]
+    pub fn simplicity(&self) -> Option<&'tr SimplicityLeaf> { self.leaf.simplicity() }
 
     /// The depth of this leaf.
     ///
@@ -230,12 +316,10 @@ impl<'tr, Pk: MiniscriptKey, Ext: Extension> TapTreeIterItem<'tr, Pk, Ext> {
     #[inline]
     pub fn depth(&self) -> u8 { self.depth }
 
-    /// The Tapleaf version of this leaf.
-    ///
-    /// This function returns a constant value, the Elements Tapscript leaf
-    /// version, which is the only version Miniscript leaves use.
+    /// The Tapleaf version of this leaf: the Elements Tapscript leaf version, or `0xbe` for
+    /// a Simplicity leaf.
     #[inline]
-    pub fn leaf_version(&self) -> LeafVersion { LeafVersion::default() }
+    pub fn leaf_version(&self) -> LeafVersion { self.leaf.leaf_version() }
 }
 
 impl<Pk: ToPublicKey, Ext: ParseableExt> TapTreeIterItem<'_, Pk, Ext> {
@@ -245,7 +329,7 @@ impl<Pk: ToPublicKey, Ext: ParseableExt> TapTreeIterItem<'_, Pk, Ext> {
     /// all (or many) of the leaves of the tree, you may instead want to call
     /// [`super::Tr::spend_info`] and use the [`super::TrSpendInfo::leaves`] iterator instead.
     #[inline]
-    pub fn compute_script(&self) -> elements::Script { self.node.encode() }
+    pub fn compute_script(&self) -> Script { self.leaf.encode() }
 
     /// Computes the [`TapLeafHash`] of the leaf.
     ///
@@ -260,7 +344,7 @@ impl<Pk: ToPublicKey, Ext: ParseableExt> TapTreeIterItem<'_, Pk, Ext> {
 }
 
 pub(super) struct TapTreeBuilder<Pk: MiniscriptKey, Ext: Extension> {
-    depths_leaves: Vec<LeafDepth<Pk, Ext>>,
+    depths_leaves: Vec<(u8, TapLeaf<Pk, Ext>)>,
     complete_heights: u128, // ArrayVec<bool, 129> represented as a bitmap...and a bool.
     complete_128: bool,     // BIP341 says depths are in [0,128] *inclusive* so 129 possibilities.
     current_height: u8,
@@ -286,8 +370,8 @@ impl<Pk: MiniscriptKey, Ext: Extension> TapTreeBuilder<Pk, Ext> {
     }
 
     #[inline]
-    pub(super) fn push_leaf<A: Into<Arc<Miniscript<Pk, Tap, Ext>>>>(&mut self, ms: A) {
-        self.depths_leaves.push((self.current_height, ms.into()));
+    pub(super) fn push_leaf(&mut self, leaf: TapLeaf<Pk, Ext>) {
+        self.depths_leaves.push((self.current_height, leaf));
 
         // Special-case 128 which doesn't fit into the `complete_heights` bitmap
         if usize::from(self.current_height) == TAPROOT_CONTROL_MAX_NODE_COUNT {

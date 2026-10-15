@@ -1285,10 +1285,9 @@ impl<Pk: FromStrKey, Ext: Extension> FromStr for Descriptor<Pk, Ext> {
         let top = expression::Tree::from_str(s)?;
         let ret = Self::from_tree(top.root())?;
         if let Self::Tr(ref inner) = ret {
-            for item in inner.leaves() {
-                item.miniscript()
-                    .validate(&Tap::SANE)
-                    .map_err(Error::Validation)?;
+            // A Simplicity leaf has no program to check.
+            for ms in inner.leaves().filter_map(|item| item.miniscript()) {
+                ms.validate(&Tap::SANE).map_err(Error::Validation)?;
             }
         }
         Ok(ret)

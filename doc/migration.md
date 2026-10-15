@@ -138,6 +138,27 @@ script decoding and interpretation did not support the other lengths.
 They do not make a spending branch safe by themselves. Combine them with a
 transaction signature such as `pk` to pass the default safety checks.
 
+## Taproot leaves
+
+`Tr::leaves()` and `Tr::spend_info().leaves()` include every leaf in tree order.
+Their `miniscript()` accessor returns `None` for an opaque Simplicity commitment.
+Use the leaf's script and version methods when building PSET metadata, and skip
+opaque leaves when looking for Miniscript keys or spending plans.
+
+Version 0.5 parsed Simplicity policies in leaves such as `eltr(K,sim{pk(A)})`
+through the `simplicity-lang` crate. That grammar and the dependency are
+removed, so such descriptors no longer parse. Compute the program's CMR with
+rust-simplicity and write the leaf as `sim{asm(CMR)}`. The leaf script is the
+CMR, so the Taproot output stays the same when the CMR does.
+
+With the `simplicity` feature, `sim{asm(CMR)}` commits to a program without
+revealing it. `SimplicityLeaf::from_cmr` and `cmr` use `[u8; 32]`. Pass
+`Cmr::to_byte_array()` when using rust-simplicity. The feature adds no runtime
+or compiler dependency. Any such leaf makes a complete policy lift and maximum satisfaction
+weight unavailable. Available key paths and ordinary script leaves can still be
+planned and satisfied. The interpreter returns `UnsupportedTapLeafVersion` for
+Simplicity and other leaf versions it cannot evaluate.
+
 ## Compiled descriptors
 
 Policy compilation returns `Descriptor<Pk, NoExt>`, because the compiler emits

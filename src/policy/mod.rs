@@ -63,6 +63,8 @@ pub enum LiftError {
     RawDescriptorLift,
     /// Cannot lift extension fragments.
     ExtensionLift,
+    /// Cannot lift Simplicity leaves, whose commitment hides the program.
+    SimplicityLift,
 }
 
 impl fmt::Display for LiftError {
@@ -76,6 +78,7 @@ impl fmt::Display for LiftError {
             ),
             Self::RawDescriptorLift => f.write_str("Cannot lift raw descriptors"),
             Self::ExtensionLift => f.write_str("Cannot lift extension fragments"),
+            Self::SimplicityLift => f.write_str("Cannot lift Simplicity leaves"),
         }
     }
 }
@@ -87,7 +90,8 @@ impl error::Error for LiftError {
             Self::HeightTimelockCombination
             | Self::BranchExceedResourceLimits
             | Self::RawDescriptorLift
-            | Self::ExtensionLift => None,
+            | Self::ExtensionLift
+            | Self::SimplicityLift => None,
         }
     }
 }
@@ -680,8 +684,10 @@ mod tests {
                 Descriptor::Tr(tr) => {
                     let leaves: Vec<_> = tr.tap_tree().unwrap().leaves().collect();
                     assert_eq!(leaves.len(), 10, "expected 10 leaves from thresh(3,5)");
-                    let mut leaf_scripts: Vec<_> =
-                        leaves.iter().map(|l| l.miniscript().to_string()).collect();
+                    let mut leaf_scripts: Vec<_> = leaves
+                        .iter()
+                        .map(|l| l.miniscript().map(ToString::to_string))
+                        .collect();
                     leaf_scripts.sort();
                     leaf_scripts.dedup();
                     assert_eq!(leaf_scripts.len(), 10, "all 10 leaves should be distinct");

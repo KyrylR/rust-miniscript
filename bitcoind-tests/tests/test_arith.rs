@@ -140,10 +140,13 @@ fn test_desc_satisfy_with_issuance(
                 .leaves()
                 .flat_map(|leaf| {
                     let leaf_hash = leaf.compute_tap_leaf_hash();
-                    leaf.miniscript().iter_pk().filter_map(move |pk| {
-                        let i = x_only_pks.iter().position(|&x| x.to_public_key() == pk);
-                        i.map(|idx| (xonly_keypairs[idx], leaf_hash))
-                    })
+                    leaf.miniscript()
+                        .into_iter()
+                        .flat_map(|ms| ms.iter_pk())
+                        .filter_map(move |pk| {
+                            let i = x_only_pks.iter().position(|&x| x.to_public_key() == pk);
+                            i.map(|idx| (xonly_keypairs[idx], leaf_hash))
+                        })
                 })
                 .collect();
             for (keypair, leaf_hash) in x_only_keypairs_reqd {

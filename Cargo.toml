@@ -16,6 +16,7 @@ default = ["std"]
 std = ["bitcoin-miniscript/std", "bitcoin/std", "bitcoin/secp-recovery", "bech32/std", "serde?/std"]
 compiler = []
 trace = []
+simplicity = []
 
 serde = ["dep:serde", "bitcoin/serde", "elements/serde"]
 rand = ["bitcoin/rand"]
@@ -119,6 +120,9 @@ exact_features = [
     ["std", "serde", "base64"],
     ["std", "rand", "base64"],
     ["std", "compiler", "trace", "serde", "rand", "base64"],
+    ["simplicity"],
+    ["std", "simplicity"],
+    ["std", "compiler", "trace", "serde", "rand", "base64", "simplicity"],
 ]
 
 [lints]

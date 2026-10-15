@@ -1237,7 +1237,11 @@ fn update_item_with_descriptor_helper<F: PsbtFields, Ext: ParseableExt>(
                 tap_scripts.insert(control_block, leaf_script);
             }
 
-            for leaf_pk in leaf_derived.miniscript().iter_pk() {
+            for leaf_pk in leaf_derived
+                .miniscript()
+                .into_iter()
+                .flat_map(|ms| ms.iter_pk())
+            {
                 let tapleaf_hashes = &mut item
                     .tap_key_origins()
                     .get_mut(&leaf_pk.to_x_only_pubkey())

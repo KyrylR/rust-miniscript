@@ -15,9 +15,12 @@ use elements::taproot::{
 };
 use elements::{pset, Script};
 
+use super::taptree::TapLeaf;
 use crate::extensions::{CovExtArgs, CovenantExt, Extension, ParseableExt};
 use crate::miniscript::context::Tap;
 use crate::prelude::Vec;
+#[cfg(feature = "simplicity")]
+use crate::simplicity::SimplicityLeaf;
 use crate::sync::Arc;
 use crate::{Miniscript, MiniscriptKey, ToPublicKey};
 
@@ -114,7 +117,7 @@ impl<Pk: ToPublicKey, Ext: ParseableExt> TrSpendInfo<Pk, Ext> {
         let mut parent_stack = ParentStack::new();
         for leaf in tree.leaves() {
             let depth = usize::from(leaf.depth());
-            let script = leaf.miniscript().encode();
+            let script = leaf.compute_script();
 
             let leaf_hash = TapLeafHash::from_script(&script, leaf.leaf_version());
             let mut current_hash = TapNodeHash::from_byte_array(leaf_hash.to_byte_array());
@@ -146,11 +149,7 @@ impl<Pk: ToPublicKey, Ext: ParseableExt> TrSpendInfo<Pk, Ext> {
             // of the whole tree.
             nodes.push(TrSpendInfoNode {
                 sibling_hash: current_hash,
-                leaf_data: Some(LeafData {
-                    script,
-                    miniscript: Arc::clone(leaf.miniscript()),
-                    leaf_hash,
-                }),
+                leaf_data: Some(LeafData { script, leaf: leaf.leaf.clone(), leaf_hash }),
             });
 
             // 3. Recursively complete nodes as long as we are on a right branch.
@@ -271,7 +270,7 @@ struct TrSpendInfoNode<Pk: MiniscriptKey, Ext: Extension> {
 #[derive(Debug)]
 struct LeafData<Pk: MiniscriptKey, Ext: Extension> {
     script: Script,
-    miniscript: Arc<Miniscript<Pk, Tap, Ext>>,
+    leaf: TapLeaf<Pk, Ext>,
     leaf_hash: TapLeafHash,
 }
 
@@ -322,10 +321,10 @@ impl<'sp, Pk: MiniscriptKey, Ext: Extension> Iterator for TrSpendInfoIter<'sp, P
 
                 return Some(TrSpendInfoIterItem {
                     script: &leaf.script,
-                    miniscript: &leaf.miniscript,
+                    leaf: &leaf.leaf,
                     leaf_hash: leaf.leaf_hash,
                     control_block: ControlBlock {
-                        leaf_version: LeafVersion::default(),
+                        leaf_version: leaf.leaf.leaf_version(),
                         output_key_parity: self.spend_info.output_key_parity,
                         internal_key: self.spend_info.internal_key,
                         merkle_branch: TaprootMerkleBranch::from_inner(merkle_stack)
@@ -345,19 +344,26 @@ impl<'sp, Pk: MiniscriptKey, Ext: Extension> Iterator for TrSpendInfoIter<'sp, P
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TrSpendInfoIterItem<'tr, Pk: MiniscriptKey, Ext: Extension = CovenantExt<CovExtArgs>> {
     script: &'tr Script,
-    miniscript: &'tr Arc<Miniscript<Pk, Tap, Ext>>,
+    leaf: &'tr TapLeaf<Pk, Ext>,
     leaf_hash: TapLeafHash,
     control_block: ControlBlock,
 }
 
 impl<'sp, Pk: MiniscriptKey, Ext: Extension> TrSpendInfoIterItem<'sp, Pk, Ext> {
-    /// The Tapscript of this leaf.
+    /// The script of this leaf: a Tapscript, or the commitment of a Simplicity leaf.
     #[inline]
     pub fn script(&self) -> &'sp Script { self.script }
 
-    /// The Tapscript of this leaf, in Miniscript form.
+    /// The Tapscript of this leaf, in Miniscript form, or `None` for a Simplicity leaf.
     #[inline]
-    pub fn miniscript(&self) -> &'sp Arc<Miniscript<Pk, Tap, Ext>> { self.miniscript }
+    pub fn miniscript(&self) -> Option<&'sp Arc<Miniscript<Pk, Tap, Ext>>> {
+        self.leaf.miniscript()
+    }
+
+    /// The program commitment of this leaf, or `None` for a Tapscript leaf.
+    #[cfg(feature = "simplicity")]
+    #[inline]
+    pub fn simplicity(&self) -> Option<&'sp SimplicityLeaf> { self.leaf.simplicity() }
 
     /// The depth of the leaf in the tree.
     ///
@@ -368,10 +374,8 @@ impl<'sp, Pk: MiniscriptKey, Ext: Extension> TrSpendInfoIterItem<'sp, Pk, Ext> {
         self.control_block.merkle_branch.as_inner().len() as u8 // cast ok, length limited to 128
     }
 
-    /// The Tapleaf version of this leaf.
-    ///
-    /// This function returns a constant value, the Elements Tapscript leaf
-    /// version, which is the only version Miniscript leaves use.
+    /// The Tapleaf version of this leaf: the Elements Tapscript leaf version, or `0xbe` for
+    /// a Simplicity leaf.
     #[inline]
     pub fn leaf_version(&self) -> LeafVersion { self.control_block.leaf_version }
 

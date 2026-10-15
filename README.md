@@ -30,6 +30,10 @@ Descriptor names use the `el` prefix, for example `elwpkh(KEY)` and
 `eltr(KEY,TREE)`. Confidential descriptors use `ct(BLINDING_KEY,DESCRIPTOR)`.
 The `psbt` module operates on Elements PSETs.
 
+The optional `simplicity` feature adds opaque `sim{asm(CMR)}` Taproot leaves.
+It preserves the commitment and leaf version without compiling programs or
+constructing Simplicity witnesses.
+
 More information can be found in [the documentation](https://docs.rs/elements-miniscript)
 or in [the `examples/` directory](examples/)
 

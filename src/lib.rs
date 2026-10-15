@@ -122,6 +122,9 @@ mod pub_macros;
 #[cfg(bench)]
 mod benchmarks;
 mod blanket_traits;
+#[cfg(feature = "simplicity")]
+pub mod simplicity;
+
 pub mod confidential;
 pub mod descriptor;
 mod error;
@@ -163,6 +166,8 @@ pub use crate::primitives::absolute_locktime::{AbsLockTime, AbsLockTimeError};
 pub use crate::primitives::positive_f64::PositiveF64;
 pub use crate::primitives::relative_locktime::{RelLockTime, RelLockTimeError};
 pub use crate::primitives::threshold::{Threshold, ThresholdError};
+#[cfg(feature = "simplicity")]
+pub use crate::simplicity::SimplicityLeaf;
 pub use crate::validation::{Error as ValidationError, ValidationParams};
 
 /// Trait representing a key which can be converted to a hash type.
@@ -482,6 +487,8 @@ pub enum Error {
     NonStandardBareScript,
     /// Miniscript is equivalent to false. No possible satisfaction
     ImpossibleSatisfaction,
+    /// A Simplicity commitment does not reveal a bound on its witness size.
+    UnboundedSimplicityLeaf,
     /// Bare descriptors don't have any addresses
     BareDescriptorAddr,
     /// PubKey invalid under current context
@@ -546,6 +553,7 @@ impl fmt::Display for Error {
                 "
             ),
             Self::ImpossibleSatisfaction => write!(f, "Impossible to satisfy Miniscript"),
+            Self::UnboundedSimplicityLeaf => f.write_str("Simplicity leaf witness size is unknown"),
             Self::BareDescriptorAddr => write!(f, "Bare descriptors don't have address"),
             Self::PubKeyCtxError(ref pk, ref ctx) => {
                 write!(f, "Pubkey error: {} under {} scriptcontext", pk, ctx)
@@ -578,6 +586,7 @@ impl std::error::Error for Error {
             | MaxRecursiveDepthExceeded
             | NonStandardBareScript
             | ImpossibleSatisfaction
+            | UnboundedSimplicityLeaf
             | BareDescriptorAddr
             | TrNoScriptCode
             | MultipathDescLenMismatch => None,

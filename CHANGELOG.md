@@ -16,6 +16,9 @@ See the [migration notes](doc/migration.md) for upgrading from 0.5.
   count as transaction signatures in safety checks.
 - Support `elcovwsh` with authenticated covenant preimages and separate signature
   checks for the inner script and covenant suffix.
+- Add optional CMR-only `sim{asm(CMR)}` Taproot leaves. Mixed trees retain ordinary
+  spending paths but do not expose a complete policy or maximum satisfaction
+  weight when a CMR leaf is present.
 - Check issuance presence before reading its amounts, preventing witness items
   from replacing absent issuance data.
 - Add rust-miniscript's default `std` feature. Dependencies require the standard

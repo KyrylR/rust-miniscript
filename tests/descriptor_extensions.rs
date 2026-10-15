@@ -39,6 +39,13 @@ fn covenant_leaves_parse_alongside_ordinary_leaves() {
     assert!(Descriptor::<bitcoin::PublicKey, NoExt>::from_str(&s).is_err());
 }
 
+#[cfg(not(feature = "simplicity"))]
+#[test]
+fn simplicity_leaves_need_their_feature() {
+    let cmr = "0526eb603a8936dba018b14794dee96a87a6fd76987dd867c3e5a1773932fdfe";
+    assert!(StdDescriptor::from_str(&format!("eltr({K0},sim{{asm({cmr})}})")).is_err());
+}
+
 struct Keys;
 
 impl Translator<String> for Keys {

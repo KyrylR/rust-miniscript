@@ -68,16 +68,19 @@ fn main() {
         let mut iter = p.leaves();
         let mut next = iter.next().unwrap();
         assert_eq!(
-            (next.depth(), next.miniscript().as_ref()),
+            (next.depth(), next.miniscript().map(|ms| ms.as_ref())),
             (
                 1u8,
-                &Miniscript::<String, Tap>::from_str("and_v(vc:pk_k(In),older(9))").unwrap()
+                Some(&Miniscript::<String, Tap>::from_str("and_v(vc:pk_k(In),older(9))").unwrap())
             )
         );
         next = iter.next().unwrap();
         assert_eq!(
-            (next.depth(), next.miniscript().as_ref()),
-            (1u8, &Miniscript::<String, Tap>::from_str("and_v(v:pk(hA),pk(S))").unwrap())
+            (next.depth(), next.miniscript().map(|ms| ms.as_ref())),
+            (
+                1u8,
+                Some(&Miniscript::<String, Tap>::from_str("and_v(v:pk(hA),pk(S))").unwrap())
+            )
         );
         assert_eq!(iter.next(), None);
     }
