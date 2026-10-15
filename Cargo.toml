@@ -1,15 +1,15 @@
 [package]
-name = "miniscript"
-version = "13.0.0"
+name = "elements-miniscript"
+version = "0.6.0"
 authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>, Sanket Kanjalkar <sanket1729@gmail.com>"]
 license = "CC0-1.0"
-homepage = "https://github.com/rust-bitcoin/rust-miniscript/"
-repository = "https://github.com/rust-bitcoin/rust-miniscript/"
-description = "Miniscript: a subset of Bitcoin Script designed for analysis"
-keywords = [ "crypto", "bitcoin", "miniscript", "script" ]
+homepage = "https://github.com/ElementsProject/elements-miniscript/"
+repository = "https://github.com/ElementsProject/elements-miniscript/"
+description = "Miniscript: Elements scripts, descriptors and spending plans"
+keywords = [ "crypto", "elements", "miniscript", "script" ]
 readme = "README.md"
 edition = "2021"
-rust-version = "1.63.0"
+rust-version = "1.74.0"
 
 [features]
 default = ["std"]
@@ -17,20 +17,21 @@ std = ["bitcoin/std", "bitcoin/secp-recovery", "bech32/std", "serde?/std"]
 compiler = []
 trace = []
 
-serde = ["dep:serde", "bitcoin/serde"]
+serde = ["dep:serde", "bitcoin/serde", "elements/serde"]
 rand = ["bitcoin/rand"]
-base64 = ["bitcoin/base64"]
+base64 = ["bitcoin/base64", "elements/base64"]
 
 [dependencies]
 bech32 = { version = "0.11.0", default-features = false, features = ["alloc"] }
-bitcoin = { version = "0.32.6", default-features = false }
-hex = { package = "hex-conservative", default-features = false, features = ["alloc"], version = "1.0.0" }
+bitcoin = { version = "0.32.102", default-features = false }
+elements = { version = "0.27.0", default-features = false }
+hex = { package = "hex-conservative", default-features = false, features = ["alloc"], version = "1.2.0" }
 
-serde = { version = "1.0.103", default-features = false, features = ["alloc"], optional = true }
+serde = { version = "1.0.195", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 serde_test = "1.0.147"
-bitcoin = { version = "0.32.0", features = ["base64"] }
+bitcoin = { version = "0.32.102", features = ["base64"] }
 secp256k1 = {version = "0.29.0", features = ["rand-std"]}
 
 [[example]]
@@ -72,6 +73,9 @@ required-features = ["compiler"]
 
 [package.metadata.rbmt.lint]
 allowed_duplicates = [
+    # rust-elements and rust-bitcoin use different releases of these crates.
+    "bitcoin-internals",
+    "bitcoin_hashes",
     "hex-conservative",
 ]
 
@@ -116,31 +120,12 @@ exact_features = [
     ["std", "compiler", "trace", "serde", "rand", "base64"],
 ]
 
-[package.metadata.rbmt.integration]
-package = "bitcoind-tests"
-versions = [
-    "30_2",
-    "29_0",
-    "28_2",
-    "27_2",
-    "26_2",
-    "25_2",
-    "24_2",
-    "23_2",
-    "22_1",
-    "0_21_2",
-    "0_20_2",
-    "0_19_1",
-    "0_18_1",
-    "0_17_2",
-]
-
 [lints]
 workspace = true
 
 [workspace]
 members = ["fuzz"]
-exclude = ["embedded", "bitcoind-tests"]
+exclude = ["bitcoind-tests"]
 
 [workspace.metadata.rbmt.toolchains]
 nightly = "nightly-2026-10-03"

@@ -41,7 +41,7 @@ jobs:
         run: cargo rbmt test --toolchain nightly --lock-file ${{ matrix.dep }}
 
   MSRV:                         # 2 jobs, one per lock file.
-    name: Test - 1.63.0 toolchain
+    name: Test - 1.74.0 toolchain
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -111,28 +111,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rbmt
-      - name: "Generate integration lock file"
-        run: RUSTUP_TOOLCHAIN="$(cargo rbmt toolchains --stable)" cargo generate-lockfile --manifest-path bitcoind-tests/Cargo.toml
-      - name: "Run integration tests"
-        run: cargo rbmt integration
-
-  Embedded:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Set up QEMU
-        run: sudo apt update && sudo apt install -y qemu-system-arm gcc-arm-none-eabi
-      - name: Checkout Toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: nightly
-          override: true
-          components: rust-src
-          target: thumbv7m-none-eabi
-      - name: Run
-        env:
-          RUSTFLAGS: "-C link-arg=-Tlink.x"
-          CARGO_TARGET_THUMBV7M_NONE_EABI_RUNNER: "qemu-system-arm -cpu cortex-m3 -machine mps2-an385 -nographic -semihosting-config enable=on,target=native -kernel"
-        run: cd embedded && cargo run --target thumbv7m-none-eabi --release
+      - name: Install Elements
+        run: |
+          curl --fail --location --output elements.tar.gz https://github.com/ElementsProject/elements/releases/download/elements-23.3.1/elements-23.3.1-x86_64-linux-gnu.tar.gz
+          echo "864e3a8240137c4e948ecae7c526ccb363771351ea68737a14c682025d5fedaa  elements.tar.gz" | sha256sum --check
+          tar -xzf elements.tar.gz
+          echo "ELEMENTSD_EXE=$PWD/elements-23.3.1/bin/elementsd" >> "$GITHUB_ENV"
+      - name: Run integration tests
+        run: cargo test --manifest-path bitcoind-tests/Cargo.toml

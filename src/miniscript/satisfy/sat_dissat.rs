@@ -3,7 +3,7 @@
 //! Satisfactions and dissatisfactions for individual Miniscript fragments.
 
 use bitcoin::hashes::hash160;
-use bitcoin::TapLeafHash;
+use elements::taproot::TapLeafHash;
 
 use super::{Placeholder, Satisfaction, Witness};
 use crate::iter::TreeLike;

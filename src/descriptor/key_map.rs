@@ -188,7 +188,7 @@ mod tests {
         };
 
         let want_sk = single.key;
-        let descriptor_s = format!("wpkh({})", descriptor_sk_s);
+        let descriptor_s = format!("elwpkh({})", descriptor_sk_s);
         let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let pk = want_sk.public_key(&secp);
@@ -221,7 +221,7 @@ mod tests {
         }
 
         let want_sk = xpriv.to_priv();
-        let descriptor_s = format!("wpkh([{}]{})", xpriv_fingerprint, xpriv);
+        let descriptor_s = format!("elwpkh([{}]{})", xpriv_fingerprint, xpriv);
         let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let pk = want_sk.public_key(&secp);
@@ -256,7 +256,7 @@ mod tests {
         }
 
         let want_sk = child.to_priv();
-        let descriptor_s = format!("wpkh({}/44')", s);
+        let descriptor_s = format!("elwpkh({}/44')", s);
         let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let pk = want_sk.public_key(&secp);
@@ -294,7 +294,7 @@ mod tests {
         }
 
         let want_sk = child.to_priv();
-        let descriptor_s = format!("wpkh({}/44'/0'/0'/0/*)", s);
+        let descriptor_s = format!("elwpkh({}/44'/0'/0'/0/*)", s);
         let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
 
         let key_source = (master_fingerprint, derivation_path);
@@ -312,7 +312,7 @@ mod tests {
         let secp = Secp256k1::new();
 
         // Create a keymap with one key
-        let descriptor_s = "wpkh(cMk8gWmj1KpjdYnAWwsEDekodMYhbyYBhG8gMtCCxucJ98JzcNij)";
+        let descriptor_s = "elwpkh(cMk8gWmj1KpjdYnAWwsEDekodMYhbyYBhG8gMtCCxucJ98JzcNij)";
         let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor_s).unwrap();
 
         // Request a different public key that doesn't exist in the keymap
@@ -341,7 +341,7 @@ mod tests {
         assert!(matches!(result, Err(GetKeyError::NotSupported)));
 
         // Also test with KeyMap
-        let descriptor_s = "wpkh(xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi)";
+        let descriptor_s = "elwpkh(xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi)";
         let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor_s).unwrap();
 
         // While requesting an x-only key from an individual xpriv, that's an error.
@@ -375,7 +375,7 @@ mod tests {
         assert!(matches!(result, Err(GetKeyError::NotSupported)));
 
         // Also test with KeyMap; as in the previous test, the error turns to None.
-        let descriptor_s = "wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/<0;1>/*)";
+        let descriptor_s = "elwpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/<0;1>/*)";
         let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor_s).unwrap();
 
         let result = keymap.get_key(request.clone(), &secp).unwrap();
@@ -406,19 +406,19 @@ mod tests {
         let cases = [
             TestCase {
                 name: "bare wildcard",
-                descriptor: "wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)",
+                descriptor: "elwpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)",
                 key_request: ("d34db33f", "84'/1'/0'/0"),
                 exp_derivation_path: "0",
             },
             TestCase {
                 name: "single fixed step",
-                descriptor: "wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/0)",
+                descriptor: "elwpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/0)",
                 key_request: ("d34db33f", "84'/1'/0'/0"),
                 exp_derivation_path: "0",
             },
             TestCase {
                 name: "fixed step then wildcard",
-                descriptor: "wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/0/*)",
+                descriptor: "elwpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/0/*)",
                 key_request: ("d34db33f", "84'/1'/0'/0/5"),
                 exp_derivation_path: "0/5",
             },
@@ -456,7 +456,7 @@ mod tests {
         let secp = Secp256k1::new();
 
         // descriptor with a fixed derivation index of `0`.
-        let descriptor = "wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/0)";
+        let descriptor = "elwpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/0)";
         let (_, keymap) = Descriptor::parse_descriptor(&secp, descriptor).unwrap();
 
         // the key_request has the correct `key_origin`, but the requested derivation index (`5`) does not match the
@@ -485,7 +485,7 @@ mod tests {
             .unwrap();
         let fp = master_xprv.fingerprint(&secp);
         let account_path: DerivationPath = "86h/1h/0h".parse().unwrap();
-        let descriptor = format!("tr({master_xprv}/{account_path}/0/*)");
+        let descriptor = format!("eltr({master_xprv}/{account_path}/0/*)");
         let request_path: DerivationPath = format!("{account_path}/9/7").parse().unwrap();
         let key_request = KeyRequest::Bip32((fp, request_path));
         let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor).unwrap();

@@ -7,7 +7,8 @@ use std::error;
 
 use bitcoin::hashes::hash160;
 use bitcoin::hex::DisplayHex;
-use bitcoin::{absolute, relative, secp256k1, taproot};
+use bitcoin::{absolute, relative, secp256k1};
+use elements::taproot;
 
 use super::BitcoinKey;
 use crate::prelude::*;
@@ -28,10 +29,10 @@ pub enum Error {
     ControlBlockParse(taproot::TaprootError),
     /// Tap control block(merkle proofs + tweak) verification error
     ControlBlockVerificationError,
+    /// The interpreter only evaluates Elements Tapscript leaves with version `0xc4`.
+    UnsupportedTapLeafVersion(u8),
     /// General Interpreter error.
     CouldNotEvaluate,
-    /// ECDSA Signature related error
-    EcdsaSig(bitcoin::ecdsa::Error),
     /// We expected a push (including a `OP_1` but no other numeric pushes)
     ExpectedPush,
     /// The preimage to the hash function must be exactly 32 bytes.
@@ -91,9 +92,9 @@ pub enum Error {
     /// Miniscript requires the entire top level script to be satisfied.
     ScriptSatisfactionError,
     /// Schnorr Signature error
-    SchnorrSig(bitcoin::taproot::SigFromSliceError),
+    SchnorrSig(elements::SchnorrSigError),
     /// Errors in signature hash calculations
-    SighashError(bitcoin::sighash::InvalidSighashTypeError),
+    SighashError(elements::sighash::Error),
     /// Taproot Annex Unsupported
     TapAnnexUnsupported,
     /// An uncompressed public key was encountered in a context where it is
@@ -127,7 +128,9 @@ impl fmt::Display for Error {
             Self::CannotInferTrDescriptors => write!(f, "Cannot infer taproot descriptors"),
             Self::ControlBlockParse(ref e) => write!(f, "Control block parse error {}", e),
             Self::ControlBlockVerificationError => f.write_str("Control block verification failed"),
-            Self::EcdsaSig(ref s) => write!(f, "Ecdsa sig error: {}", s),
+            Self::UnsupportedTapLeafVersion(version) => {
+                write!(f, "unsupported Taproot leaf version 0x{:02x}", version)
+            }
             Self::ExpectedPush => f.write_str("expected push in script"),
             Self::CouldNotEvaluate => f.write_str("Interpreter Error: Could not evaluate"),
             Self::HashPreimageLengthMismatch => f.write_str("Hash preimage should be 32 bytes"),
@@ -189,6 +192,7 @@ impl error::Error for Error {
             | AbsoluteLockTimeComparisonInvalid(_, _)
             | CannotInferTrDescriptors
             | ControlBlockVerificationError
+            | UnsupportedTapLeafVersion(_)
             | CouldNotEvaluate
             | ExpectedPush
             | HashPreimageLengthMismatch
@@ -219,7 +223,6 @@ impl error::Error for Error {
             | UnexpectedStackElementPush
             | VerifyFailed => None,
             ControlBlockParse(e) => Some(e),
-            EcdsaSig(e) => Some(e),
             Miniscript(e) => Some(e),
             Secp(e) => Some(e),
             SchnorrSig(e) => Some(e),
@@ -234,18 +237,13 @@ impl From<secp256k1::Error> for Error {
 }
 
 #[doc(hidden)]
-impl From<bitcoin::sighash::InvalidSighashTypeError> for Error {
-    fn from(e: bitcoin::sighash::InvalidSighashTypeError) -> Self { Self::SighashError(e) }
+impl From<elements::sighash::Error> for Error {
+    fn from(e: elements::sighash::Error) -> Self { Self::SighashError(e) }
 }
 
 #[doc(hidden)]
-impl From<bitcoin::ecdsa::Error> for Error {
-    fn from(e: bitcoin::ecdsa::Error) -> Self { Self::EcdsaSig(e) }
-}
-
-#[doc(hidden)]
-impl From<bitcoin::taproot::SigFromSliceError> for Error {
-    fn from(e: bitcoin::taproot::SigFromSliceError) -> Self { Self::SchnorrSig(e) }
+impl From<elements::SchnorrSigError> for Error {
+    fn from(e: elements::SchnorrSigError) -> Self { Self::SchnorrSig(e) }
 }
 
 #[doc(hidden)]

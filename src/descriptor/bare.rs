@@ -9,8 +9,8 @@
 
 use core::fmt;
 
-use bitcoin::script::{self, PushBytes};
-use bitcoin::{Address, Network, ScriptBuf, Weight};
+use bitcoin::Weight;
+use elements::{script, secp256k1_zkp, Script};
 
 use crate::descriptor::write_descriptor;
 use crate::expression::{self, FromTree};
@@ -21,8 +21,8 @@ use crate::policy::{semantic, Liftable};
 use crate::prelude::*;
 use crate::util::{varint_len, witness_to_scriptsig};
 use crate::{
-    BareCtx, Error, ForEachKey, FromStrKey, Miniscript, MiniscriptKey, Satisfier, ToPublicKey,
-    TranslateErr, Translator,
+    elementssig_to_rawsig, BareCtx, Error, ForEachKey, FromStrKey, Miniscript, MiniscriptKey,
+    Satisfier, ToPublicKey, TranslateErr, Translator,
 };
 
 /// Create a Bare Descriptor. That is descriptor that is
@@ -99,18 +99,18 @@ impl<Pk: MiniscriptKey> Bare<Pk> {
 
 impl<Pk: MiniscriptKey + ToPublicKey> Bare<Pk> {
     /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn script_pubkey(&self) -> ScriptBuf { self.ms.encode() }
+    pub fn script_pubkey(&self) -> Script { self.ms.encode() }
 
     /// Obtains the underlying miniscript for this descriptor.
-    pub fn inner_script(&self) -> ScriptBuf { self.script_pubkey() }
+    pub fn inner_script(&self) -> Script { self.script_pubkey() }
 
     /// Obtains the pre bip-340 signature script code for this descriptor.
-    pub fn ecdsa_sighash_script_code(&self) -> ScriptBuf { self.script_pubkey() }
+    pub fn ecdsa_sighash_script_code(&self) -> Script { self.script_pubkey() }
 
     /// Returns satisfying non-malleable witness and scriptSig with minimum
     /// weight to spend an output controlled by the given descriptor if it is
     /// possible to construct one using the `satisfier`.
-    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -123,7 +123,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Bare<Pk> {
     /// Returns satisfying, possibly malleable, witness and scriptSig with
     /// minimum weight to spend an output controlled by the given descriptor if
     /// it is possible to construct one using the `satisfier`.
-    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -153,22 +153,25 @@ impl<Pk: MiniscriptKey + ToPublicKey> Bare<Pk> {
 }
 
 impl<Pk: MiniscriptKey> fmt::Debug for Bare<Pk> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}", self.ms) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "el{:?}", self.ms) }
 }
 
 impl<Pk: MiniscriptKey> fmt::Display for Bare<Pk> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write_descriptor!(f, "{}", self.ms) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write_descriptor!(f, "el{}", self.ms) }
 }
 
 impl<Pk: MiniscriptKey> Liftable<Pk> for Bare<Pk> {
     fn lift(&self) -> Result<semantic::Policy<Pk>, Error> { self.ms.lift() }
 }
 
+/// Parses a bare descriptor, a Miniscript whose root name has the `el` prefix.
 impl<Pk: FromStrKey> FromTree for Bare<Pk> {
     fn from_tree(root: expression::TreeIterItem) -> Result<Self, Error> {
-        let sub = Miniscript::<Pk, BareCtx>::from_tree(root)?;
-        BareCtx::top_level_checks(&sub)?;
-        Self::new(sub)
+        // The error does not echo the name, which may be a key.
+        if !root.name().starts_with("el") {
+            return Err(Error::Unexpected("missing Elements descriptor prefix".into()));
+        }
+        Self::new(Miniscript::from_tree_with_root_prefix(root, "el")?)
     }
 }
 
@@ -255,37 +258,38 @@ impl<Pk: MiniscriptKey> Pkh<Pk> {
 
 impl<Pk: MiniscriptKey + ToPublicKey> Pkh<Pk> {
     /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn script_pubkey(&self) -> ScriptBuf {
-        // Fine to hard code the `Network` here because we immediately call
-        // `script_pubkey` which does not use the `network` field of `Address`.
-        let addr = self.address(Network::Bitcoin);
+    pub fn script_pubkey(&self) -> Script {
+        // Fine to hard code the `AddressParams` here because we immediately call
+        // `script_pubkey` which does not use the `params` field of `Address`.
+        let addr = self.address(None, &elements::AddressParams::ELEMENTS);
         addr.script_pubkey()
     }
 
-    /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn address(&self, network: Network) -> Address {
-        Address::p2pkh(self.pk.to_public_key(), network)
+    /// Obtains the corresponding address for this descriptor, blinded if `blinder` is given.
+    pub fn address(
+        &self,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static elements::AddressParams,
+    ) -> elements::Address {
+        elements::Address::p2pkh(&self.pk.to_public_key(), blinder, params)
     }
 
     /// Obtains the underlying miniscript for this descriptor.
-    pub fn inner_script(&self) -> ScriptBuf { self.script_pubkey() }
+    pub fn inner_script(&self) -> Script { self.script_pubkey() }
 
     /// Obtains the pre bip-340 signature script code for this descriptor.
-    pub fn ecdsa_sighash_script_code(&self) -> ScriptBuf { self.script_pubkey() }
+    pub fn ecdsa_sighash_script_code(&self) -> Script { self.script_pubkey() }
 
     /// Returns satisfying non-malleable witness and scriptSig with minimum
     /// weight to spend an output controlled by the given descriptor if it is
     /// possible to construct one using the `satisfier`.
-    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
         if let Some(sig) = satisfier.lookup_ecdsa_sig(&self.pk) {
             let script_sig = script::Builder::new()
-                .push_slice::<&PushBytes>(
-                    // serialize() does not allocate here
-                    sig.serialize().as_ref(),
-                )
+                .push_slice(&elementssig_to_rawsig(&sig))
                 .push_key(&self.pk.to_public_key())
                 .into_script();
             let witness = vec![];
@@ -298,7 +302,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Pkh<Pk> {
     /// Returns satisfying, possibly malleable, witness and scriptSig with
     /// minimum weight to spend an output controlled by the given descriptor if
     /// it is possible to construct one using the `satisfier`.
-    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -333,12 +337,12 @@ impl<Pk: MiniscriptKey + ToPublicKey> Pkh<Pk> {
 }
 
 impl<Pk: MiniscriptKey> fmt::Debug for Pkh<Pk> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "pkh({:?})", self.pk) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "elpkh({:?})", self.pk) }
 }
 
 impl<Pk: MiniscriptKey> fmt::Display for Pkh<Pk> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_descriptor!(f, "pkh({})", self.pk)
+        write_descriptor!(f, "elpkh({})", self.pk)
     }
 }
 
@@ -351,7 +355,7 @@ impl<Pk: MiniscriptKey> Liftable<Pk> for Pkh<Pk> {
 impl<Pk: FromStrKey> FromTree for Pkh<Pk> {
     fn from_tree(root: expression::TreeIterItem) -> Result<Self, Error> {
         let pk = root
-            .verify_terminal_parent("pkh", "public key")
+            .verify_terminal_parent("elpkh", "public key")
             .map_err(Error::Parse)?;
         Self::new(pk).map_err(Error::ContextError)
     }

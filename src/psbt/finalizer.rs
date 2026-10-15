@@ -1,24 +1,25 @@
 // Written in 2020 by Sanket Kanjalkar <sanket1729@gmail.com>
 // SPDX-License-Identifier: CC0-1.0
 
-//! Partially-Signed Bitcoin Transactions
+//! Partially-Signed Elements Transactions
 //!
 //! This module implements the Finalizer and Extractor roles defined in
 //! BIP 174, PSBT, described at
-//! `https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki`
+//! `https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki`,
+//! for the Elements PSET format.
 //!
 
 use core::convert::TryFrom;
-use core::mem;
 
 use bitcoin::hashes::hash160;
 use bitcoin::key::XOnlyPublicKey;
-use bitcoin::secp256k1::Secp256k1;
-use bitcoin::sighash::Prevouts;
-use bitcoin::taproot::LeafVersion;
-use bitcoin::{secp256k1, PublicKey, Script, ScriptBuf, TxOut, Witness};
+use bitcoin::PublicKey;
+use elements::secp256k1_zkp::{self as secp256k1, Secp256k1};
+use elements::sighash::Prevouts;
+use elements::taproot::LeafVersion;
+use elements::{Script, TxOut, Witness};
 
-use super::{sanity_check, Error, InputError, Psbt, PsbtInputSatisfier};
+use super::{partial_sigs, sanity_check, Error, InputError, Psbt, PsbtInputSatisfier};
 use crate::prelude::*;
 use crate::util::witness_size;
 use crate::{
@@ -31,23 +32,20 @@ use crate::{
 // be present. Also, currently the spec does not support hidden branches, so
 // inferring a descriptor is not possible
 fn construct_tap_witness(
-    spk: &Script,
     sat: &PsbtInputSatisfier,
     allow_mall: bool,
 ) -> Result<Vec<Vec<u8>>, InputError> {
     // When miniscript tries to finalize the PSBT, it doesn't have the full descriptor (which contained a pkh() fragment)
     // and instead resorts to parsing the raw script sig, which is translated into a "expr_raw_pkh" internally.
     let mut map: BTreeMap<hash160::Hash, bitcoin::key::XOnlyPublicKey> = BTreeMap::new();
-    sat.psbt.inputs.iter().for_each(|input| {
+    sat.psbt.inputs().iter().for_each(|input| {
         // We need to satisfy or dissatisfy any given key. `tap_key_origin` is the only field of PSBT Input which consist of
         // all the keys added on a descriptor and thus we get keys from it.
         input.tap_key_origins.keys().for_each(|key| {
             map.insert(key.to_pubkeyhash(SigType::Schnorr), *key);
         })
     });
-    assert!(spk.is_p2tr());
-
-    // try the key spend path firsti
+    // Try the key spend path first
     if let Some(sig) = sat.psbt_input().tap_internal_key.as_ref().and_then(|key| {
         <PsbtInputSatisfier as Satisfier<XOnlyPublicKey>>::lookup_tap_key_spend_sig(sat, key)
     }) {
@@ -59,7 +57,7 @@ fn construct_tap_witness(
         <PsbtInputSatisfier as Satisfier<XOnlyPublicKey>>::lookup_tap_control_block_map(sat)
     {
         for (control_block, (script, ver)) in block_map {
-            if *ver != LeafVersion::TapScript {
+            if *ver != LeafVersion::default() {
                 // We don't know how to satisfy non default version scripts yet
                 continue;
             }
@@ -97,18 +95,21 @@ fn construct_tap_witness(
 }
 
 // Get the scriptpubkey for the psbt input
-pub(super) fn get_scriptpubkey(psbt: &Psbt, index: usize) -> Result<ScriptBuf, InputError> {
+pub(super) fn get_scriptpubkey(psbt: &Psbt, index: usize) -> Result<Script, InputError> {
     get_utxo(psbt, index).map(|utxo| utxo.script_pubkey.clone())
 }
 
 // Get the spending utxo for this psbt input
-pub(super) fn get_utxo(psbt: &Psbt, index: usize) -> Result<&bitcoin::TxOut, InputError> {
-    let inp = &psbt.inputs[index];
+pub(super) fn get_utxo(psbt: &Psbt, index: usize) -> Result<&TxOut, InputError> {
+    let inp = &psbt.inputs()[index];
     let utxo = if let Some(ref witness_utxo) = inp.witness_utxo {
         witness_utxo
     } else if let Some(ref non_witness_utxo) = inp.non_witness_utxo {
-        let vout = psbt.unsigned_tx.input[index].previous_output.vout;
-        &non_witness_utxo.output[vout as usize]
+        let vout = inp.previous_outpoint().vout;
+        non_witness_utxo
+            .output
+            .get(vout as usize)
+            .ok_or(InputError::MissingUtxo)?
     } else {
         return Err(InputError::MissingUtxo);
     };
@@ -116,9 +117,9 @@ pub(super) fn get_utxo(psbt: &Psbt, index: usize) -> Result<&bitcoin::TxOut, Inp
 }
 
 /// Get the Prevouts for the psbt
-pub(super) fn prevouts(psbt: &Psbt) -> Result<Vec<&bitcoin::TxOut>, super::Error> {
+pub(super) fn prevouts(psbt: &Psbt) -> Result<Vec<&TxOut>, super::Error> {
     let mut utxos = vec![];
-    for i in 0..psbt.inputs.len() {
+    for i in 0..psbt.inputs().len() {
         let utxo_ref = get_utxo(psbt, i).map_err(|e| Error::InputError(e, i))?;
         utxos.push(utxo_ref);
     }
@@ -135,12 +136,12 @@ pub(super) fn prevouts(psbt: &Psbt) -> Result<Vec<&bitcoin::TxOut>, super::Error
 // and we want to satisfy it in any way possible.
 fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, InputError> {
     let mut map: BTreeMap<hash160::Hash, PublicKey> = BTreeMap::new();
-    let psbt_inputs = &psbt.inputs;
+    let psbt_inputs = psbt.inputs();
     for psbt_input in psbt_inputs {
         // Use BIP32 Derviation to get set of all possible keys.
         let public_keys = psbt_input.bip32_derivation.keys();
         for key in public_keys {
-            let bitcoin_key = bitcoin::PublicKey::new(*key);
+            let bitcoin_key = *key;
             let hash = bitcoin_key.pubkey_hash().to_raw_hash();
             map.insert(hash, bitcoin_key);
         }
@@ -148,7 +149,7 @@ fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, In
 
     // Figure out Scriptpubkey
     let script_pubkey = get_scriptpubkey(psbt, index)?;
-    let inp = &psbt.inputs[index];
+    let inp = &psbt.inputs()[index];
     // 1. `PK`: creates a `Pk` descriptor(does not check if partial sig is given)
     if script_pubkey.is_p2pk() {
         let script_pubkey_len = script_pubkey.len();
@@ -165,7 +166,7 @@ fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, In
             .find(|&(pk, _sig)| script_pubkey.as_bytes()[3..23] == pk.pubkey_hash()[..])
             .ok_or(InputError::MissingPubkey)?;
         Descriptor::new_pkh(*pk).map_err(InputError::from)
-    } else if script_pubkey.is_p2wpkh() {
+    } else if script_pubkey.is_v0_p2wpkh() {
         // 3. `Wpkh`: creates a `wpkh` descriptor if the partial sig has corresponding pk.
         let (pk, _) = inp
             .partial_sigs
@@ -179,13 +180,13 @@ fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, In
             })
             .ok_or(InputError::MissingPubkey)?;
         Descriptor::new_wpkh(*pk).map_err(InputError::from)
-    } else if script_pubkey.is_p2wsh() {
+    } else if script_pubkey.is_v0_p2wsh() {
         // 4. `Wsh`: creates a `Wsh` descriptor
         if inp.redeem_script.is_some() {
             return Err(InputError::NonEmptyRedeemScript);
         }
         if let Some(ref witness_script) = inp.witness_script {
-            if witness_script.to_p2wsh() != *script_pubkey {
+            if witness_script.to_v0_p2wsh() != script_pubkey {
                 return Err(InputError::InvalidWitnessScript {
                     witness_script: witness_script.clone(),
                     p2wsh_expected: script_pubkey.clone(),
@@ -200,16 +201,16 @@ fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, In
         match inp.redeem_script {
             None => Err(InputError::MissingRedeemScript),
             Some(ref redeem_script) => {
-                if redeem_script.to_p2sh() != *script_pubkey {
+                if redeem_script.to_p2sh() != script_pubkey {
                     return Err(InputError::InvalidRedeemScript {
                         redeem: redeem_script.clone(),
                         p2sh_expected: script_pubkey.clone(),
                     });
                 }
-                if redeem_script.is_p2wsh() {
+                if redeem_script.is_v0_p2wsh() {
                     // 5. `ShWsh` case
                     if let Some(ref witness_script) = inp.witness_script {
-                        if witness_script.to_p2wsh() != *redeem_script {
+                        if witness_script.to_v0_p2wsh() != *redeem_script {
                             return Err(InputError::InvalidWitnessScript {
                                 witness_script: witness_script.clone(),
                                 p2wsh_expected: redeem_script.clone(),
@@ -222,7 +223,7 @@ fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, In
                     } else {
                         Err(InputError::MissingWitnessScript)
                     }
-                } else if redeem_script.is_p2wpkh() {
+                } else if redeem_script.is_v0_p2wpkh() {
                     // 6. `ShWpkh` case
                     let (pk, _) = inp
                         .partial_sigs
@@ -274,24 +275,36 @@ fn get_descriptor(psbt: &Psbt, index: usize) -> Result<Descriptor<PublicKey>, In
 pub fn interpreter_check<C: secp256k1::Verification>(
     psbt: &Psbt,
     secp: &Secp256k1<C>,
+    genesis_hash: elements::BlockHash,
+) -> Result<(), Error> {
+    let tx = psbt.extract_tx()?;
+    interpreter_check_tx(psbt, secp, genesis_hash, &tx)
+}
+
+pub(super) fn interpreter_check_tx<C: secp256k1::Verification>(
+    psbt: &Psbt,
+    secp: &Secp256k1<C>,
+    genesis_hash: elements::BlockHash,
+    tx: &elements::Transaction,
 ) -> Result<(), Error> {
     let utxos = prevouts(psbt)?;
     let utxos = &Prevouts::All(&utxos);
-    let empty_script_sig = ScriptBuf::new();
+    let empty_script_sig = Script::new();
     let empty_witness = Witness::default();
-    for (index, input) in psbt.inputs.iter().enumerate() {
+    for (index, input) in psbt.inputs().iter().enumerate() {
         let script_sig = input.final_script_sig.as_ref().unwrap_or(&empty_script_sig);
         let witness = input
             .final_script_witness
             .as_ref()
             .unwrap_or(&empty_witness);
 
-        interpreter_inp_check(psbt, secp, index, utxos, witness, script_sig)?;
+        interpreter_inp_check(psbt, secp, index, utxos, witness, script_sig, tx, genesis_hash)?;
     }
     Ok(())
 }
 
 // Run the miniscript interpreter on a single psbt input
+#[allow(clippy::too_many_arguments)]
 fn interpreter_inp_check<C: secp256k1::Verification, T: Borrow<TxOut>>(
     psbt: &Psbt,
     secp: &Secp256k1<C>,
@@ -299,6 +312,8 @@ fn interpreter_inp_check<C: secp256k1::Verification, T: Borrow<TxOut>>(
     utxos: &Prevouts<T>,
     witness: &Witness,
     script_sig: &Script,
+    tx: &elements::Transaction,
+    genesis_hash: elements::BlockHash,
 ) -> Result<(), Error> {
     let spk = get_scriptpubkey(psbt, index).map_err(|e| Error::InputError(e, index))?;
 
@@ -306,12 +321,12 @@ fn interpreter_inp_check<C: secp256k1::Verification, T: Borrow<TxOut>>(
     // corrected, there should be no errors
     // Interpreter check
     {
-        let cltv = psbt.unsigned_tx.lock_time;
-        let csv = psbt.unsigned_tx.input[index].sequence;
+        let cltv = tx.lock_time;
+        let csv = tx.input[index].sequence;
         let interpreter =
             interpreter::Interpreter::from_txdata(&spk, script_sig, witness, csv, cltv)
                 .map_err(|e| Error::InputError(InputError::Interpreter(e), index))?;
-        let iter = interpreter.iter(secp, &psbt.unsigned_tx, index, utxos);
+        let iter = interpreter.iter(secp, tx, index, utxos, genesis_hash);
         if let Some(error) = iter.filter_map(Result::err).next() {
             return Err(Error::InputError(InputError::Interpreter(error), index));
         };
@@ -334,28 +349,31 @@ fn interpreter_inp_check<C: secp256k1::Verification, T: Borrow<TxOut>>(
 pub fn finalize<C: secp256k1::Verification>(
     psbt: &mut Psbt,
     secp: &Secp256k1<C>,
+    genesis_hash: elements::BlockHash,
 ) -> Result<(), super::Error> {
-    finalize_helper(psbt, secp, false)
+    finalize_helper(psbt, secp, false, genesis_hash)
 }
 
 /// Same as [finalize], but allows for malleable satisfactions
 pub fn finalize_mall<C: secp256k1::Verification>(
     psbt: &mut Psbt,
     secp: &Secp256k1<C>,
+    genesis_hash: elements::BlockHash,
 ) -> Result<(), super::Error> {
-    finalize_helper(psbt, secp, true)
+    finalize_helper(psbt, secp, true, genesis_hash)
 }
 
 pub fn finalize_helper<C: secp256k1::Verification>(
     psbt: &mut Psbt,
     secp: &Secp256k1<C>,
     allow_mall: bool,
+    genesis_hash: elements::BlockHash,
 ) -> Result<(), super::Error> {
     sanity_check(psbt)?;
 
-    // Actually construct the witnesses
-    for index in 0..psbt.inputs.len() {
-        finalize_input(psbt, index, secp, allow_mall)?;
+    let mut tx = None;
+    for index in 0..psbt.inputs().len() {
+        finalize_input(psbt, index, secp, allow_mall, genesis_hash, &mut tx)?;
     }
     // Interpreter is already run inside finalize_input for each input
     Ok(())
@@ -368,22 +386,23 @@ fn finalize_input_helper<C: secp256k1::Verification>(
     index: usize,
     secp: &Secp256k1<C>,
     allow_mall: bool,
-) -> Result<(Witness, ScriptBuf), super::Error> {
+    genesis_hash: elements::BlockHash,
+    tx: &elements::Transaction,
+) -> Result<(Witness, Script), super::Error> {
     let (witness, script_sig) = {
         let spk = get_scriptpubkey(psbt, index).map_err(|e| Error::InputError(e, index))?;
         let sat = PsbtInputSatisfier::new(psbt, index);
 
-        if spk.is_p2tr() {
+        if spk.is_v1_p2tr() {
             // Deal with tr case separately, unfortunately we cannot infer the full descriptor for Tr
-            let wit = construct_tap_witness(&spk, &sat, allow_mall)
-                .map_err(|e| Error::InputError(e, index))?;
-            (wit, ScriptBuf::new())
+            let wit =
+                construct_tap_witness(&sat, allow_mall).map_err(|e| Error::InputError(e, index))?;
+            (wit, Script::new())
         } else {
             // Get a descriptor for this input.
             let desc = get_descriptor(psbt, index).map_err(|e| Error::InputError(e, index))?;
 
             //generate the satisfaction witness and scriptsig
-            let sat = PsbtInputSatisfier::new(psbt, index);
             if !allow_mall {
                 desc.get_satisfaction(sat)
             } else {
@@ -393,12 +412,23 @@ fn finalize_input_helper<C: secp256k1::Verification>(
         }
     };
 
-    let witness = bitcoin::Witness::from_slice(&witness);
+    let witness = Witness::from_slice(&witness);
     let utxos = prevouts(psbt)?;
     let utxos = &Prevouts::All(&utxos);
-    interpreter_inp_check(psbt, secp, index, utxos, &witness, &script_sig)?;
+    interpreter_inp_check(psbt, secp, index, utxos, &witness, &script_sig, tx, genesis_hash)?;
 
     Ok((witness, script_sig))
+}
+
+pub(super) fn has_final_scripts(input: &elements::pset::Input) -> bool {
+    input
+        .final_script_sig
+        .as_ref()
+        .is_some_and(|script| !script.is_empty())
+        || input
+            .final_script_witness
+            .as_ref()
+            .is_some_and(|witness| !witness.is_empty())
 }
 
 pub(super) fn finalize_input<C: secp256k1::Verification>(
@@ -406,23 +436,49 @@ pub(super) fn finalize_input<C: secp256k1::Verification>(
     index: usize,
     secp: &Secp256k1<C>,
     allow_mall: bool,
+    genesis_hash: elements::BlockHash,
+    tx: &mut Option<elements::Transaction>,
 ) -> Result<(), super::Error> {
     // Preserve previously finalized inputs
-    if psbt.inputs[index].final_script_sig.is_some()
-        || psbt.inputs[index].final_script_witness.is_some()
-    {
+    if has_final_scripts(&psbt.inputs()[index]) {
         return Ok(());
     }
+    // The satisfier would treat a partial signature that does not parse as missing.
+    for sig in partial_sigs(&psbt.inputs()[index], index) {
+        sig?;
+    }
 
-    let (witness, script_sig) = finalize_input_helper(psbt, index, secp, allow_mall)?;
+    // Finalization changes only scriptSigs and witnesses, which sighashes do not
+    // commit to. Extract lazily so already-finalized inputs need no other data.
+    let tx = match tx {
+        Some(tx) => tx,
+        None => tx.insert(psbt.extract_tx()?),
+    };
+    let (witness, script_sig) =
+        finalize_input_helper(psbt, index, secp, allow_mall, genesis_hash, tx)?;
 
     // Now mutate the psbt input. Note that we cannot error after this point.
     // If the input is mutated, it means that the finalization succeeded.
     {
-        let original = mem::take(&mut psbt.inputs[index]);
-        let input = &mut psbt.inputs[index];
-        input.non_witness_utxo = original.non_witness_utxo;
-        input.witness_utxo = original.witness_utxo;
+        // Clear the signing data as BIP 174 requires of the Finalizer. Unlike a
+        // v0 PSBT input, a PSET input also holds its prevout, sequence, locktime,
+        // issuance, pegin and blinding data, which the extractor still needs.
+        let input = &mut psbt.inputs_mut()[index];
+        input.partial_sigs.clear();
+        input.sighash_type = None;
+        input.redeem_script = None;
+        input.witness_script = None;
+        input.bip32_derivation.clear();
+        input.ripemd160_preimages.clear();
+        input.sha256_preimages.clear();
+        input.hash160_preimages.clear();
+        input.hash256_preimages.clear();
+        input.tap_key_sig = None;
+        input.tap_script_sigs.clear();
+        input.tap_scripts.clear();
+        input.tap_key_origins.clear();
+        input.tap_internal_key = None;
+        input.tap_merkle_root = None;
         input.final_script_sig = (!script_sig.is_empty()).then_some(script_sig);
         input.final_script_witness = (!witness.is_empty()).then_some(witness);
     }
@@ -432,39 +488,106 @@ pub(super) fn finalize_input<C: secp256k1::Verification>(
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{absolute, transaction, Transaction, TxIn};
-    use hex;
+    use core::str::FromStr;
+
+    use elements::script::Builder;
+    use elements::sighash::SighashCache;
+    use elements::EcdsaSighashType;
 
     use super::*;
-    use crate::psbt::PsbtExt;
+    use crate::psbt::tests::{genesis_hash, pset_spending, wpkh_key};
+    use crate::psbt::{PsbtExt, PsbtInputExt, PsbtSighashMsg};
+    use crate::{elementssig_to_rawsig, DefiniteDescriptorKey, Descriptor};
 
     #[test]
     fn tests_from_bip174() {
-        let mut psbt = Psbt::deserialize(&hex::decode_to_vec("70736274ff01009a020000000258e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd750000000000ffffffff838d0427d0ec650a68aa46bb0b098aea4422c071b2ca78352a077959d07cea1d0100000000ffffffff0270aaf00800000000160014d85c2b71d0060b09c9886aeb815e50991dda124d00e1f5050000000016001400aea9a2e5f0f876a588df5546e8742d1d87008f00000000000100bb0200000001aad73931018bd25f84ae400b68848be09db706eac2ac18298babee71ab656f8b0000000048473044022058f6fc7c6a33e1b31548d481c826c015bd30135aad42cd67790dab66d2ad243b02204a1ced2604c6735b6393e5b41691dd78b00f0c5942fb9f751856faa938157dba01feffffff0280f0fa020000000017a9140fb9463421696b82c833af241c78c17ddbde493487d0f20a270100000017a91429ca74f8a08f81999428185c97b5d852e4063f6187650000002202029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f473044022074018ad4180097b873323c0015720b3684cc8123891048e7dbcd9b55ad679c99022073d369b740e3eb53dcefa33823c8070514ca55a7dd9544f157c167913261118c01220202dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d7483045022100f61038b308dc1da865a34852746f015772934208c6d24454393cd99bdf2217770220056e675a675a6d0a02b85b14e5e29074d8a25a9b5760bea2816f661910a006ea01010304010000000104475221029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f2102dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d752ae2206029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f10d90c6a4f000000800000008000000080220602dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d710d90c6a4f0000008000000080010000800001012000c2eb0b0000000017a914b7f5faf40e3d40a5a459b1db3535f2b72fa921e887220203089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc473044022062eb7a556107a7c73f45ac4ab5a1dddf6f7075fb1275969a7f383efff784bcb202200c05dbb7470dbf2f08557dd356c7325c1ed30913e996cd3840945db12228da5f012202023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e73473044022065f45ba5998b59a27ffe1a7bed016af1f1f90d54b3aa8f7450aa5f56a25103bd02207f724703ad1edb96680b284b56d4ffcb88f7fb759eabbe08aa30f29b851383d2010103040100000001042200208c2353173743b595dfb4a07b72ba8e42e3797da74e87fe7d9d7497e3b2028903010547522103089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc21023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7352ae2206023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7310d90c6a4f000000800000008003000080220603089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc10d90c6a4f00000080000000800200008000220203a9a4c37f5996d3aa25dbac6b570af0650394492942460b354753ed9eeca5877110d90c6a4f000000800000008004000080002202027f6399757d2eff55a136ad02c684b1838b6556e5f1b6b34282a94b6b5005109610d90c6a4f00000080000000800500008000").unwrap()).unwrap();
+        // The Elements counterpart of the BIP 174 finalizer vector: a P2SH multisig
+        // input and a P2SH-wrapped P2WSH multisig input.
+        let secp = Secp256k1::new();
+        let keys: Vec<_> = (1..=4).map(|sk| wpkh_key(&secp, sk)).collect();
+        let descs = [
+            format!("elsh(multi(2,{},{}))", keys[0].1, keys[1].1),
+            format!("elsh(wsh(multi(2,{},{})))", keys[2].1, keys[3].1),
+        ];
+        let descs: Vec<Descriptor<DefiniteDescriptorKey>> = descs
+            .iter()
+            .map(|d| Descriptor::from_str(d).unwrap())
+            .collect();
+        let spks: Vec<Script> = descs.iter().map(|d| d.script_pubkey()).collect();
+        let mut psbt = pset_spending(&spks);
+        for (input, desc) in psbt.inputs_mut().iter_mut().zip(&descs) {
+            input.update_with_descriptor_unchecked(desc).unwrap();
+        }
 
-        let secp = Secp256k1::verification_only();
-        psbt.finalize_mut(&secp).unwrap();
+        let unsigned_tx = psbt.extract_tx().unwrap();
+        let mut cache = SighashCache::new(&unsigned_tx);
+        let mut sigs = vec![];
+        for (idx, signers) in [&keys[0..2], &keys[2..4]].iter().enumerate() {
+            let msg = psbt
+                .sighash_msg(idx, &mut cache, None, genesis_hash())
+                .unwrap();
+            assert_eq!(matches!(msg, PsbtSighashMsg::LegacySighash(_)), idx == 0);
+            for (sk, pk) in signers.iter() {
+                let sig = (secp.sign_ecdsa(&msg.to_secp_msg(), sk), EcdsaSighashType::All);
+                let sig = elementssig_to_rawsig(&sig);
+                psbt.inputs_mut()[idx].partial_sigs.insert(*pk, sig.clone());
+                sigs.push(sig);
+            }
+        }
+        let redeem_script = psbt.inputs()[0].redeem_script.clone().unwrap();
+        let nested_redeem_script = psbt.inputs()[1].redeem_script.clone().unwrap();
+        let witness_script = psbt.inputs()[1].witness_script.clone().unwrap();
 
-        let expected = Psbt::deserialize(&hex::decode_to_vec("70736274ff01009a020000000258e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd750000000000ffffffff838d0427d0ec650a68aa46bb0b098aea4422c071b2ca78352a077959d07cea1d0100000000ffffffff0270aaf00800000000160014d85c2b71d0060b09c9886aeb815e50991dda124d00e1f5050000000016001400aea9a2e5f0f876a588df5546e8742d1d87008f00000000000100bb0200000001aad73931018bd25f84ae400b68848be09db706eac2ac18298babee71ab656f8b0000000048473044022058f6fc7c6a33e1b31548d481c826c015bd30135aad42cd67790dab66d2ad243b02204a1ced2604c6735b6393e5b41691dd78b00f0c5942fb9f751856faa938157dba01feffffff0280f0fa020000000017a9140fb9463421696b82c833af241c78c17ddbde493487d0f20a270100000017a91429ca74f8a08f81999428185c97b5d852e4063f6187650000000107da00473044022074018ad4180097b873323c0015720b3684cc8123891048e7dbcd9b55ad679c99022073d369b740e3eb53dcefa33823c8070514ca55a7dd9544f157c167913261118c01483045022100f61038b308dc1da865a34852746f015772934208c6d24454393cd99bdf2217770220056e675a675a6d0a02b85b14e5e29074d8a25a9b5760bea2816f661910a006ea01475221029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f2102dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d752ae0001012000c2eb0b0000000017a914b7f5faf40e3d40a5a459b1db3535f2b72fa921e8870107232200208c2353173743b595dfb4a07b72ba8e42e3797da74e87fe7d9d7497e3b20289030108da0400473044022062eb7a556107a7c73f45ac4ab5a1dddf6f7075fb1275969a7f383efff784bcb202200c05dbb7470dbf2f08557dd356c7325c1ed30913e996cd3840945db12228da5f01473044022065f45ba5998b59a27ffe1a7bed016af1f1f90d54b3aa8f7450aa5f56a25103bd02207f724703ad1edb96680b284b56d4ffcb88f7fb759eabbe08aa30f29b851383d20147522103089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc21023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7352ae00220203a9a4c37f5996d3aa25dbac6b570af0650394492942460b354753ed9eeca5877110d90c6a4f000000800000008004000080002202027f6399757d2eff55a136ad02c684b1838b6556e5f1b6b34282a94b6b5005109610d90c6a4f00000080000000800500008000").unwrap()).unwrap();
-        assert_eq!(psbt, expected);
+        psbt.finalize_mut(&secp, genesis_hash()).unwrap();
+
+        let expected_script_sig = Builder::new()
+            .push_int(0)
+            .push_slice(&sigs[0])
+            .push_slice(&sigs[1])
+            .push_slice(redeem_script.as_bytes())
+            .into_script();
+        assert_eq!(psbt.inputs()[0].final_script_sig, Some(expected_script_sig));
+        assert_eq!(psbt.inputs()[0].final_script_witness, None);
+        assert_eq!(
+            psbt.inputs()[1].final_script_sig,
+            Some(
+                Builder::new()
+                    .push_slice(nested_redeem_script.as_bytes())
+                    .into_script()
+            )
+        );
+        assert_eq!(
+            psbt.inputs()[1].final_script_witness,
+            Some(Witness::from_slice(&[
+                vec![],
+                sigs[2].clone(),
+                sigs[3].clone(),
+                witness_script.to_bytes()
+            ]))
+        );
+        // The signing data is cleared, but the data the extractor needs is kept.
+        for (input, original) in psbt.inputs().iter().zip(pset_spending(&spks).inputs()) {
+            assert!(input.partial_sigs.is_empty());
+            assert!(input.bip32_derivation.is_empty());
+            assert_eq!(input.redeem_script, None);
+            assert_eq!(input.witness_script, None);
+            assert_eq!(input.witness_utxo, original.witness_utxo);
+            assert_eq!(input.previous_outpoint(), original.previous_outpoint());
+        }
+        psbt.extract(&secp, genesis_hash()).unwrap();
     }
 
     #[test]
     fn finalize_skips_already_finalized_input() {
-        let tx = Transaction {
-            version: transaction::Version::ONE,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![],
-        };
-        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&[vec![1]]));
+        let mut psbt = Psbt::new_v2();
+        psbt.add_input(elements::pset::Input::default());
+        psbt.inputs_mut()[0].final_script_witness = Some(Witness::from_slice(&[vec![1]]));
 
-        let expected_input = psbt.inputs[0].clone();
+        let expected_input = psbt.inputs()[0].clone();
         let secp = Secp256k1::verification_only();
 
-        psbt.finalize_mut(&secp).unwrap();
+        psbt.finalize_mut(&secp, genesis_hash()).unwrap();
 
-        assert_eq!(psbt.inputs[0], expected_input);
+        assert_eq!(psbt.inputs()[0], expected_input);
     }
 }

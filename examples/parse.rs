@@ -4,12 +4,12 @@
 
 use std::str::FromStr;
 
-use miniscript::descriptor::DescriptorType;
-use miniscript::Descriptor;
+use elements_miniscript::descriptor::DescriptorType;
+use elements_miniscript::Descriptor;
 
 fn main() {
-    let desc = miniscript::Descriptor::<bitcoin::PublicKey>::from_str(
-        "wsh(c:pk_k(020202020202020202020202020202020202020202020202020202020202020202))",
+    let desc = elements_miniscript::Descriptor::<bitcoin::PublicKey>::from_str(
+        "elwsh(c:pk_k(020202020202020202020202020202020202020202020202020202020202020202))",
     )
     .unwrap();
 
@@ -43,8 +43,8 @@ fn main() {
     );
 
     // In a similar fashion we can parse a wrapped segwit script.
-    let desc = miniscript::Descriptor::<bitcoin::PublicKey>::from_str(
-        "sh(wsh(c:pk_k(020202020202020202020202020202020202020202020202020202020202020202)))",
+    let desc = elements_miniscript::Descriptor::<bitcoin::PublicKey>::from_str(
+        "elsh(wsh(c:pk_k(020202020202020202020202020202020202020202020202020202020202020202)))",
     )
     .unwrap();
     assert!(desc.desc_type() == DescriptorType::ShWsh);

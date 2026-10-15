@@ -389,7 +389,7 @@ impl<'s> TreeIterItem<'s> {
         T::from_str(self.name()).map_err(ParseError::box_from_str)
     }
 
-    /// Check that a tree node has exactly one child, which is a terminal.
+    /// Check that a tree node has exactly one child, which is a terminal, in round brackets.
     ///
     /// If so, parse the terminal child from a string and return it.
     ///
@@ -404,6 +404,11 @@ impl<'s> TreeIterItem<'s> {
         T: FromStr,
         T::Err: StaticDebugAndDisplay,
     {
+        if self.parens() == Parens::Curly {
+            return Err(ParseError::Tree(ParseTreeError::IllegalCurlyBrace {
+                pos: self.children_pos(),
+            }));
+        }
         self.verify_n_children(description, 1..=1)
             .map_err(ParseError::Tree)?;
         self.first_child()

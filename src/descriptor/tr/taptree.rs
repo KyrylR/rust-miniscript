@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use bitcoin::taproot::{LeafVersion, TapLeafHash, TAPROOT_CONTROL_MAX_NODE_COUNT};
+use elements::taproot::{LeafVersion, TapLeafHash, TAPROOT_CONTROL_MAX_NODE_COUNT};
 
 use crate::miniscript::context::Tap;
 use crate::policy::{Liftable, Semantic};
@@ -195,7 +195,7 @@ pub struct TapTreeIterItem<'tr, Pk: MiniscriptKey> {
 impl<'tr, Pk: MiniscriptKey> TapTreeIterItem<'tr, Pk> {
     /// The Tapscript in the leaf.
     ///
-    /// To obtain a [`bitcoin::Script`] from this node, call [`Miniscript::encode`]
+    /// To obtain an [`elements::Script`] from this node, call [`Miniscript::encode`]
     /// on the returned value.
     #[inline]
     pub fn miniscript(&self) -> &'tr Arc<Miniscript<Pk, Tap>> { self.node }
@@ -208,26 +208,24 @@ impl<'tr, Pk: MiniscriptKey> TapTreeIterItem<'tr, Pk> {
 
     /// The Tapleaf version of this leaf.
     ///
-    /// This function returns a constant value, since there is only one version in use
-    /// on the Bitcoin network; however, it may be useful to use this method in case
-    /// you wish to be forward-compatible with future versions supported by this
-    /// library.
+    /// This function returns a constant value, the Elements Tapscript leaf
+    /// version, which is the only version Miniscript leaves use.
     #[inline]
-    pub fn leaf_version(&self) -> LeafVersion { LeafVersion::TapScript }
+    pub fn leaf_version(&self) -> LeafVersion { LeafVersion::default() }
 }
 
 impl<Pk: ToPublicKey> TapTreeIterItem<'_, Pk> {
-    /// Computes the Bitcoin Script of the leaf.
+    /// Computes the Elements Script of the leaf.
     ///
     /// This function is potentially expensive. If you are calling this method on
     /// all (or many) of the leaves of the tree, you may instead want to call
     /// [`super::Tr::spend_info`] and use the [`super::TrSpendInfo::leaves`] iterator instead.
     #[inline]
-    pub fn compute_script(&self) -> bitcoin::ScriptBuf { self.node.encode() }
+    pub fn compute_script(&self) -> elements::Script { self.node.encode() }
 
     /// Computes the [`TapLeafHash`] of the leaf.
     ///
-    /// This function is potentially expensive, since it serializes the full Bitcoin
+    /// This function is potentially expensive, since it serializes the full Elements
     /// Script of the leaf and hashes this data. If you are calling this method on
     /// all (or many) of the leaves of the tree, you may instead want to call
     /// [`super::Tr::spend_info`] and use the [`super::TrSpendInfo::leaves`] iterator instead.

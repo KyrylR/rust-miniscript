@@ -1285,10 +1285,10 @@ impl<K: InnerXKey> DescriptorXKey<K> {
     /// ```
     /// # use std::str::FromStr;
     /// # fn body() -> Result<(), ()> {
-    /// use miniscript::bitcoin::bip32;
-    /// use miniscript::descriptor::DescriptorPublicKey;
+    /// use elements_miniscript::bitcoin::bip32;
+    /// use elements_miniscript::descriptor::DescriptorPublicKey;
     ///
-    /// let ctx = miniscript::bitcoin::secp256k1::Secp256k1::signing_only();
+    /// let ctx = elements_miniscript::bitcoin::secp256k1::Secp256k1::signing_only();
     ///
     /// let key = DescriptorPublicKey::from_str("[d34db33f/44'/0'/0']xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/1/*").or(Err(()))?;
     /// let xpub = match key {

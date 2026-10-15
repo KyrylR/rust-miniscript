@@ -5,9 +5,9 @@
 
 use std::str::FromStr;
 
-use miniscript::bitcoin::Network;
-use miniscript::descriptor::Wsh;
-use miniscript::policy::{Concrete, Liftable};
+use elements_miniscript::descriptor::Wsh;
+use elements_miniscript::elements::AddressParams;
+use elements_miniscript::policy::{Concrete, Liftable};
 
 fn main() {
     // HTLC policy with 10:1 odds for happy (co-operative) case compared to uncooperative case.
@@ -27,7 +27,7 @@ fn main() {
 
     assert_eq!(
         format!("{}", htlc_descriptor),
-        "wsh(andor(pk(022222222222222222222222222222222222222222222222222222222222222222),sha256(1111111111111111111111111111111111111111111111111111111111111111),and_v(v:pkh(020202020202020202020202020202020202020202020202020202020202020202),older(4444))))#lfytrjen"
+        "elwsh(andor(pk(022222222222222222222222222222222222222222222222222222222222222222),sha256(1111111111111111111111111111111111111111111111111111111111111111),and_v(v:pkh(020202020202020202020202020202020202020202020202020202020202020202),older(4444))))#mm63458x"
     );
 
     // Lift the descriptor into an abstract policy.
@@ -42,15 +42,15 @@ fn main() {
         "0020d853877af928a8d2a569c9c0ed14bd16f6a80ce9cccaf8a6150fd8f7f8867ae2"
     );
 
-    // Encode the Wsh descriptor into a Bitcoin script.
+    // Encode the Wsh descriptor into an Elements script.
     assert_eq!(
         format!("{:x}", htlc_descriptor.inner_script()),
         "21022222222222222222222222222222222222222222222222222222222222222222ac6476a91451814f108670aced2d77c1805ddd6634bc9d473188ad025c11b26782012088a82011111111111111111111111111111111111111111111111111111111111111118768"
     );
 
-    // Get the address for this Wsh descriptor.
+    // Get the unblinded Elements regtest address for this Wsh descriptor.
     assert_eq!(
-        format!("{}", htlc_descriptor.address(Network::Bitcoin)),
-        "bc1qmpfcw7he9z5d9ftfe8qw699azmm2sr8fen903fs4plv007yx0t3qxfmqv5"
+        format!("{}", htlc_descriptor.address(None, &AddressParams::ELEMENTS)),
+        "ert1qmpfcw7he9z5d9ftfe8qw699azmm2sr8fen903fs4plv007yx0t3qdt0h29"
     );
 }

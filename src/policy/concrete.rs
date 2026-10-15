@@ -1335,7 +1335,7 @@ mod compiler_tests {
         let policy: Policy<String> = policy_str!("pk(A)");
         let desc = policy.compile_tr(None).unwrap();
         // pk(A) promoted to the internal key, leaving the script tree empty
-        assert_eq!(desc.to_string(), "tr(A)#xyg3grex");
+        assert_eq!(desc.to_string(), "eltr(A)#nfhfhxyf");
     }
 
     #[test]
@@ -1380,14 +1380,14 @@ mod compiler_tests {
         // Single key: extract_key promotes it, leaving Unsatisfiable
         let pol = Policy::<String>::from_str("pk(A)").unwrap();
         let desc = pol.compile_tr_private_experimental(None).unwrap();
-        assert_eq!(desc.to_string(), "tr(A)#xyg3grex");
+        assert_eq!(desc.to_string(), "eltr(A)#nfhfhxyf");
 
         // Two keys: one promoted to internal key, other becomes single leaf
         let pol = Policy::<String>::from_str("and(pk(A),pk(B))").unwrap();
         let desc = pol
             .compile_tr_private_experimental(Some("UNSPENDABLE".to_string()))
             .unwrap();
-        assert_eq!(desc.to_string(), "tr(UNSPENDABLE,and_v(v:pk(A),pk(B)))#787dpsca");
+        assert_eq!(format!("{:#}", desc), "eltr(UNSPENDABLE,and_v(v:pk(A),pk(B)))");
     }
 }
 

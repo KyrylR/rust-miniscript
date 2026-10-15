@@ -4,33 +4,39 @@
 //! which we know how to satisfy
 //!
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
-use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::psbt::Psbt;
-use bitcoin::{
-    psbt, secp256k1, transaction, Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid,
+use bitcoin::hashes::Hash as BitcoinHash;
+use bitcoin::secp256k1::{self, Secp256k1};
+use elements::hashes::{hash160, ripemd160, sha256, sha256d};
+use elements::pset::PartiallySignedTransaction as Psbt;
+use elements::{
+    confidential, pset as psbt, secp256k1_zkp, AssetIssuance, BlockHash, LockTime, OutPoint,
+    Script, Sequence, TxIn, TxInWitness, TxOut, TxOutWitness, Txid,
 };
-use bitcoind::{AddressType, Client};
-use miniscript::bitcoin::absolute;
+use elements_miniscript as miniscript;
+use elementsd::ElementsD;
 use miniscript::psbt::PsbtExt;
-use miniscript::{bitcoin, DefiniteDescriptorKey, Descriptor};
+use miniscript::{bitcoin, elements, elementssig_to_rawsig, Descriptor};
 
 mod setup;
-use setup::test_util::{self, PubData, TestData};
+use setup::test_util::{self, PubData, TestData, PARAMS};
+use setup::Call;
 
 // parse ~30 miniscripts from file
-pub(crate) fn parse_miniscripts(pubdata: &PubData) -> Vec<Descriptor<DefiniteDescriptorKey>> {
+pub(crate) fn parse_miniscripts(
+    secp: &Secp256k1<secp256k1::All>,
+    pubdata: &PubData,
+) -> Vec<Descriptor<bitcoin::PublicKey>> {
     // File must exist in current path before this produces output
     let mut desc_vec = vec![];
     // Consumes the iterator, returns an (Optional) String
     for line in read_lines("tests/data/random_ms.txt") {
         let ms = test_util::parse_insane_ms(&line.unwrap(), pubdata);
         let wsh = Descriptor::new_wsh(ms).unwrap();
-        desc_vec.push(wsh.into_definite().unwrap());
+        desc_vec.push(wsh.derived_descriptor(secp, 0).unwrap());
     }
     desc_vec
 }
@@ -45,99 +51,75 @@ where
     io::BufReader::new(file).lines()
 }
 
-/// Quickly create a BTC amount.
-fn btc<F: Into<f64>>(btc: F) -> Amount { Amount::from_btc(btc.into()).unwrap() }
-
 // Find the Outpoint by value.
 // Ideally, we should find by scriptPubkey, but this
 // works for temp test case
-fn get_vout(cl: &Client, txid: Txid, value: Amount) -> (OutPoint, TxOut) {
-    let model = cl
-        .get_transaction(txid)
-        .expect("rpc call failed")
-        .into_model()
-        .expect("conversion to model type failed");
-    let tx = model.tx;
-
+fn get_vout(cl: &ElementsD, txid: Txid, value: u64) -> (OutPoint, TxOut) {
+    let tx = cl.get_transaction(&txid);
     for (i, txout) in tx.output.into_iter().enumerate() {
-        if txout.value == value {
+        if txout.value == confidential::Value::Explicit(value) {
             return (OutPoint::new(txid, i as u32), txout);
         }
     }
     unreachable!("Only call get vout on functions which have the expected outpoint");
 }
 
-pub fn test_from_cpp_ms(cl: &Client, testdata: &TestData) {
+pub fn test_from_cpp_ms(cl: &ElementsD, testdata: &TestData) {
     let secp = secp256k1::Secp256k1::new();
-    let desc_vec = parse_miniscripts(&testdata.pubdata);
+    let desc_vec = parse_miniscripts(&secp, &testdata.pubdata);
     let sks = &testdata.secretdata.sks;
     let pks = &testdata.pubdata.pks;
     // Generate some blocks
-    let blocks = cl
-        .generate_to_address(500, &cl.new_address().unwrap())
-        .unwrap();
-    assert_eq!(blocks.0.len(), 500);
+    cl.generate(500);
 
     // Next send some btc to each address corresponding to the miniscript
+    // Create a hard-
     let mut txids = vec![];
     for wsh in desc_vec.iter() {
-        let txid = cl
-            .send_to_address(&wsh.address(bitcoin::Network::Regtest).unwrap(), btc(1))
-            .expect("rpc call failed")
-            .txid()
-            .expect("conversion to model failed");
+        let txid = cl.send_to_address(
+            &wsh.address(&PARAMS).unwrap(), // This is unblinded address
+            "1",
+        );
+        cl.generate(1);
         txids.push(txid);
     }
     // Wait for the funds to mature.
-    let blocks = cl
-        .generate_to_address(50, &cl.new_address().unwrap())
-        .unwrap();
-    assert_eq!(blocks.0.len(), 50);
+    cl.generate(50);
     // Create a PSBT for each transaction.
     // Spend one input and spend one output for simplicity.
     let mut psbts = vec![];
     for (desc, txid) in desc_vec.iter().zip(txids) {
-        let mut psbt = Psbt {
-            unsigned_tx: Transaction {
-                version: transaction::Version::TWO,
-                lock_time: absolute::LockTime::from_time(1_603_866_330).expect("valid timestamp"), // 10/28/2020 @ 6:25am (UTC)
-                input: vec![],
-                output: vec![],
-            },
-            unknown: BTreeMap::new(),
-            proprietary: BTreeMap::new(),
-            xpub: BTreeMap::new(),
-            version: 0,
-            inputs: vec![],
-            outputs: vec![],
-        };
-        // figure out the outpoint from the txid
-        let (outpoint, witness_utxo) = get_vout(cl, txid, btc(1.0));
+        let mut psbt = Psbt::new_v2();
+        psbt.global.tx_data.fallback_locktime =
+            Some(LockTime::from_time(1_603_866_330).expect("valid timestamp")); // 10/28/2020 @ 6:25am (UTC)
+        let (outpoint, witness_utxo) = get_vout(cl, txid, 100_000_000);
         let txin = TxIn {
             previous_output: outpoint,
-            // set the sequence to a non-final number for the locktime transactions to be
-            // processed correctly.
-            // We waited 50 blocks, keep 49 for safety
-            sequence: Sequence::from_height(49),
-            ..Default::default()
+            is_pegin: false,
+            script_sig: Script::new(),
+            sequence: Sequence::from_height(49), // We waited 50 blocks, keep 49 for safety
+            asset_issuance: AssetIssuance::default(),
+            witness: TxInWitness::default(),
         };
-        psbt.unsigned_tx.input.push(txin);
+        psbt.add_input(psbt::Input::from_txin(txin));
         // Get a new script pubkey from the node so that
         // the node wallet tracks the receiving transaction
         // and we can check it by gettransaction RPC.
-        let addr = cl.new_address_with_type(AddressType::Bech32).unwrap();
-        psbt.unsigned_tx.output.push(TxOut {
-            value: Amount::from_sat(99_999_000),
+        let addr = cl.get_new_address();
+        let out = TxOut {
+            value: confidential::Value::Explicit(99_999_000),
             script_pubkey: addr.script_pubkey(),
-        });
-        let input = psbt::Input {
-            witness_utxo: Some(witness_utxo),
-            witness_script: Some(desc.explicit_script().unwrap()),
-            ..Default::default()
+            asset: witness_utxo.asset,
+            nonce: confidential::Nonce::Null,
+            witness: TxOutWitness::default(),
         };
-        psbt.inputs.push(input);
-        psbt.update_input_with_descriptor(0, desc).unwrap();
-        psbt.outputs.push(psbt::Output::default());
+        psbt.add_output(psbt::Output::from_txout(out));
+        // ELEMENTS: Add fee output
+        let fee_out = TxOut::new_fee(1_000, witness_utxo.asset.explicit().unwrap());
+        psbt.add_output(psbt::Output::from_txout(fee_out));
+
+        psbt.inputs_mut()[0].witness_utxo = Some(witness_utxo);
+        psbt.inputs_mut()[0].witness_script = Some(desc.explicit_script().unwrap());
         psbts.push(psbt);
     }
 
@@ -145,8 +127,7 @@ pub fn test_from_cpp_ms(cl: &Client, testdata: &TestData) {
     // Sign the transactions with all keys
     // AKA the signer role of psbt
     for i in 0..psbts.len() {
-        let wsh_derived = desc_vec[i].derived_descriptor(&secp);
-        let ms = if let Descriptor::Wsh(wsh) = &wsh_derived {
+        let ms = if let Descriptor::Wsh(wsh) = &desc_vec[i] {
             wsh.as_inner()
         } else {
             unreachable!("Only Wsh descriptors are supported");
@@ -157,78 +138,75 @@ pub fn test_from_cpp_ms(cl: &Client, testdata: &TestData) {
             .map(|pk| sks[pks.iter().position(|&x| x == pk).unwrap()])
             .collect();
         // Get the required sighash message
-        let amt = btc(1);
-        let mut sighash_cache = bitcoin::sighash::SighashCache::new(&psbts[i].unsigned_tx);
-        let sighash_type = bitcoin::sighash::EcdsaSighashType::All;
-        let sighash = sighash_cache
-            .p2wsh_signature_hash(0, &ms.encode(), amt, sighash_type)
-            .unwrap();
+        let amt = confidential::Value::Explicit(100_000_000);
+        let unsigned_tx = psbts[i].extract_tx().unwrap();
+        let mut sighash_cache = elements::sighash::SighashCache::new(&unsigned_tx);
+        let sighash_ty = elements::EcdsaSighashType::All;
+        let sighash = sighash_cache.segwitv0_sighash(0, &ms.encode(), amt, sighash_ty);
 
         // requires both signing and verification because we check the tx
         // after we psbt extract it
-        let msg = secp256k1::Message::from_digest(sighash.to_byte_array());
+        let msg = secp256k1_zkp::Message::from_digest_slice(sighash.as_ref()).unwrap();
 
         // Finally construct the signature and add to psbt
         for sk in sks_reqd {
-            let signature = secp.sign_ecdsa(&msg, &sk);
+            let sig = secp.sign_ecdsa(&msg, &sk);
+            let ser_sig = elementssig_to_rawsig(&(sig, sighash_ty));
             let pk = pks[sks.iter().position(|&x| x == sk).unwrap()];
-            psbts[i].inputs[0]
-                .partial_sigs
-                .insert(pk, bitcoin::ecdsa::Signature { signature, sighash_type });
+            psbts[i].inputs_mut()[0].partial_sigs.insert(pk, ser_sig);
         }
         // Add the hash preimages to the psbt
-        psbts[i].inputs[0]
-            .sha256_preimages
-            .insert(testdata.pubdata.sha256, testdata.secretdata.sha256_pre.to_vec());
-        psbts[i].inputs[0].hash256_preimages.insert(
+        psbts[i].inputs_mut()[0].sha256_preimages.insert(
+            sha256::Hash::from_byte_array(testdata.pubdata.sha256.to_byte_array()),
+            testdata.secretdata.sha256_pre.to_vec(),
+        );
+        psbts[i].inputs_mut()[0].hash256_preimages.insert(
             sha256d::Hash::from_byte_array(testdata.pubdata.hash256.to_byte_array()),
             testdata.secretdata.hash256_pre.to_vec(),
         );
         println!("{}", ms);
-        psbts[i].inputs[0]
-            .hash160_preimages
-            .insert(testdata.pubdata.hash160, testdata.secretdata.hash160_pre.to_vec());
-        psbts[i].inputs[0]
-            .ripemd160_preimages
-            .insert(testdata.pubdata.ripemd160, testdata.secretdata.ripemd160_pre.to_vec());
+        psbts[i].inputs_mut()[0].hash160_preimages.insert(
+            hash160::Hash::from_byte_array(testdata.pubdata.hash160.to_byte_array()),
+            testdata.secretdata.hash160_pre.to_vec(),
+        );
+        psbts[i].inputs_mut()[0].ripemd160_preimages.insert(
+            ripemd160::Hash::from_byte_array(testdata.pubdata.ripemd160.to_byte_array()),
+            testdata.secretdata.ripemd160_pre.to_vec(),
+        );
         // Finalize the transaction using psbt
         // Let miniscript do it's magic!
-        if let Err(e) = psbts[i].finalize_mall_mut(&secp) {
+        if let Err(e) = psbts[i].finalize_mall_mut(&secp, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH) {
             // All miniscripts should satisfy
             panic!("Could not satisfy: error{} ms:{} at ind:{}", e[0], ms, i);
         } else {
-            let tx = psbts[i].extract(&secp).unwrap();
+            // default genesis hash
+            let tx = psbts[i]
+                .extract(&secp, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH)
+                .unwrap();
 
             // Send the transactions to bitcoin node for mining.
             // Regtest mode has standardness checks
             // Check whether the node accepts the transactions
-            let txid = cl
-                .send_raw_transaction(&tx)
-                .unwrap_or_else(|_| panic!("{} send tx failed for ms {}", i, ms))
-                .txid()
-                .expect("conversion to model failed");
+            let txid = cl.send_raw_transaction(&tx);
             spend_txids.push(txid);
         }
     }
     // Finally mine the blocks and await confirmations
-    let _blocks = cl
-        .generate_to_address(10, &cl.new_address().unwrap())
-        .unwrap();
+    cl.generate(10);
     // Get the required transactions from the node mined in the blocks.
     for txid in spend_txids {
         // Check whether the transaction is mined in blocks
         // Assert that the confirmations are > 0.
-        let num_conf = cl.get_transaction(txid).unwrap().confirmations;
+        let num_conf = cl.call("gettransaction", &[txid.to_string().into()])["confirmations"]
+            .as_u64()
+            .unwrap();
         assert!(num_conf > 0);
     }
 }
 
 #[test]
-fn test_setup() { setup::setup(); }
-
-#[test]
 fn tests_from_cpp() {
-    let cl = &setup::setup().client;
-    let testdata = TestData::new_fixed_data(50);
+    let (cl, genesis_hash) = &setup::setup();
+    let testdata = TestData::new_fixed_data(50, *genesis_hash);
     test_from_cpp_ms(cl, &testdata);
 }

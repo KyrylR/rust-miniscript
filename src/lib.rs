@@ -29,12 +29,23 @@
 //!
 //! Miniscript also admits a more human-readable encoding.
 //!
+//! ## Elements
+//!
+//! This library targets the [Elements](https://github.com/ElementsProject/elements)
+//! sidechain. Scripts, addresses, transactions, PSETs and Taproot commitments are the
+//! Elements ones, while the Miniscript engine (parsing, typing, policy compilation,
+//! satisfaction and planning) is shared with rust-miniscript.
+//!
 //! ## Output Descriptors
 //!
 //! While spending policies in Bitcoin are entirely defined by Script; there
 //! are multiple ways of embedding these Scripts in transaction outputs; for
 //! example, P2SH or Segwit v0. These different embeddings are expressed by
 //! *Output Descriptors*, [which are described here](https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md).
+//! Elements descriptors carry an `el` prefix, for example `elwsh(...)` and `eltr(...)`.
+//! [`descriptor::WalletPolicy`] templates use the same grammar (`elwpkh(@0/**)`) with
+//! BIP-388's validation rules; they are an Elements adaptation and are not
+//! interchangeable with Bitcoin BIP-388 wallet policies.
 //!
 //! # Examples
 //!
@@ -43,8 +54,8 @@
 //! ```rust
 //! use std::str::FromStr;
 //!
-//! let desc = miniscript::Descriptor::<bitcoin::PublicKey>::from_str("\
-//!     sh(wsh(or_d(\
+//! let desc = elements_miniscript::Descriptor::<bitcoin::PublicKey>::from_str("\
+//!     elsh(wsh(or_d(\
 //!     c:pk_k(020e0338c96a8870479f2396c373cc7696ba124e8635d41b0ea581112b67817261),\
 //!     c:pk_k(0250863ad64a87ae8a2fe83c1af1a8403cb53f53e486d8511dad8a04887e5b2352)\
 //!     )))\
@@ -52,8 +63,8 @@
 //!
 //! // Derive the P2SH address.
 //! assert_eq!(
-//!     desc.address(bitcoin::Network::Bitcoin).unwrap().to_string(),
-//!     "3CJxbQBfWAe1ZkKiGQNEYrioV73ZwvBWns"
+//!     desc.address(&elements_miniscript::elements::AddressParams::ELEMENTS).unwrap().to_string(),
+//!     "XMyBX13qCo5Lp65mymgYVdmsYR5bcznWUa"
 //! );
 //!
 //! // Estimate the satisfaction cost.
@@ -85,6 +96,7 @@ compile_error!(
 );
 
 pub use bitcoin;
+pub use elements;
 pub use hex;
 
 #[cfg(not(feature = "std"))]
@@ -136,7 +148,9 @@ pub use crate::expression::{ParseNumError, ParseThresholdError, ParseTreeError};
 pub use crate::interpreter::Interpreter;
 pub use crate::miniscript::context::{BareCtx, Legacy, ScriptContext, Segwitv0, SigType, Tap};
 pub use crate::miniscript::decode::Terminal;
-pub use crate::miniscript::satisfy::{Preimage32, Satisfier};
+pub use crate::miniscript::satisfy::{
+    elementssig_from_rawsig, elementssig_to_rawsig, ElementsSig, Preimage32, Satisfier,
+};
 pub use crate::miniscript::{hash256, Miniscript};
 pub use crate::policy::semantic::MathSyntaxError;
 use crate::prelude::*;
@@ -429,10 +443,6 @@ pub trait ForEachKey<Pk: MiniscriptKey> {
 pub enum Error {
     /// Error when lexing a bitcoin Script.
     ScriptLexer(crate::miniscript::lex::Error),
-    /// rust-bitcoin address error
-    AddrError(bitcoin::address::ParseError),
-    /// rust-bitcoin p2sh address error
-    AddrP2shError(bitcoin::address::P2shError),
     /// While parsing backward, hit beginning of script
     UnexpectedStart,
     /// Got something we were not expecting
@@ -502,8 +512,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::ScriptLexer(ref e) => e.fmt(f),
-            Self::AddrError(ref e) => fmt::Display::fmt(e, f),
-            Self::AddrP2shError(ref e) => fmt::Display::fmt(e, f),
             Self::UnexpectedStart => f.write_str("unexpected start of script"),
             Self::Unexpected(ref s) => write!(f, "unexpected «{}»", s),
             Self::UnknownWrapper(ch) => write!(f, "unknown wrapper «{}:»", ch),
@@ -566,8 +574,6 @@ impl std::error::Error for Error {
             | TrNoScriptCode
             | MultipathDescLenMismatch => None,
             ScriptLexer(e) => Some(e),
-            AddrError(e) => Some(e),
-            AddrP2shError(e) => Some(e),
             Secp(e) => Some(e),
             #[cfg(feature = "compiler")]
             CompilerError(e) => Some(e),
@@ -617,16 +623,6 @@ impl From<bitcoin::secp256k1::Error> for Error {
 }
 
 #[doc(hidden)]
-impl From<bitcoin::address::ParseError> for Error {
-    fn from(e: bitcoin::address::ParseError) -> Self { Self::AddrError(e) }
-}
-
-#[doc(hidden)]
-impl From<bitcoin::address::P2shError> for Error {
-    fn from(e: bitcoin::address::P2shError) -> Self { Self::AddrP2shError(e) }
-}
-
-#[doc(hidden)]
 #[cfg(feature = "compiler")]
 impl From<crate::policy::compiler::CompilerError> for Error {
     fn from(e: crate::policy::compiler::CompilerError) -> Self { Self::CompilerError(e) }
@@ -663,7 +659,7 @@ fn push_opcode_size(script_size: usize) -> usize {
 
 /// Helper function used by tests
 #[cfg(test)]
-fn hex_script(s: &str) -> bitcoin::ScriptBuf { bitcoin::ScriptBuf::from_hex(s).unwrap() }
+fn hex_script(s: &str) -> elements::Script { elements::Script::from_hex_no_prefix(s).unwrap() }
 
 #[cfg(test)]
 mod tests {

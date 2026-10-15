@@ -118,7 +118,7 @@ macro_rules! benchmark_tr {
     ($ty:ty, $name:ident, $genfn:expr, $n:expr; $comb:expr) => {
         #[bench]
         fn $name(bh: &mut Bencher) {
-            let s = format!("tr(02b35c601492528601122c0807fa1f8bf987b9704dff438b2524d979b954e206fb,{})", $genfn($n, $comb));
+            let s = format!("eltr(02b35c601492528601122c0807fa1f8bf987b9704dff438b2524d979b954e206fb,{})", $genfn($n, $comb));
             println!("{}", s);
             bh.iter(|| black_box(<$ty>::from_str(&s).unwrap()))
         }
@@ -145,25 +145,25 @@ macro_rules! deep_expression {
 
 macro_rules! balanced_segwit {
     ($name:ident, $n:expr) => {
-        benchmark!(Desc, $name, generate_balanced_tree_str, $n, "wsh", parens "or_i");
+        benchmark!(Desc, $name, generate_balanced_tree_str, $n, "elwsh", parens "or_i");
     }
 }
 
 macro_rules! deep_segwit {
     ($name:ident, $n:expr) => {
-        benchmark!(Desc, $name, generate_deep_tree_str, $n, "wsh", parens "or_i");
+        benchmark!(Desc, $name, generate_deep_tree_str, $n, "elwsh", parens "or_i");
     }
 }
 
 macro_rules! balanced_segwit_thresh {
     ($name:ident, $n:expr) => {
-        benchmark!(Desc, $name, generate_balanced_tree_str, $n, "wsh"; |l, r| format!("thresh(2,{l},a:{r})"));
+        benchmark!(Desc, $name, generate_balanced_tree_str, $n, "elwsh"; |l, r| format!("thresh(2,{l},a:{r})"));
     }
 }
 
 macro_rules! deep_segwit_thresh {
     ($name:ident, $n:expr) => {
-        benchmark!(Desc, $name, generate_deep_tree_str, $n, "wsh"; |l, r| format!("thresh(2,{l},a:{r})"));
+        benchmark!(Desc, $name, generate_deep_tree_str, $n, "elwsh"; |l, r| format!("thresh(2,{l},a:{r})"));
     }
 }
 

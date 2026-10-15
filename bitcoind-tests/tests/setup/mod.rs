@@ -1,41 +1,117 @@
-extern crate miniscript;
+pub extern crate elements_miniscript;
 
-use bitcoind::client::bitcoin;
+use std::str::FromStr;
+
+use elements::encode::{deserialize, serialize_hex};
+use elements::BlockHash;
+pub use elements_miniscript as miniscript;
+use elements_miniscript::bitcoin::hex::FromHex;
+use elementsd::bitcoincore_rpc::jsonrpc::serde_json::{json, Value};
+use elementsd::bitcoind::bitcoincore_rpc::RpcApi;
+use elementsd::ElementsD;
+use miniscript::elements;
 
 pub mod test_util;
 
-// Launch an instance of bitcoind with
-pub fn setup() -> bitcoind::BitcoinD {
-    // Create env var BITCOIND_EXE_PATH to point to the ../bitcoind/bin/bitcoind binary
-    let key = "BITCOIND_EXE";
-    if std::env::var(key).is_err() {
-        let mut root_path = std::env::current_dir().unwrap();
-        while std::fs::metadata(root_path.join("LICENSE")).is_err() {
-            if !root_path.pop() {
-                panic!("Could not find LICENSE file; do not know where repo root is.");
-            }
-        }
+pub fn setup() -> (ElementsD, elements::BlockHash) {
+    let mut conf = elementsd::Conf::new(None);
+    conf.0.args.extend(["-listen=0", "-connect=0"]);
 
-        let bitcoind_path = root_path
-            .join("bitcoind-tests")
-            .join("bin")
-            .join("bitcoind");
-        std::env::set_var(key, bitcoind_path);
+    // The default initial coins of the elementsd crate are fewer than the tests spend.
+    let arg_pos = conf
+        .0
+        .args
+        .iter()
+        .position(|x| x.starts_with("-initialfreecoins="));
+
+    match arg_pos {
+        Some(i) => conf.0.args[i] = "-initialfreecoins=210000000000",
+        None => conf.0.args.push("-initialfreecoins=210000000000"),
+    };
+
+    let elementsd = ElementsD::with_conf(elementsd::exe_path().unwrap(), &conf).unwrap();
+
+    let create = elementsd.call("createwallet", &["wallet".into()]);
+    assert_eq!(create.get("name").unwrap(), "wallet");
+
+    let rescan = elementsd.call("rescanblockchain", &[]);
+    assert_eq!(rescan.get("stop_height").unwrap().as_u64().unwrap(), 0);
+
+    let balances = elementsd.call("getbalances", &[]);
+    let mine = balances.get("mine").unwrap();
+    let trusted = mine.get("trusted").unwrap();
+    assert_eq!(trusted.get("bitcoin").unwrap(), 2100.0);
+
+    let genesis_str = elementsd.call("getblockhash", &[0u32.into()]);
+    let genesis_str = genesis_str.as_str().unwrap();
+    let genesis_hash = BlockHash::from_str(genesis_str).unwrap();
+
+    (elementsd, genesis_hash)
+}
+
+#[allow(unused)]
+pub trait Call {
+    fn call(&self, cmd: &str, args: &[Value]) -> Value;
+    fn get_new_address(&self) -> elements::Address;
+    fn send_to_address(&self, addr: &elements::Address, amt: &str) -> elements::Txid;
+    fn get_transaction(&self, txid: &elements::Txid) -> elements::Transaction;
+    fn test_mempool_accept(&self, hex: &elements::Transaction) -> bool;
+    fn send_raw_transaction(&self, hex: &elements::Transaction) -> elements::Txid;
+    fn generate(&self, blocks: u32);
+}
+
+impl Call for ElementsD {
+    fn call(&self, cmd: &str, args: &[Value]) -> Value {
+        self.client().call::<Value>(cmd, args).unwrap()
     }
 
-    let exe_path = bitcoind::exe_path().unwrap();
-    let bitcoind = bitcoind::BitcoinD::new(exe_path).unwrap();
-    let cl = &bitcoind.client;
-    // generate to an address by the wallet. And wait for funds to mature
-    let addr = cl.new_address().unwrap();
-    let blks = cl.generate_to_address(101, &addr).unwrap();
-    assert_eq!(blks.0.len(), 101);
+    fn get_new_address(&self) -> elements::Address {
+        let addr_str = self
+            .call("getnewaddress", &[])
+            .as_str()
+            .unwrap()
+            .to_string();
 
-    let balance = cl
-        .get_balance()
-        .expect("failed to get balance")
-        .balance()
-        .unwrap();
-    assert_eq!(balance, bitcoin::Amount::from_sat(100_000_000 * 50));
-    bitcoind
+        elements::Address::from_str(&addr_str).unwrap()
+    }
+
+    fn get_transaction(&self, txid: &elements::Txid) -> elements::Transaction {
+        let tx_hex = self.call("gettransaction", &[txid.to_string().into()])["hex"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let tx_bytes = Vec::<u8>::from_hex(&tx_hex).unwrap();
+        deserialize(&tx_bytes).unwrap()
+    }
+
+    fn send_to_address(&self, addr: &elements::Address, amt: &str) -> elements::Txid {
+        let tx_id = self
+            .call("sendtoaddress", &[addr.to_string().into(), amt.into()])
+            .as_str()
+            .unwrap()
+            .to_string();
+        elements::Txid::from_str(&tx_id).unwrap()
+    }
+
+    fn send_raw_transaction(&self, tx: &elements::Transaction) -> elements::Txid {
+        let tx_id = self
+            .call("sendrawtransaction", &[serialize_hex(tx).into()])
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        elements::Txid::from_str(&tx_id).unwrap()
+    }
+
+    fn generate(&self, blocks: u32) {
+        let address = self.get_new_address();
+        let _value = self.call("generatetoaddress", &[blocks.into(), address.to_string().into()]);
+    }
+
+    fn test_mempool_accept(&self, tx: &elements::Transaction) -> bool {
+        let result = self.call("testmempoolaccept", &[json!([serialize_hex(tx)])]);
+        let allowed = result.get(0).unwrap().get("allowed");
+        allowed.unwrap().as_bool().unwrap()
+    }
 }

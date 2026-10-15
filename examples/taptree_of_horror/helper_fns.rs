@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::hashes::{ripemd160, sha256, Hash};
-use miniscript::descriptor::DescriptorSecretKey;
-use miniscript::ToPublicKey;
+use elements_miniscript::descriptor::DescriptorSecretKey;
+use elements_miniscript::ToPublicKey;
 use secp256k1::Secp256k1;
 
 use crate::KEYS_PER_PERSONA;

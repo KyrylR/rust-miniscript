@@ -20,9 +20,9 @@ use core::iter::FromIterator;
 
 use bitcoin::hashes::{hash160, ripemd160, sha256};
 use bitcoin::key::XOnlyPublicKey;
-use bitcoin::script::PushBytesBuf;
-use bitcoin::taproot::{ControlBlock, LeafVersion, TapLeafHash};
-use bitcoin::{absolute, bip32, psbt, relative, ScriptBuf, WitnessVersion};
+use bitcoin::{absolute, bip32, relative, WitnessVersion};
+use elements::pset;
+use elements::taproot::{ControlBlock, LeafVersion, TapLeafHash};
 
 use crate::descriptor::{self, Descriptor, DescriptorType, KeyMap};
 use crate::miniscript::hash256;
@@ -148,7 +148,7 @@ where
     }
 
     fn provider_lookup_tap_key_spend_sig(&self, pk: &Pk) -> Option<usize> {
-        Satisfier::lookup_tap_key_spend_sig(self, pk).map(|s| s.serialize().len())
+        Satisfier::lookup_tap_key_spend_sig(self, pk).map(|s| schnorr_sig_len(&s))
     }
 
     fn provider_lookup_tap_leaf_script_sig(
@@ -156,7 +156,7 @@ where
         pk: &Pk,
         leaf_hash: &TapLeafHash,
     ) -> Option<usize> {
-        Satisfier::lookup_tap_leaf_script_sig(self, pk, leaf_hash).map(|s| s.serialize().len())
+        Satisfier::lookup_tap_leaf_script_sig(self, pk, leaf_hash).map(|s| schnorr_sig_len(&s))
     }
 
     fn provider_lookup_raw_pkh_pk(&self, hash: &hash160::Hash) -> Option<bitcoin::PublicKey> {
@@ -179,7 +179,7 @@ where
         hash: &(hash160::Hash, TapLeafHash),
     ) -> Option<(XOnlyPublicKey, usize)> {
         Satisfier::lookup_raw_pkh_tap_leaf_script_sig(self, hash)
-            .map(|(pk, sig)| (pk, sig.serialize().len()))
+            .map(|(pk, sig)| (pk, schnorr_sig_len(&sig)))
     }
 
     fn provider_lookup_sha256(&self, hash: &Pk::Sha256) -> bool {
@@ -201,6 +201,14 @@ where
     fn check_older(&self, s: relative::LockTime) -> bool { Satisfier::check_older(self, s) }
 
     fn check_after(&self, l: absolute::LockTime) -> bool { Satisfier::check_after(self, l) }
+}
+
+// The length of `sig.to_vec()`, which omits the sighash byte for `SIGHASH_DEFAULT`.
+fn schnorr_sig_len(sig: &elements::SchnorrSig) -> usize {
+    match sig.hash_ty {
+        elements::SchnorrSighashType::Default => 64,
+        _ => 65,
+    }
 }
 
 /// Representation of a particular spending path on a descriptor.
@@ -280,8 +288,8 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
     pub fn satisfy<Sat: Satisfier<Pk>>(
         &self,
         stfr: &Sat,
-    ) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error> {
-        use bitcoin::blockdata::script::Builder;
+    ) -> Result<(Vec<Vec<u8>>, elements::Script), Error> {
+        use elements::script::Builder;
 
         let stack = self
             .template
@@ -295,14 +303,10 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
                 vec![],
                 stack
                     .into_iter()
-                    .fold(Builder::new(), |builder, item| {
-                        let bytes = PushBytesBuf::try_from(item)
-                            .expect("All the possible placeholders can be made into PushBytesBuf");
-                        builder.push_slice(bytes)
-                    })
+                    .fold(Builder::new(), |builder, item| builder.push_slice(&item))
                     .into_script(),
             ),
-            DescriptorType::Wpkh | DescriptorType::Tr => (stack, ScriptBuf::new()),
+            DescriptorType::Wpkh | DescriptorType::Tr => (stack, elements::Script::new()),
             DescriptorType::ShWpkh => (stack, self.descriptor.unsigned_script_sig()),
             DescriptorType::Wsh | DescriptorType::ShWsh => {
                 let mut stack = stack;
@@ -318,12 +322,12 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
 }
 
 impl Plan<DefiniteDescriptorKey> {
-    /// Update a PSBT input with the metadata required to complete this plan
+    /// Update a PSET input with the metadata required to complete this plan
     ///
     /// This will only add the metadata for items required to complete this plan. For example, if
     /// there are multiple keys present in the descriptor, only the few used by this plan will be
-    /// added to the PSBT.
-    pub fn update_psbt_input(&self, input: &mut psbt::Input) {
+    /// added to the PSET.
+    pub fn update_psbt_input(&self, input: &mut pset::Input) {
         if let Descriptor::Tr(tr) = &self.descriptor {
             enum SpendType {
                 KeySpend { internal_key: XOnlyPublicKey },
@@ -332,7 +336,7 @@ impl Plan<DefiniteDescriptorKey> {
 
             #[derive(Default)]
             struct TrDescriptorData {
-                tap_script: Option<ScriptBuf>,
+                tap_script: Option<elements::Script>,
                 control_block: Option<ControlBlock>,
                 spend_type: Option<SpendType>,
                 key_origins: BTreeMap<XOnlyPublicKey, bip32::KeySource>,
@@ -400,12 +404,12 @@ impl Plan<DefiniteDescriptorKey> {
             if let (Some(tap_script), Some(control_block)) = (data.tap_script, data.control_block) {
                 input
                     .tap_scripts
-                    .insert(control_block, (tap_script, LeafVersion::TapScript));
+                    .insert(control_block, (tap_script, LeafVersion::default()));
             }
         } else {
             for item in &self.template {
                 if let Placeholder::EcdsaSigPk(pk) = item {
-                    let public_key = pk.to_public_key().inner;
+                    let public_key = pk.to_public_key();
                     let master_fingerprint = pk.master_fingerprint();
                     for derivation_path in pk.full_derivation_paths() {
                         input
@@ -420,7 +424,7 @@ impl Plan<DefiniteDescriptorKey> {
                 Descriptor::Sh(sh) => match sh.as_inner() {
                     descriptor::ShInner::Wsh(wsh) => {
                         input.witness_script = Some(wsh.inner_script());
-                        input.redeem_script = Some(wsh.inner_script().to_p2wsh());
+                        input.redeem_script = Some(wsh.inner_script().to_v0_p2wsh());
                     }
                     descriptor::ShInner::Wpkh(..) => input.redeem_script = Some(sh.inner_script()),
                     descriptor::ShInner::Ms(_) => input.redeem_script = Some(sh.inner_script()),
@@ -802,7 +806,7 @@ mod test {
             .unwrap(),
         ];
         let hashes = vec![];
-        let desc = format!("wsh(t:or_c(pk({}),v:pkh({})))", keys[0], keys[1]);
+        let desc = format!("elwsh(t:or_c(pk({}),v:pkh({})))", keys[0], keys[1]);
 
         // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig)
         // + 1 (witness script len) + 63 (witness script)
@@ -828,7 +832,7 @@ mod test {
             .unwrap(),
         ];
         let hashes = vec![];
-        let desc = format!("wsh(and_v(v:pk({}),pk({})))", keys[0], keys[1]);
+        let desc = format!("elwsh(and_v(v:pk({}),pk({})))", keys[0], keys[1]);
 
         // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2
         // + 1 (witness script len) + 70 (witness script)
@@ -862,7 +866,7 @@ mod test {
             .unwrap(),
         ];
         let hashes = vec![];
-        let desc = format!("wsh(multi(3,{},{},{},{}))", keys[0], keys[1], keys[2], keys[3]);
+        let desc = format!("elwsh(multi(3,{},{},{},{}))", keys[0], keys[1], keys[2], keys[3]);
 
         let tests = vec![
             (vec![], vec![], None, None, None),
@@ -890,7 +894,7 @@ mod test {
             .unwrap(),
         ];
         let hashes = vec![];
-        let desc = format!("wsh(thresh(2,pk({}),s:pk({}),snl:older(144)))", keys[0], keys[1]);
+        let desc = format!("elwsh(thresh(2,pk({}),s:pk({}),snl:older(144)))", keys[0], keys[1]);
 
         let tests = vec![
             (vec![], vec![], None, None, None),
@@ -940,7 +944,7 @@ mod test {
 
         test_inner(&desc, keys.clone(), hashes.clone(), tests);
 
-        let desc = format!("wsh(thresh(2,pk({}),s:pk({}),snl:after(144)))", keys[0], keys[1]);
+        let desc = format!("elwsh(thresh(2,pk({}),s:pk({}),snl:after(144)))", keys[0], keys[1]);
 
         let tests = vec![
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_0) + 1 (OP_ZERO)
@@ -1001,7 +1005,7 @@ mod test {
         //        B = multi(1, key2, key3)
         //        C = and(key4, after(10))
         let desc = format!(
-            "tr({},{{pk({}),{{multi_a(1,{},{}),and_v(v:pk({}),after(10))}}}})",
+            "eltr({},{{pk({}),{{multi_a(1,{},{}),and_v(v:pk({}),after(10))}}}})",
             keys[0], keys[1], keys[2], keys[3], keys[4]
         );
 
@@ -1092,7 +1096,7 @@ mod test {
         )
         .unwrap()];
         let hashes = vec![hash160::Hash::from_slice(&[0; 20]).unwrap()];
-        let desc = format!("wsh(and_v(v:pk({}),hash160({})))", keys[0], hashes[0]);
+        let desc = format!("elwsh(and_v(v:pk({}),hash160({})))", keys[0], hashes[0]);
 
         let tests = vec![
             // No assets, impossible
@@ -1116,8 +1120,10 @@ mod test {
         let root_xpub = Xpub::from_str("xpub661MyMwAqRbcFkPHucMnrGNzDwb6teAX1RbKQmqtEF8kK3Z7LZ59qafCjB9eCRLiTVG3uxBxgKvRgbubRhqSKXnGGb1aoaqLrpMBDrVxga8").unwrap();
         let fingerprint = root_xpub.fingerprint();
         let xpub = format!("[{}/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ", fingerprint);
-        let desc =
-            format!("tr({}/0/0,{{pkh({}/0/1),multi_a(2,{}/1/0,{}/1/1)}})", xpub, xpub, xpub, xpub);
+        let desc = format!(
+            "eltr({}/0/0,{{pkh({}/0/1),multi_a(2,{}/1/0,{}/1/1)}})",
+            xpub, xpub, xpub, xpub
+        );
 
         let desc = Descriptor::from_str(&desc).unwrap();
 
@@ -1125,7 +1131,7 @@ mod test {
         let first_branch = DescriptorPublicKey::from_str(&format!("{}/0/1", xpub)).unwrap();
         let second_branch = DescriptorPublicKey::from_str(&format!("{}/1/*", xpub)).unwrap(); // Note this is a wildcard key, so it can sign for the whole multi_a
 
-        let mut psbt_input = bitcoin::psbt::Input::default();
+        let mut psbt_input = pset::Input::default();
         let assets = Assets::new().add(internal_key);
         desc.clone()
             .into_plan(&assets)
@@ -1136,7 +1142,7 @@ mod test {
         assert_eq!(psbt_input.tap_key_origins.len(), 1, "Unexpected number of tap_key_origins");
         assert_eq!(psbt_input.tap_scripts.len(), 0, "Unexpected number of tap_scripts");
 
-        let mut psbt_input = bitcoin::psbt::Input::default();
+        let mut psbt_input = pset::Input::default();
         let assets = Assets::new().add(first_branch);
         desc.clone()
             .into_plan(&assets)
@@ -1147,7 +1153,7 @@ mod test {
         assert_eq!(psbt_input.tap_key_origins.len(), 1, "Unexpected number of tap_key_origins");
         assert_eq!(psbt_input.tap_scripts.len(), 1, "Unexpected number of tap_scripts");
 
-        let mut psbt_input = bitcoin::psbt::Input::default();
+        let mut psbt_input = pset::Input::default();
         let assets = Assets::new().add(second_branch);
         desc.into_plan(&assets)
             .unwrap()
@@ -1164,13 +1170,13 @@ mod test {
         let root_xpub = Xpub::from_str("xpub661MyMwAqRbcFkPHucMnrGNzDwb6teAX1RbKQmqtEF8kK3Z7LZ59qafCjB9eCRLiTVG3uxBxgKvRgbubRhqSKXnGGb1aoaqLrpMBDrVxga8").unwrap();
         let fingerprint = root_xpub.fingerprint();
         let xpub = format!("[{}/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ", fingerprint);
-        let desc = format!("wsh(multi(2,{}/1/0,{}/1/1))", xpub, xpub);
+        let desc = format!("elwsh(multi(2,{}/1/0,{}/1/1))", xpub, xpub);
 
         let desc = Descriptor::from_str(&desc).unwrap();
 
         let asset_key = DescriptorPublicKey::from_str(&format!("{}/1/*", xpub)).unwrap(); // Note this is a wildcard key, so it can sign for the whole multi
 
-        let mut psbt_input = bitcoin::psbt::Input::default();
+        let mut psbt_input = pset::Input::default();
         let assets = Assets::new().add(asset_key);
         desc.into_plan(&assets)
             .unwrap()
@@ -1207,10 +1213,7 @@ mod test {
                 let sighash =
                     secp256k1::Message::from_digest_slice(&b"michael was a message, amusingly"[..])
                         .expect("32 bytes");
-                bitcoin::ecdsa::Signature {
-                    signature: secp.sign_ecdsa(&sighash, sk),
-                    sighash_type: bitcoin::sighash::EcdsaSighashType::All,
-                }
+                (secp.sign_ecdsa(&sighash, sk), elements::EcdsaSighashType::All)
             })
             .collect::<Vec<_>>();
 
@@ -1218,7 +1221,7 @@ mod test {
         let exp_witness_script = desc.explicit_script().expect("has explicit script");
         let exp_script_sig = desc.unsigned_script_sig();
 
-        let mut satisfier = BTreeMap::<DefiniteDescriptorKey, bitcoin::ecdsa::Signature>::new();
+        let mut satisfier = BTreeMap::<DefiniteDescriptorKey, ElementsSig>::new();
         let mut assets = Assets::new();
         for (i, pk) in pks.iter().enumerate() {
             satisfier.insert(DefiniteDescriptorKey::from_str(&pk.to_string()).unwrap(), sigs[i]);
@@ -1240,7 +1243,7 @@ mod test {
         // For native P2WSH:
         // - script_sig should be empty
         // - witness should contain [signature, witness_script]
-        test_plan_satisfy(|pks| format!("wsh(pk({}))", pks[0]), 2);
+        test_plan_satisfy(|pks| format!("elwsh(pk({}))", pks[0]), 2);
     }
 
     #[test]
@@ -1248,7 +1251,7 @@ mod test {
         // For P2SH-P2WSH:
         // - script_sig should be the unsigned_script_sig (pushes the P2WSH redeemScript)
         // - witness should contain [signature, witness_script]
-        test_plan_satisfy(|pks| format!("sh(wsh(pk({})))", pks[0]), 2);
+        test_plan_satisfy(|pks| format!("elsh(wsh(pk({})))", pks[0]), 2);
     }
 
     #[test]
@@ -1259,11 +1262,11 @@ mod test {
         // - witness should be the same no matter the order of the keys
         assert_eq!(
             test_plan_satisfy(
-                |pks| format!("wsh(sortedmulti(2,{},{},{}))", pks[0], pks[1], pks[2]),
+                |pks| format!("elwsh(sortedmulti(2,{},{},{}))", pks[0], pks[1], pks[2]),
                 4
             ),
             test_plan_satisfy(
-                |pks| format!("wsh(sortedmulti(2,{},{},{}))", pks[1], pks[2], pks[0]),
+                |pks| format!("elwsh(sortedmulti(2,{},{},{}))", pks[1], pks[2], pks[0]),
                 4
             )
         );
@@ -1277,7 +1280,7 @@ mod test {
         .unwrap();
         let assets = Assets::from_iter([asset_key]);
         let desc = Descriptor::<DefiniteDescriptorKey>::from_str(
-            "wsh(pk(02a71967cb7bcd569e6768f393e660d6773013a1099e1352c0487ffd7a4c78c87e))",
+            "elwsh(pk(02a71967cb7bcd569e6768f393e660d6773013a1099e1352c0487ffd7a4c78c87e))",
         )
         .unwrap();
 
@@ -1341,7 +1344,7 @@ mod test {
         )
         .unwrap();
         let desc =
-            Descriptor::<DefiniteDescriptorKey>::from_str(&format!("sh(wpkh({}))", key)).unwrap();
+            Descriptor::<DefiniteDescriptorKey>::from_str(&format!("elsh(wpkh({}))", key)).unwrap();
         let max_weight = desc.max_weight_to_satisfy().unwrap().to_wu() as usize;
         let script_sig = desc.unsigned_script_sig();
         let plan = desc.into_plan(&Assets::new().add(key)).unwrap();
@@ -1361,10 +1364,11 @@ mod test {
         // the 73 bytes a plan budgets.
         let mut raw = [0x01u8; 64];
         raw[0] = 0x80;
-        let sig = bitcoin::ecdsa::Signature::sighash_all(
+        let sig: ElementsSig = (
             secp256k1::ecdsa::Signature::from_compact(&raw).unwrap(),
+            elements::EcdsaSighashType::All,
         );
-        assert_eq!(sig.to_vec().len(), 72);
+        assert_eq!(elementssig_to_rawsig(&sig).len(), 72);
 
         let keys = [
             DescriptorPublicKey::from_str(
@@ -1393,10 +1397,10 @@ mod test {
         let assets = Assets::new().add(keys[0].clone()).add(keys[1].clone());
 
         for desc in [
-            format!("wpkh({})", keys[0]),
-            format!("sh(wpkh({}))", keys[0]),
-            format!("wsh(and_v(v:pk({}),pk({})))", keys[0], keys[1]),
-            format!("sh(wsh(and_v(v:pk({}),pk({}))))", keys[0], keys[1]),
+            format!("elwpkh({})", keys[0]),
+            format!("elsh(wpkh({}))", keys[0]),
+            format!("elwsh(and_v(v:pk({}),pk({})))", keys[0], keys[1]),
+            format!("elsh(wsh(and_v(v:pk({}),pk({}))))", keys[0], keys[1]),
         ] {
             let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
             let max_weight = desc.max_weight_to_satisfy().unwrap().to_wu() as usize;
@@ -1409,6 +1413,59 @@ mod test {
             assert_eq!(plan.witness_size(), bitcoin::consensus::serialize(&witness).len());
             assert_eq!(plan.scriptsig_size(), varint_len(script_sig.len()) + script_sig.len());
             assert_eq!(plan.satisfaction_weight(), max_weight + 4 + 1);
+        }
+    }
+
+    /// A [`Satisfier`] with the same Schnorr signature for every key and leaf.
+    struct SchnorrSigs(XOnlyPublicKey, elements::SchnorrSig);
+
+    impl Satisfier<DefiniteDescriptorKey> for SchnorrSigs {
+        fn lookup_tap_key_spend_sig(
+            &self,
+            _: &DefiniteDescriptorKey,
+        ) -> Option<elements::SchnorrSig> {
+            Some(self.1)
+        }
+
+        fn lookup_tap_leaf_script_sig(
+            &self,
+            _: &DefiniteDescriptorKey,
+            _: &TapLeafHash,
+        ) -> Option<elements::SchnorrSig> {
+            Some(self.1)
+        }
+
+        fn lookup_raw_pkh_tap_leaf_script_sig(
+            &self,
+            _: &(hash160::Hash, TapLeafHash),
+        ) -> Option<(XOnlyPublicKey, elements::SchnorrSig)> {
+            Some((self.0, self.1))
+        }
+    }
+
+    #[test]
+    fn provider_schnorr_sig_len() {
+        let key = DefiniteDescriptorKey::from_str(
+            "02c2fd50ceae468857bb7eb32ae9cd4083e6c7e42fbbec179d81134b3e3830586c",
+        )
+        .unwrap();
+        let leaf_hash = TapLeafHash::from_script(&elements::Script::new(), LeafVersion::default());
+        let pkh = (key.to_pubkeyhash(SigType::Schnorr), leaf_hash);
+        let sig = elements::secp256k1_zkp::schnorr::Signature::from_slice(&[1u8; 64]).unwrap();
+
+        for (hash_ty, len) in [
+            (elements::SchnorrSighashType::Default, 64),
+            (elements::SchnorrSighashType::All, 65),
+        ] {
+            let sig = elements::SchnorrSig { sig, hash_ty };
+            assert_eq!(sig.to_vec().len(), len);
+            let sigs = SchnorrSigs(key.to_x_only_pubkey(), sig);
+            assert_eq!(sigs.provider_lookup_tap_key_spend_sig(&key), Some(len));
+            assert_eq!(sigs.provider_lookup_tap_leaf_script_sig(&key, &leaf_hash), Some(len));
+            assert_eq!(
+                sigs.provider_lookup_raw_pkh_tap_leaf_script_sig(&pkh),
+                Some((key.to_x_only_pubkey(), len))
+            );
         }
     }
 }

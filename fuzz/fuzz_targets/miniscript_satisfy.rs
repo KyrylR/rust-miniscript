@@ -6,8 +6,9 @@ use descriptor_fuzz::FuzzPk;
 use honggfuzz::fuzz;
 use miniscript::bitcoin::hashes::hash160;
 use miniscript::bitcoin::locktime::{absolute, relative};
-use miniscript::bitcoin::taproot::Signature;
-use miniscript::bitcoin::{secp256k1, PublicKey, TapLeafHash, TapSighashType, XOnlyPublicKey};
+use miniscript::bitcoin::{secp256k1, PublicKey, XOnlyPublicKey};
+use miniscript::elements::taproot::TapLeafHash;
+use miniscript::elements::{SchnorrSig as Signature, SchnorrSighashType as TapSighashType};
 use miniscript::{Miniscript, Satisfier, Segwitv0, Tap};
 
 struct FuzzSatisfier<'b> {
@@ -28,7 +29,7 @@ impl Satisfier<FuzzPk> for FuzzSatisfier<'_> {
         if b & 1 == 1 {
             // FIXME in later version of rust-secp we can use from_byte_array
             let secp_sig = secp256k1::schnorr::Signature::from_slice(&[0xab; 64]).unwrap();
-            Some(Signature { signature: secp_sig, sighash_type: TapSighashType::Default })
+            Some(Signature { sig: secp_sig, hash_ty: TapSighashType::Default })
         } else {
             None
         }

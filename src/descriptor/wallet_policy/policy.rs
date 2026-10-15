@@ -7,15 +7,28 @@ use super::{KeyInfo, WalletPolicyError};
 use crate::descriptor::Wildcard;
 use crate::{BTreeSet, Descriptor, ToString, Vec};
 
-/// A wallet policy as described in BIP-388
+/// A wallet policy in the style of BIP-388, over Elements descriptors.
+///
+/// BIP-388 defines wallet policies for Bitcoin descriptors. This crate's descriptors
+/// are Elements descriptors, so a wallet policy template is written in the same
+/// grammar: its top level is `elpkh`, `elwpkh`, `elsh`, `elwsh` or `eltr`, with the
+/// unprefixed `wpkh`/`wsh` only nested inside `elsh`, exactly as in a descriptor. Key
+/// expressions and every BIP-388 validation rule are unchanged: placeholders `@i`
+/// followed by `/**` or `/<NUM;NUM>/*`, first occurrences in order, disjoint
+/// derivations for a reused placeholder, pairwise-distinct key information items,
+/// and no bare script at the top level.
+///
+/// These templates are an Elements adaptation, not BIP-388 wallet policies: a
+/// Bitcoin wallet policy such as `wpkh(@0/**)` does not parse, and an Elements
+/// template must not be handed to software expecting BIP-388.
 ///
 ///```rust
 /// use std::str::FromStr;
-/// use miniscript::{Descriptor, DescriptorPublicKey};
-/// use miniscript::descriptor::{KeyInfo, WalletPolicy};
+/// use elements_miniscript::{Descriptor, DescriptorPublicKey};
+/// use elements_miniscript::descriptor::{KeyInfo, WalletPolicy};
 ///
 /// // Convert from a `Descriptor<DescriptorPublicKey>`:
-/// let desc_str = "pkh([6738736c/44'/0'/0']xpub6Br37sWxruYfT8ASpCjVHKGwgdnYFEn98DwiN76i2oyY6fgH1LAPmmDcF46xjxJr22gw4jmVjTE2E3URMnRPEPYyo1zoPSUba563ESMXCeb/<0;1>/*)";
+/// let desc_str = "elpkh([6738736c/44'/0'/0']xpub6Br37sWxruYfT8ASpCjVHKGwgdnYFEn98DwiN76i2oyY6fgH1LAPmmDcF46xjxJr22gw4jmVjTE2E3URMnRPEPYyo1zoPSUba563ESMXCeb/<0;1>/*)";
 /// let descriptor = Descriptor::<DescriptorPublicKey>::from_str(desc_str).unwrap();
 /// let policy1: WalletPolicy = (&descriptor).try_into().unwrap();
 ///
@@ -24,8 +37,11 @@ use crate::{BTreeSet, Descriptor, ToString, Vec};
 /// assert_eq!(policy1, policy2);
 ///
 /// // Convert from/to a wallet policy template string:
-/// let mut from_template = WalletPolicy::from_str("pkh(@0/**)").unwrap();
-/// assert_eq!(from_template.to_string(), "pkh(@0/**)");
+/// let mut from_template = WalletPolicy::from_str("elpkh(@0/**)").unwrap();
+/// assert_eq!(from_template.to_string(), "elpkh(@0/**)");
+///
+/// // Bitcoin BIP-388 templates are not accepted:
+/// assert!(WalletPolicy::from_str("pkh(@0/**)").is_err());
 /// assert_eq!(from_template.n_keys(), 1);
 ///
 /// // Cannot go back into descriptor if you created from template:
@@ -123,7 +139,8 @@ fn check_policy(
     key_info: &[KeyInfo],
 ) -> Result<(), WalletPolicyError> {
     // BIP-388's DESCRIPTOR_TEMPLATE grammar only produces sh, wsh, pkh,
-    // wpkh and tr at the top level.
+    // wpkh and tr at the top level; here their Elements counterparts elsh,
+    // elwsh, elpkh, elwpkh and eltr.
     if matches!(template, Descriptor::Bare(_)) {
         return Err(WalletPolicyError::TemplateValidationBareTopLevel);
     }

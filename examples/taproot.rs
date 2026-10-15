@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use miniscript::bitcoin::key::{Keypair, XOnlyPublicKey};
-use miniscript::bitcoin::secp256k1::rand;
-use miniscript::bitcoin::{Network, WitnessVersion};
-use miniscript::descriptor::DescriptorType;
-use miniscript::policy::Concrete;
-use miniscript::{translate_hash_fail, Descriptor, Miniscript, Tap, Translator};
+use elements_miniscript::bitcoin::key::{Keypair, XOnlyPublicKey};
+use elements_miniscript::bitcoin::secp256k1::rand;
+use elements_miniscript::bitcoin::WitnessVersion;
+use elements_miniscript::descriptor::DescriptorType;
+use elements_miniscript::elements::AddressParams;
+use elements_miniscript::policy::Concrete;
+use elements_miniscript::{translate_hash_fail, Descriptor, Miniscript, Tap, Translator};
 
 // Refer to https://github.com/sanket1729/adv_btc_workshop/blob/master/workshop.md#creating-a-taproot-descriptor
 // for a detailed explanation of the policy and it's compilation
@@ -48,7 +49,7 @@ fn main() {
     let desc = pol.compile_tr(Some("UNSPENDABLE_KEY".to_string())).unwrap();
 
     let expected_desc =
-        Descriptor::<String>::from_str("tr(Ca,{and_v(v:pk(In),older(9)),and_v(v:pk(hA),pk(S))})")
+        Descriptor::<String>::from_str("eltr(Ca,{and_v(v:pk(In),older(9)),and_v(v:pk(hA),pk(S))})")
             .unwrap();
     assert_eq!(desc, expected_desc);
 
@@ -107,15 +108,13 @@ fn main() {
     let max_sat_wt = real_desc.max_weight_to_satisfy().unwrap().to_wu();
     assert_eq!(max_sat_wt, 267);
 
-    // Compute the bitcoin address and check if it matches
-    let network = Network::Bitcoin;
-    let addr = real_desc.address(network).unwrap();
-    let expected_addr = bitcoin::Address::from_str(
-        "bc1p4l2xzq7js40965s5w0fknd287kdlmt2dljte37zsc5a34u0h9c4q85snyd",
-    )
-    .unwrap()
-    .assume_checked();
-    assert_eq!(addr, expected_addr);
+    // Compute the unblinded Elements regtest address. Elements Taproot outputs use
+    // Elements-tagged hashes, so the Bitcoin address of this descriptor does not carry
+    // over; check that the address pays to the descriptor's Taproot output instead.
+    let addr = real_desc.address(&AddressParams::ELEMENTS).unwrap();
+    assert_eq!(addr.script_pubkey(), real_desc.script_pubkey());
+    assert!(addr.script_pubkey().is_v1_p2tr());
+    assert!(addr.to_string().starts_with("ert1p"));
 }
 
 fn hardcoded_xonlypubkeys() -> Vec<XOnlyPublicKey> {

@@ -10,11 +10,11 @@
 /// This macro is handy when dealing with scripts that are only contain keys.
 /// See also [`crate::translate_hash_clone`]
 /// ```rust
-/// use miniscript::{bitcoin::PublicKey, policy::concrete::Policy, Translator, hash256};
+/// use elements_miniscript::{bitcoin::PublicKey, policy::concrete::Policy, Translator, hash256};
 /// use std::str::FromStr;
-/// use miniscript::translate_hash_fail;
+/// use elements_miniscript::translate_hash_fail;
 /// use std::collections::HashMap;
-/// use miniscript::bitcoin::hashes::{sha256, hash160, ripemd160};
+/// use elements_miniscript::bitcoin::hashes::{sha256, hash160, ripemd160};
 /// let alice_key = "0270cf3c71f65a3d93d285d9149fddeeb638f87a2d4d8cf16c525f71c417439777";
 /// let bob_key = "02f43b15c50a436f5335dbea8a64dd3b4e63e34c3b50c42598acb5f4f336b5d2fb";
 /// let placeholder_policy = Policy::<String>::from_str("and(pk(alice_key),pk(bob_key))").unwrap();

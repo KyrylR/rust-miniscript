@@ -8,7 +8,7 @@ fn do_test(data: &[u8]) {
 
     if let Ok(desc) = data_str.parse::<Descriptor<DefiniteDescriptorKey>>() {
         let _ = desc.to_string();
-        let _ = desc.address(miniscript::bitcoin::Network::Bitcoin);
+        let _ = desc.address(&miniscript::elements::AddressParams::ELEMENTS);
     }
 }
 

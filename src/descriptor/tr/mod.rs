@@ -2,8 +2,9 @@
 
 use core::{cmp, fmt, hash};
 
-use bitcoin::taproot::{TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_NODE_SIZE};
-use bitcoin::{opcodes, Address, Network, ScriptBuf, Weight};
+use bitcoin::Weight;
+use elements::taproot::{TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_NODE_SIZE};
+use elements::{secp256k1_zkp, Script};
 use sync::Arc;
 
 use super::checksum;
@@ -262,25 +263,24 @@ impl<Pk: MiniscriptKey> Tr<Pk> {
 
 impl<Pk: MiniscriptKey + ToPublicKey> Tr<Pk> {
     /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn script_pubkey(&self) -> ScriptBuf {
-        let output_key = self.spend_info().output_key();
-        let builder = bitcoin::blockdata::script::Builder::new();
-        builder
-            .push_opcode(opcodes::all::OP_PUSHNUM_1)
-            .push_slice(output_key.serialize())
-            .into_script()
+    pub fn script_pubkey(&self) -> Script {
+        Script::new_v1_p2tr_tweaked(self.spend_info().output_key())
     }
 
-    /// Obtains the corresponding address for this descriptor.
-    pub fn address(&self, network: Network) -> Address {
+    /// Obtains the corresponding address for this descriptor, blinded if `blinder` is given.
+    pub fn address(
+        &self,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static elements::AddressParams,
+    ) -> elements::Address {
         let spend_info = self.spend_info();
-        Address::p2tr_tweaked(spend_info.output_key(), network)
+        elements::Address::p2tr_tweaked(spend_info.output_key(), blinder, params)
     }
 
     /// Returns satisfying non-malleable witness and scriptSig with minimum
     /// weight to spend an output controlled by the given descriptor if it is
     /// possible to construct one using the `satisfier`.
-    pub fn get_satisfaction<S>(&self, satisfier: &S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction<S>(&self, satisfier: &S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -288,7 +288,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Tr<Pk> {
             .try_completing(satisfier)
             .expect("the same satisfier should manage to complete the template");
         if let Witness::Stack(stack) = satisfaction.stack {
-            Ok((stack, ScriptBuf::new()))
+            Ok((stack, Script::new()))
         } else {
             Err(Error::CouldNotSatisfy)
         }
@@ -297,10 +297,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Tr<Pk> {
     /// Returns satisfying, possibly malleable, witness and scriptSig with
     /// minimum weight to spend an output controlled by the given descriptor if
     /// it is possible to construct one using the `satisfier`.
-    pub fn get_satisfaction_mall<S>(
-        &self,
-        satisfier: &S,
-    ) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction_mall<S>(&self, satisfier: &S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -308,7 +305,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Tr<Pk> {
             .try_completing(satisfier)
             .expect("the same satisfier should manage to complete the template");
         if let Witness::Stack(stack) = satisfaction.stack {
-            Ok((stack, ScriptBuf::new()))
+            Ok((stack, Script::new()))
         } else {
             Err(Error::CouldNotSatisfy)
         }
@@ -344,7 +341,7 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Tr<Pk> {
     fn from_tree(root: expression::TreeIterItem) -> Result<Self, Error> {
         use crate::expression::{Parens, ParseTreeError};
 
-        root.verify_toplevel("tr", 1..=2)
+        root.verify_toplevel("eltr", 1..=2)
             .map_err(From::from)
             .map_err(Error::Parse)?;
 
@@ -394,8 +391,8 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Tr<Pk> {
 impl<Pk: MiniscriptKey> fmt::Debug for Tr<Pk> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.tree {
-            Some(ref s) => write!(f, "tr({:?},{:?})", self.internal_key, s),
-            None => write!(f, "tr({:?})", self.internal_key),
+            Some(ref s) => write!(f, "eltr({:?},{:?})", self.internal_key, s),
+            None => write!(f, "eltr({:?})", self.internal_key),
         }
     }
 }
@@ -406,8 +403,8 @@ impl<Pk: MiniscriptKey> fmt::Display for Tr<Pk> {
         let mut wrapped_f = checksum::Formatter::new(f);
         let key = &self.internal_key;
         match self.tree {
-            Some(ref s) => write!(wrapped_f, "tr({},{})", key, s)?,
-            None => write!(wrapped_f, "tr({})", key)?,
+            Some(ref s) => write!(wrapped_f, "eltr({},{})", key, s)?,
+            None => write!(wrapped_f, "eltr({})", key)?,
         }
         wrapped_f.write_checksum_if_not_alt()
     }
@@ -475,22 +472,15 @@ where
         let mut min_wit_len = None;
         for leaf in spend_info.leaves() {
             let mut satisfaction = if allow_mall {
-                match leaf.miniscript().build_template_mall(provider) {
-                    s @ Satisfaction { stack: Witness::Stack(_), .. } => s,
-                    _ => continue, // No witness for this script in tr descriptor, look for next one
-                }
+                leaf.miniscript().build_template_mall(provider)
             } else {
-                match leaf.miniscript().build_template(provider) {
-                    s @ Satisfaction { stack: Witness::Stack(_), .. } => s,
-                    _ => continue, // No witness for this script in tr descriptor, look for next one
-                }
+                leaf.miniscript().build_template(provider)
             };
-            let wit = match satisfaction {
-                Satisfaction { stack: Witness::Stack(ref mut wit), .. } => wit,
-                _ => unreachable!(),
+            let Witness::Stack(ref mut wit) = satisfaction.stack else {
+                continue;
             };
 
-            let script = ScriptBuf::from(leaf.script());
+            let script = leaf.script().clone();
             let control_block = leaf.control_block().clone();
 
             wit.push(Placeholder::TapScript(script));
@@ -518,7 +508,7 @@ mod tests {
     fn strip_ws(desc: &str) -> String { desc.replace(&[' ', '\n'][..], "") }
 
     fn descriptor() -> String {
-        let desc = "tr(acc0, {
+        let desc = "eltr(acc0, {
             {
               multi_a(3, acc10, acc11, acc12),
               and_v(
@@ -552,17 +542,17 @@ mod tests {
     #[test]
     fn display_roundtrips_unbalanced_taptree() {
         assert_display_roundtrip(&descriptor());
-        assert_display_roundtrip("tr(acc0,{pk(acc1),{pk(acc2),pk(acc3)}})");
-        assert_display_roundtrip("tr(acc0,{{pk(acc1),pk(acc2)},{pk(acc3),pk(acc4)}})");
+        assert_display_roundtrip("eltr(acc0,{pk(acc1),{pk(acc2),pk(acc3)}})");
+        assert_display_roundtrip("eltr(acc0,{{pk(acc1),pk(acc2)},{pk(acc3),pk(acc4)}})");
     }
 
     #[test]
     fn tr_rejects_raw_pkh_leaf() {
         let hash = "1111111111111111111111111111111111111111";
         for desc in [
-            format!("tr(acc0,c:expr_raw_pkh({hash}))"),
-            format!("tr(acc0,{{pk(acc1),c:expr_raw_pkh({hash})}})"),
-            format!("tr(acc0,{{pk(acc1),and_v(v:pk(acc2),c:expr_raw_pkh({hash}))}})"),
+            format!("eltr(acc0,c:expr_raw_pkh({hash}))"),
+            format!("eltr(acc0,{{pk(acc1),c:expr_raw_pkh({hash})}})"),
+            format!("eltr(acc0,{{pk(acc1),and_v(v:pk(acc2),c:expr_raw_pkh({hash}))}})"),
         ] {
             assert!(
                 matches!(
@@ -577,11 +567,11 @@ mod tests {
     #[test]
     fn tr_maximum_depth() {
         // Copied from integration tests
-        let descriptor128 = "tr(X!,{pk(X1!),{pk(X2!),{pk(X3!),{pk(X4!),{pk(X5!),{pk(X6!),{pk(X7!),{pk(X8!),{pk(X9!),{pk(X10!),{pk(X11!),{pk(X12!),{pk(X13!),{pk(X14!),{pk(X15!),{pk(X16!),{pk(X17!),{pk(X18!),{pk(X19!),{pk(X20!),{pk(X21!),{pk(X22!),{pk(X23!),{pk(X24!),{pk(X25!),{pk(X26!),{pk(X27!),{pk(X28!),{pk(X29!),{pk(X30!),{pk(X31!),{pk(X32!),{pk(X33!),{pk(X34!),{pk(X35!),{pk(X36!),{pk(X37!),{pk(X38!),{pk(X39!),{pk(X40!),{pk(X41!),{pk(X42!),{pk(X43!),{pk(X44!),{pk(X45!),{pk(X46!),{pk(X47!),{pk(X48!),{pk(X49!),{pk(X50!),{pk(X51!),{pk(X52!),{pk(X53!),{pk(X54!),{pk(X55!),{pk(X56!),{pk(X57!),{pk(X58!),{pk(X59!),{pk(X60!),{pk(X61!),{pk(X62!),{pk(X63!),{pk(X64!),{pk(X65!),{pk(X66!),{pk(X67!),{pk(X68!),{pk(X69!),{pk(X70!),{pk(X71!),{pk(X72!),{pk(X73!),{pk(X74!),{pk(X75!),{pk(X76!),{pk(X77!),{pk(X78!),{pk(X79!),{pk(X80!),{pk(X81!),{pk(X82!),{pk(X83!),{pk(X84!),{pk(X85!),{pk(X86!),{pk(X87!),{pk(X88!),{pk(X89!),{pk(X90!),{pk(X91!),{pk(X92!),{pk(X93!),{pk(X94!),{pk(X95!),{pk(X96!),{pk(X97!),{pk(X98!),{pk(X99!),{pk(X100!),{pk(X101!),{pk(X102!),{pk(X103!),{pk(X104!),{pk(X105!),{pk(X106!),{pk(X107!),{pk(X108!),{pk(X109!),{pk(X110!),{pk(X111!),{pk(X112!),{pk(X113!),{pk(X114!),{pk(X115!),{pk(X116!),{pk(X117!),{pk(X118!),{pk(X119!),{pk(X120!),{pk(X121!),{pk(X122!),{pk(X123!),{pk(X124!),{pk(X125!),{pk(X126!),{pk(X127!),{pk(X128!),pk(X129)}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}})";
+        let descriptor128 = "eltr(X!,{pk(X1!),{pk(X2!),{pk(X3!),{pk(X4!),{pk(X5!),{pk(X6!),{pk(X7!),{pk(X8!),{pk(X9!),{pk(X10!),{pk(X11!),{pk(X12!),{pk(X13!),{pk(X14!),{pk(X15!),{pk(X16!),{pk(X17!),{pk(X18!),{pk(X19!),{pk(X20!),{pk(X21!),{pk(X22!),{pk(X23!),{pk(X24!),{pk(X25!),{pk(X26!),{pk(X27!),{pk(X28!),{pk(X29!),{pk(X30!),{pk(X31!),{pk(X32!),{pk(X33!),{pk(X34!),{pk(X35!),{pk(X36!),{pk(X37!),{pk(X38!),{pk(X39!),{pk(X40!),{pk(X41!),{pk(X42!),{pk(X43!),{pk(X44!),{pk(X45!),{pk(X46!),{pk(X47!),{pk(X48!),{pk(X49!),{pk(X50!),{pk(X51!),{pk(X52!),{pk(X53!),{pk(X54!),{pk(X55!),{pk(X56!),{pk(X57!),{pk(X58!),{pk(X59!),{pk(X60!),{pk(X61!),{pk(X62!),{pk(X63!),{pk(X64!),{pk(X65!),{pk(X66!),{pk(X67!),{pk(X68!),{pk(X69!),{pk(X70!),{pk(X71!),{pk(X72!),{pk(X73!),{pk(X74!),{pk(X75!),{pk(X76!),{pk(X77!),{pk(X78!),{pk(X79!),{pk(X80!),{pk(X81!),{pk(X82!),{pk(X83!),{pk(X84!),{pk(X85!),{pk(X86!),{pk(X87!),{pk(X88!),{pk(X89!),{pk(X90!),{pk(X91!),{pk(X92!),{pk(X93!),{pk(X94!),{pk(X95!),{pk(X96!),{pk(X97!),{pk(X98!),{pk(X99!),{pk(X100!),{pk(X101!),{pk(X102!),{pk(X103!),{pk(X104!),{pk(X105!),{pk(X106!),{pk(X107!),{pk(X108!),{pk(X109!),{pk(X110!),{pk(X111!),{pk(X112!),{pk(X113!),{pk(X114!),{pk(X115!),{pk(X116!),{pk(X117!),{pk(X118!),{pk(X119!),{pk(X120!),{pk(X121!),{pk(X122!),{pk(X123!),{pk(X124!),{pk(X125!),{pk(X126!),{pk(X127!),{pk(X128!),pk(X129)}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}})";
         descriptor128.parse::<crate::Descriptor<String>>().unwrap();
 
         // Copied from integration tests
-        let descriptor129 = "tr(X!,{pk(X1!),{pk(X2!),{pk(X3!),{pk(X4!),{pk(X5!),{pk(X6!),{pk(X7!),{pk(X8!),{pk(X9!),{pk(X10!),{pk(X11!),{pk(X12!),{pk(X13!),{pk(X14!),{pk(X15!),{pk(X16!),{pk(X17!),{pk(X18!),{pk(X19!),{pk(X20!),{pk(X21!),{pk(X22!),{pk(X23!),{pk(X24!),{pk(X25!),{pk(X26!),{pk(X27!),{pk(X28!),{pk(X29!),{pk(X30!),{pk(X31!),{pk(X32!),{pk(X33!),{pk(X34!),{pk(X35!),{pk(X36!),{pk(X37!),{pk(X38!),{pk(X39!),{pk(X40!),{pk(X41!),{pk(X42!),{pk(X43!),{pk(X44!),{pk(X45!),{pk(X46!),{pk(X47!),{pk(X48!),{pk(X49!),{pk(X50!),{pk(X51!),{pk(X52!),{pk(X53!),{pk(X54!),{pk(X55!),{pk(X56!),{pk(X57!),{pk(X58!),{pk(X59!),{pk(X60!),{pk(X61!),{pk(X62!),{pk(X63!),{pk(X64!),{pk(X65!),{pk(X66!),{pk(X67!),{pk(X68!),{pk(X69!),{pk(X70!),{pk(X71!),{pk(X72!),{pk(X73!),{pk(X74!),{pk(X75!),{pk(X76!),{pk(X77!),{pk(X78!),{pk(X79!),{pk(X80!),{pk(X81!),{pk(X82!),{pk(X83!),{pk(X84!),{pk(X85!),{pk(X86!),{pk(X87!),{pk(X88!),{pk(X89!),{pk(X90!),{pk(X91!),{pk(X92!),{pk(X93!),{pk(X94!),{pk(X95!),{pk(X96!),{pk(X97!),{pk(X98!),{pk(X99!),{pk(X100!),{pk(X101!),{pk(X102!),{pk(X103!),{pk(X104!),{pk(X105!),{pk(X106!),{pk(X107!),{pk(X108!),{pk(X109!),{pk(X110!),{pk(X111!),{pk(X112!),{pk(X113!),{pk(X114!),{pk(X115!),{pk(X116!),{pk(X117!),{pk(X118!),{pk(X119!),{pk(X120!),{pk(X121!),{pk(X122!),{pk(X123!),{pk(X124!),{pk(X125!),{pk(X126!),{pk(X127!),{pk(X128!),{pk(X129),pk(X130)}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}})";
+        let descriptor129 = "eltr(X!,{pk(X1!),{pk(X2!),{pk(X3!),{pk(X4!),{pk(X5!),{pk(X6!),{pk(X7!),{pk(X8!),{pk(X9!),{pk(X10!),{pk(X11!),{pk(X12!),{pk(X13!),{pk(X14!),{pk(X15!),{pk(X16!),{pk(X17!),{pk(X18!),{pk(X19!),{pk(X20!),{pk(X21!),{pk(X22!),{pk(X23!),{pk(X24!),{pk(X25!),{pk(X26!),{pk(X27!),{pk(X28!),{pk(X29!),{pk(X30!),{pk(X31!),{pk(X32!),{pk(X33!),{pk(X34!),{pk(X35!),{pk(X36!),{pk(X37!),{pk(X38!),{pk(X39!),{pk(X40!),{pk(X41!),{pk(X42!),{pk(X43!),{pk(X44!),{pk(X45!),{pk(X46!),{pk(X47!),{pk(X48!),{pk(X49!),{pk(X50!),{pk(X51!),{pk(X52!),{pk(X53!),{pk(X54!),{pk(X55!),{pk(X56!),{pk(X57!),{pk(X58!),{pk(X59!),{pk(X60!),{pk(X61!),{pk(X62!),{pk(X63!),{pk(X64!),{pk(X65!),{pk(X66!),{pk(X67!),{pk(X68!),{pk(X69!),{pk(X70!),{pk(X71!),{pk(X72!),{pk(X73!),{pk(X74!),{pk(X75!),{pk(X76!),{pk(X77!),{pk(X78!),{pk(X79!),{pk(X80!),{pk(X81!),{pk(X82!),{pk(X83!),{pk(X84!),{pk(X85!),{pk(X86!),{pk(X87!),{pk(X88!),{pk(X89!),{pk(X90!),{pk(X91!),{pk(X92!),{pk(X93!),{pk(X94!),{pk(X95!),{pk(X96!),{pk(X97!),{pk(X98!),{pk(X99!),{pk(X100!),{pk(X101!),{pk(X102!),{pk(X103!),{pk(X104!),{pk(X105!),{pk(X106!),{pk(X107!),{pk(X108!),{pk(X109!),{pk(X110!),{pk(X111!),{pk(X112!),{pk(X113!),{pk(X114!),{pk(X115!),{pk(X116!),{pk(X117!),{pk(X118!),{pk(X119!),{pk(X120!),{pk(X121!),{pk(X122!),{pk(X123!),{pk(X124!),{pk(X125!),{pk(X126!),{pk(X127!),{pk(X128!),{pk(X129),pk(X130)}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}})";
         assert!(matches!(
             descriptor129
                 .parse::<crate::Descriptor::<String>>()

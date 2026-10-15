@@ -1,16 +1,21 @@
 use std::str::FromStr;
 
-use bitcoin::absolute::LockTime;
-use bitcoin::consensus::encode::serialize;
+use bitcoin::bip32::Xpriv;
 use bitcoin::hashes::Hash;
-use bitcoin::hex::{Case, DisplayHex};
-use bitcoin::transaction::Version;
-use bitcoin::{Address, Amount, Network, Psbt, PublicKey, Sequence, TxIn, TxOut};
+use bitcoin::key::Keypair;
+use bitcoin::PublicKey;
+use elements_miniscript::descriptor::DescriptorSecretKey;
+use elements_miniscript::elements::encode::serialize_hex;
+use elements_miniscript::elements::pset::{self, PartiallySignedTransaction as Psbt};
+use elements_miniscript::elements::sighash::SighashCache;
+use elements_miniscript::elements::{
+    confidential, hashes, Address, AddressParams, AssetId, BlockHash, LockTime, OutPoint,
+    SchnorrSig, SchnorrSighashType, Script, Sequence,
+};
+use elements_miniscript::policy::Concrete;
+use elements_miniscript::psbt::PsbtExt;
+use elements_miniscript::{Descriptor, DescriptorPublicKey};
 use helper_fns::{produce_grim_hash, produce_kelly_hash, produce_key_pairs};
-use miniscript::descriptor::DescriptorSecretKey;
-use miniscript::policy::Concrete;
-use miniscript::psbt::PsbtExt;
-use miniscript::{Descriptor, DescriptorPublicKey};
 mod helper_fns;
 
 pub const KEYS_PER_PERSONA: usize = 9;
@@ -59,12 +64,12 @@ fn main() {
 
     // ====== 2. Derive Keys, Preimages, Hashes, and Timelocks for Policy and Signing ======
 
-    let internal_xpub: miniscript::DescriptorPublicKey =
+    let internal_xpub: elements_miniscript::DescriptorPublicKey =
         internal_desc_secret.to_public(secp).unwrap();
 
     // example of how defining the internal xpriv that can be used for signing.
     // let internal_xpriv: DescriptorXKey<bitcoin::bip32::Xpriv> = match internal_desc_secret {
-    //     miniscript::descriptor::DescriptorSecretKey::XPrv(x) => Some(x.clone()),
+    //     elements_miniscript::descriptor::DescriptorSecretKey::XPrv(x) => Some(x.clone()),
     //     _ => None,
     // }
     // .unwrap();
@@ -187,7 +192,9 @@ fn main() {
 
     // Now, using this public descriptor create the script address
     let derived_descriptor = policy_desc.derive_at_index(0).unwrap();
-    let _script_address = derived_descriptor.address(Network::Regtest).unwrap();
+    let _script_address = derived_descriptor
+        .address(&AddressParams::ELEMENTS)
+        .unwrap();
     println!("the receiving address of this script is: {}", _script_address);
     println!("\ndescriptor is: {}\n", policy_desc);
 
@@ -200,84 +207,110 @@ fn main() {
         _ => panic!("internal spending path is not correct"),
     }
 
-    // ====== 4. Construct an Unsigned Transaction from the Tapscript ======
+    // ====== 4. Construct an Unsigned PSET from the Tapscript ======
 
     let secp: &secp256k1::Secp256k1<secp256k1::All> = &secp256k1::Secp256k1::new();
 
-    let tx_in = TxIn {
-        previous_output: bitcoin::OutPoint {
-            txid: "8888888899999999aaaaaaaabbbbbbbbccccccccddddddddeeeeeeeeffffffff"
-                .parse()
-                .unwrap(),
-            vout: 0,
-        },
-        sequence: Sequence(0),
-        //        sequence: Sequence(40),
-        ..Default::default()
-    };
+    // Elements Taproot sighashes commit to the genesis block hash of the chain the
+    // transaction is for; this example only needs a fixed value.
+    let genesis_hash = BlockHash::from_byte_array([0x42; 32]);
+    let asset = AssetId::LIQUID_BTC;
 
-    let prev_amount = Amount::from_sat(100_000_000);
-    let witness_utxo =
-        TxOut { value: prev_amount, script_pubkey: derived_descriptor.clone().script_pubkey() };
+    let mut psbt = Psbt::new_v2();
+    psbt.global.tx_data.fallback_locktime = Some(LockTime::from_time(oct_23_morning).unwrap());
+
+    let mut input = pset::Input::from_prevout(OutPoint::new(
+        "8888888899999999aaaaaaaabbbbbbbbccccccccddddddddeeeeeeeeffffffff"
+            .parse()
+            .unwrap(),
+        0,
+    ));
+    input.sequence = Some(Sequence::ZERO);
+    //        input.sequence = Some(Sequence(40));
+    input.witness_utxo = Some(elements_miniscript::elements::TxOut {
+        asset: confidential::Asset::Explicit(asset),
+        value: confidential::Value::Explicit(100_000_000),
+        script_pubkey: derived_descriptor.script_pubkey(),
+        ..Default::default()
+    });
+    psbt.add_input(input);
 
     let destination_address =
-        Address::from_str("bcrt1p2tl8zasepqe3j6m7hx4tdmqzndddr5wa9ugglpdzgenjwv42rkws66dk5a")
+        Address::from_str("ert1qpq2cfgz5lktxzr5zqv7nrzz46hsvq3492ump9pz8rzcl8wqtwqcs2yqnuv")
             .unwrap();
-    let destination_output: TxOut = TxOut {
-        value: bitcoin::Amount::from_sat(99_999_000),
-        script_pubkey: destination_address.assume_checked().script_pubkey(),
-    };
+    psbt.add_output(pset::Output::new_explicit(
+        destination_address.script_pubkey(),
+        99_999_000,
+        asset,
+        None,
+    ));
+    // Elements transactions pay their fee in an explicit output with an empty script pubkey.
+    psbt.add_output(pset::Output::new_explicit(Script::new(), 1_000, asset, None));
 
-    let time = oct_23_morning;
-
-    let unsigned_tx = bitcoin::Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::from_time(time).unwrap(),
-        input: vec![tx_in],
-        output: vec![destination_output],
-    };
-
-    let unsigned_tx_test_string = serialize(&unsigned_tx).to_hex_string(Case::Lower);
-    assert!(unsigned_tx_test_string == "0200000001ffffffffeeeeeeeeddddddddccccccccbbbbbbbbaaaaaaaa99999999888888880000000000000000000118ddf5050000000022512052fe7176190833196b7eb9aab6ec029b5ad1d1dd2f108f85a246672732aa1d9d60011967");
-
-    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
-    psbt.inputs[0].witness_utxo = Some(witness_utxo);
-
-    // Tell Psbt about the descriptor so it can sign with it
+    // Tell the PSET about the descriptor so it can sign with it
     psbt.update_input_with_descriptor(0, &derived_descriptor)
         .unwrap();
 
     // ====== 5. Sign and Create a Spending Transaction ======
 
-    // this is how you would sign for an internal key spend
-    //let _res = psbt.sign(&intneral_xpriv.xkey, secp).unwrap();
+    // Sign every leaf that each of the index 0 keys appears in.
+    let unsigned_tx = psbt.extract_tx().unwrap();
+    let mut sighash_cache = SighashCache::new(&unsigned_tx);
+    for xpriv in [
+        &a_prvs[0], &b_prvs[0], &c_prvs[0], &d_prvs[0], &e_prvs[0], &f_prvs[0], &h_prvs[0],
+        &i_prvs[0], &j_prvs[0], &l_prvs[0],
+    ] {
+        sign_tap_leaves(&mut psbt, &mut sighash_cache, xpriv, genesis_hash, secp);
+    }
 
-    // how you would sign using the leaf that uses index 0 keys
-    let _res = psbt.sign(&a_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&b_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&c_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&d_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&e_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&f_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&h_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&i_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&j_prvs[0], secp).unwrap();
-    let _res = psbt.sign(&l_prvs[0], secp).unwrap();
+    psbt.inputs_mut()[0].sha256_preimages.insert(
+        hashes::sha256::Hash::from_byte_array(kelly.1.to_byte_array()),
+        kelly.0.to_byte_array().to_vec(),
+    );
 
-    psbt.inputs[0]
-        .sha256_preimages
-        .insert(kelly.1, kelly.0.to_byte_array().to_vec());
+    psbt.inputs_mut()[0].ripemd160_preimages.insert(
+        hashes::ripemd160::Hash::from_byte_array(grim.1.to_byte_array()),
+        grim.0.to_byte_array().to_vec(),
+    );
 
-    psbt.inputs[0]
-        .ripemd160_preimages
-        .insert(grim.1, grim.0.to_byte_array().to_vec());
+    // Finalize the PSET now that we have all the required signatures and hash preimages.
+    psbt.finalize_mut(secp, genesis_hash).unwrap();
 
-    // Finalize PSBT now that we have all the required signatures and hash preimages.
-    psbt.finalize_mut(secp).unwrap();
+    // Now extract the tx, checking it with the interpreter once more.
+    let signed_tx = psbt.extract(secp, genesis_hash).unwrap();
+    println!("signed transaction: {}", serialize_hex(&signed_tx));
 
-    // Now extract the tx
-    let signed_tx = psbt.extract_tx().unwrap();
-    let raw_tx = bitcoin::consensus::encode::serialize(&signed_tx).to_hex_string(Case::Lower);
+    // A script-path spend: the satisfaction, then the leaf script and the control block.
+    let witness = signed_tx.input[0].witness.script_witness.to_vec();
+    assert!(witness.len() > 2);
+    assert_eq!(signed_tx.output, unsigned_tx.output);
+}
 
-    assert!(raw_tx == "02000000000101ffffffffeeeeeeeeddddddddccccccccbbbbbbbbaaaaaaaa99999999888888880000000000000000000118ddf5050000000022512052fe7176190833196b7eb9aab6ec029b5ad1d1dd2f108f85a246672732aa1d9d0e209250ecce1169d94cf17baaecddcef779ff1b0d07d347d24afcd5b2231f95a500209562ef4e826d891eaa72f2cee753b80a3f7f6b5aed07b850227e83546fa6185740a5da084901627205e860d6530ff5ff580fc3841b779ad8535ffd7b466664aa0280c218aa05a1054c73b1f717b6c5badf70e71e5091b4b34e25ec3584243fd0604032a0bad48af9b3263d331ba2c789a931af81755c67dfefab28f8e40658545e6659eeb93d2c501ac79914ca82f4dbdcd669d34c7de73b4c243400926cffeb42b640015f5b58eb820676382521bb38b9d0c16d40c6a1b710242232d3d8276145aee859667d3caf9b72acecbfa3be33ce7afb9bda70b19451c58550bb1076125463c240ba0ba063d92ef71a35a1bdbd41b165d71825d6b5d9555781a3a6c35aba5864c82c4e53a7656458dc8bd586a6de749b6ab59cbb5ec4e2264a185ef7b79db3ea9c408176c65f6486f5c9a7d466fe86dfed7d55f8fc480b5843414696842f1efc689e74fce36a0b318535ef86864d8f83ac4bb60085c2b45c0547b9657def51b52b8e40b5f95b03c77b685314848a292d05bf350cdad506bcb2601b634779e956235aef3bade98a812f046d47060fbf9965ac0ef016e6ef09540c1c7d5b2fe447192cbd405ea9e1a58685ef958db8aa529d3fbfcc1182e252a35715bf9b2c35a30c73e718a65e8a8c0141eaac72af71a1dd7f19c53aaead75ae5b963a4eee5d1228c389844094a38c8574e6089c33d2c37d6f889adb671ef09a188e91cf032e97a3e25e9636901096e1cc92d17fbf4c581e5a1915de53f807f3198f4a2b829fc3a4479f6bb54017e68b70fd9e5c94c6f99abf284f5da42365a2e5fd4f0971bf5cb68aea3408c0d05ace043c15e70958c73f7455db3a22e3e5fb0240749a9dc52aa66a554fb06b40c478230871c12b60bc7cae151e411aa779780a8e6a7afd57aa763185809259fc7853f65e712d1ef178d4750f66e1b6db3cae7efcec5308b815b39fe8498f404afd9c0120fe88003d0bcb15d1628edff84046255758baf205d42ce460b6fb4595b983f2ecad20eecd6dba68fd0ec5d4baa0052db8084cb15a55503b78cfee5ef31c35cd98d846ad20529c1e24d86bf35b35133a81bf1e8c21759f3a83cfb38f18eae1d5b8292ff4bead2083835dbe036944f18783e0a525babe23965a2b4fdeca2d2d84997fc6ff0fb06aad204aeb360d05ad743b838ad27c56b78f08668aeba77f2f1fc439ac80f970e57328ad2062c4d094ce7a28414102bacccb06947053e07e4da53ad96e5724565f09436dfcad20f6e5c74176d69d44a97220a694237d8e719fae4a029942aadb28a9b491b40e31ad20dc7ea580c6887971614260d91069c4d398cc80ecc6cbb4ab59099e110ad3bb8bad2059fa3dfd7286d59f9b3853fb0cdd13c4760508f672435be40057b9e02eb937bdad20aa90f13a1c98abc5620d3f379d20b8c28ddf8f46772a0d0af6b7deb7bf3a1ee1ad82012088a8202db9cdb5e102541f19b455fa798e0cb009f5faa6358b9d3507858caf797bca418882012088a6148d60757ec290d055be92da400cff617b0423cb14880460011967b141c1259b7a61aa66c551a6cd35ccc35e9e011ecbbddbbb673acba71e2e4cc11e8883326f8afc8b0ef3f1cc0428893a40e48b9419807a4fd8f8673b62840ef216d5f660011967");
+// Signs, for the PSET's only input, every Taproot leaf that the key of `xpriv` appears in.
+fn sign_tap_leaves(
+    psbt: &mut Psbt,
+    sighash_cache: &mut SighashCache<&elements_miniscript::elements::Transaction>,
+    xpriv: &Xpriv,
+    genesis_hash: BlockHash,
+    secp: &secp256k1::Secp256k1<secp256k1::All>,
+) {
+    let keypair = Keypair::from_secret_key(secp, &xpriv.private_key);
+    let (x_only_pk, _parity) = keypair.x_only_public_key();
+    let leaf_hashes = match psbt.inputs()[0].tap_key_origins.get(&x_only_pk) {
+        Some((leaf_hashes, _origin)) => leaf_hashes.clone(),
+        None => return,
+    };
+    for leaf_hash in leaf_hashes {
+        let msg = psbt
+            .sighash_msg(0, sighash_cache, Some(leaf_hash), genesis_hash)
+            .unwrap()
+            .to_secp_msg();
+        let sig = SchnorrSig {
+            sig: secp.sign_schnorr_with_aux_rand(&msg, &keypair, &[0; 32]),
+            hash_ty: SchnorrSighashType::Default,
+        };
+        psbt.inputs_mut()[0]
+            .tap_script_sigs
+            .insert((x_only_pk, leaf_hash), sig);
+    }
 }

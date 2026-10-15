@@ -16,9 +16,8 @@ use core::ops::Range;
 use core::str::{self, FromStr};
 
 use bitcoin::hashes::{hash160, ripemd160, sha256};
-use bitcoin::{
-    secp256k1, Address, Network, Script, ScriptBuf, TxIn, Weight, Witness, WitnessVersion,
-};
+use bitcoin::{secp256k1, Weight, WitnessVersion};
+use elements::{secp256k1_zkp, Script, TxIn};
 use sync::Arc;
 
 use crate::expression::FromTree as _;
@@ -402,25 +401,49 @@ impl<Pk: MiniscriptKey> Descriptor<Pk> {
 }
 
 impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
-    /// Computes the Bitcoin address of the descriptor, if one exists
+    /// Computes the unblinded Elements address of the descriptor, if one exists
     ///
-    /// Some descriptors like pk() don't have an address.
+    /// Some descriptors like elpk() don't have an address. For blinded addresses
+    /// see [`Descriptor::blinded_address`].
     ///
     /// # Errors
     /// For raw/bare descriptors that don't have an address.
-    pub fn address(&self, network: Network) -> Result<Address, Error> {
+    pub fn address(
+        &self,
+        params: &'static elements::AddressParams,
+    ) -> Result<elements::Address, Error> {
+        self.address_with_blinder(None, params)
+    }
+
+    /// Computes the Elements address of the descriptor blinded with `blinder`, if one exists
+    ///
+    /// # Errors
+    /// For raw/bare descriptors that don't have an address.
+    pub fn blinded_address(
+        &self,
+        blinder: secp256k1_zkp::PublicKey,
+        params: &'static elements::AddressParams,
+    ) -> Result<elements::Address, Error> {
+        self.address_with_blinder(Some(blinder), params)
+    }
+
+    fn address_with_blinder(
+        &self,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static elements::AddressParams,
+    ) -> Result<elements::Address, Error> {
         match *self {
             Self::Bare(_) => Err(Error::BareDescriptorAddr),
-            Self::Pkh(ref pkh) => Ok(pkh.address(network)),
-            Self::Wpkh(ref wpkh) => Ok(wpkh.address(network)),
-            Self::Wsh(ref wsh) => Ok(wsh.address(network)),
-            Self::Sh(ref sh) => Ok(sh.address(network)),
-            Self::Tr(ref tr) => Ok(tr.address(network)),
+            Self::Pkh(ref pkh) => Ok(pkh.address(blinder, params)),
+            Self::Wpkh(ref wpkh) => Ok(wpkh.address(blinder, params)),
+            Self::Wsh(ref wsh) => Ok(wsh.address(blinder, params)),
+            Self::Sh(ref sh) => Ok(sh.address(blinder, params)),
+            Self::Tr(ref tr) => Ok(tr.address(blinder, params)),
         }
     }
 
     /// Computes the scriptpubkey of the descriptor.
-    pub fn script_pubkey(&self) -> ScriptBuf {
+    pub fn script_pubkey(&self) -> Script {
         match *self {
             Self::Bare(ref bare) => bare.script_pubkey(),
             Self::Pkh(ref pkh) => pkh.script_pubkey(),
@@ -438,14 +461,14 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     /// This is used in Segwit transactions to produce an unsigned transaction
     /// whose txid will not change during signing (since only the witness data
     /// will change).
-    pub fn unsigned_script_sig(&self) -> ScriptBuf {
+    pub fn unsigned_script_sig(&self) -> Script {
         match *self {
-            Self::Bare(_) => ScriptBuf::new(),
-            Self::Pkh(_) => ScriptBuf::new(),
-            Self::Wpkh(_) => ScriptBuf::new(),
-            Self::Wsh(_) => ScriptBuf::new(),
+            Self::Bare(_) => Script::new(),
+            Self::Pkh(_) => Script::new(),
+            Self::Wpkh(_) => Script::new(),
+            Self::Wsh(_) => Script::new(),
             Self::Sh(ref sh) => sh.unsigned_script_sig(),
-            Self::Tr(_) => ScriptBuf::new(),
+            Self::Tr(_) => Script::new(),
         }
     }
 
@@ -455,7 +478,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     ///
     /// # Errors
     /// If the descriptor is a taproot descriptor.
-    pub fn explicit_script(&self) -> Result<ScriptBuf, Error> {
+    pub fn explicit_script(&self) -> Result<Script, Error> {
         match *self {
             Self::Bare(ref bare) => Ok(bare.script_pubkey()),
             Self::Pkh(ref pkh) => Ok(pkh.script_pubkey()),
@@ -473,7 +496,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     ///
     /// # Errors
     /// If the descriptor is a taproot descriptor.
-    pub fn script_code(&self) -> Result<ScriptBuf, Error> {
+    pub fn script_code(&self) -> Result<Script, Error> {
         match *self {
             Self::Bare(ref bare) => Ok(bare.ecdsa_sighash_script_code()),
             Self::Pkh(ref pkh) => Ok(pkh.ecdsa_sighash_script_code()),
@@ -487,7 +510,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     /// Returns satisfying non-malleable witness and scriptSig to spend an
     /// output controlled by the given descriptor if it possible to
     /// construct one using the satisfier S.
-    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -504,7 +527,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
     /// Returns a possilbly mallable satisfying non-malleable witness and scriptSig to spend an
     /// output controlled by the given descriptor if it possible to
     /// construct one using the satisfier S.
-    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -526,7 +549,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
         S: Satisfier<Pk>,
     {
         let (witness, script_sig) = self.get_satisfaction(satisfier)?;
-        txin.witness = Witness::from_slice(&witness);
+        txin.witness.script_witness = elements::Witness::from_slice(&witness);
         txin.script_sig = script_sig;
         Ok(())
     }
@@ -685,11 +708,11 @@ impl Descriptor<DescriptorPublicKey> {
     ///
     /// You can also use the [`TryFrom`] conversion:
     /// ```
-    /// # use miniscript::{Descriptor, DescriptorPublicKey};
-    /// # use miniscript::descriptor::DefiniteDescriptorKey;
+    /// # use elements_miniscript::{Descriptor, DescriptorPublicKey};
+    /// # use elements_miniscript::descriptor::DefiniteDescriptorKey;
     /// # use core::str::FromStr;
     /// let desc = Descriptor::<DescriptorPublicKey>::from_str(
-    ///     "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
+    ///     "elwpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
     /// ).unwrap();
     /// let definite: Descriptor<DefiniteDescriptorKey> = desc.try_into().unwrap();
     /// ```
@@ -778,9 +801,9 @@ impl Descriptor<DescriptorPublicKey> {
     /// This is a shorthand for:
     ///
     /// ```
-    /// # use miniscript::{Descriptor, DescriptorPublicKey, bitcoin::secp256k1::Secp256k1};
+    /// # use elements_miniscript::{Descriptor, DescriptorPublicKey, bitcoin::secp256k1::Secp256k1};
     /// # use core::str::FromStr;
-    /// # let descriptor = Descriptor::<DescriptorPublicKey>::from_str("tr(xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)")
+    /// # let descriptor = Descriptor::<DescriptorPublicKey>::from_str("eltr(xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)")
     ///     .expect("Valid ranged descriptor");
     /// # let index = 42;
     /// # let secp = Secp256k1::verification_only();
@@ -1077,21 +1100,17 @@ impl Descriptor<DefiniteDescriptorKey> {
     /// # Examples
     ///
     /// ```
-    /// use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
-    /// use miniscript::bitcoin::secp256k1;
+    /// use elements_miniscript::descriptor::{Descriptor, DescriptorPublicKey};
+    /// use elements_miniscript::bitcoin::secp256k1;
     /// use std::str::FromStr;
     ///
     /// // test from bip 86
     /// let secp = secp256k1::Secp256k1::verification_only();
-    /// let descriptor = Descriptor::<DescriptorPublicKey>::from_str("tr(xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)")
+    /// let descriptor = Descriptor::<DescriptorPublicKey>::from_str("eltr(xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)")
     ///     .expect("Valid ranged descriptor");
     /// let result = descriptor.derive_at_index(0).unwrap().derived_descriptor(&secp);
-    /// assert_eq!(result.to_string(), "tr(03cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115)#6qm9h8ym");
+    /// assert_eq!(result.to_string(), "eltr(03cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115)#hr5pt2wj");
     /// ```
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if hardened derivation is attempted.
     pub fn derived_descriptor<C: secp256k1::Verification>(
         &self,
         secp: &secp256k1::Secp256k1<C>,
@@ -1150,11 +1169,11 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Descriptor<Pk> {
     /// Parse an expression tree into a descriptor.
     fn from_tree(top: expression::TreeIterItem) -> Result<Self, Error> {
         Ok(match (top.name(), top.n_children()) {
-            ("pkh", 1) => Self::Pkh(Pkh::from_tree(top)?),
-            ("wpkh", 1) => Self::Wpkh(Wpkh::from_tree(top)?),
-            ("sh", 1) => Self::Sh(Sh::from_tree(top)?),
-            ("wsh", 1) => Self::Wsh(Wsh::from_tree(top)?),
-            ("tr", _) => Self::Tr(Tr::from_tree(top)?),
+            ("elpkh", 1) => Self::Pkh(Pkh::from_tree(top)?),
+            ("elwpkh", 1) => Self::Wpkh(Wpkh::from_tree(top)?),
+            ("elsh", 1) => Self::Sh(Sh::from_tree(top)?),
+            ("elwsh", 1) => Self::Wsh(Wsh::from_tree(top)?),
+            ("eltr", _) => Self::Tr(Tr::from_tree(top)?),
             _ => Self::Bare(Bare::from_tree(top)?),
         })
     }
@@ -1221,33 +1240,49 @@ pub(crate) use write_descriptor;
 
 #[cfg(test)]
 mod tests {
-    use core::convert::TryFrom;
-
-    use bitcoin::blockdata::opcodes::all::{OP_CLTV, OP_CSV};
-    use bitcoin::blockdata::script::Instruction;
-    use bitcoin::blockdata::{opcodes, script};
     use bitcoin::hashes::Hash;
-    use bitcoin::script::PushBytes;
-    use bitcoin::sighash::EcdsaSighashType;
-    use bitcoin::{bip32, PublicKey, Sequence, XOnlyPublicKey};
+    use bitcoin::{bip32, PublicKey, XOnlyPublicKey};
+    use elements::opcodes::all::{OP_CLTV, OP_CSV};
+    use elements::script::Instruction;
+    use elements::{opcodes, script, Sequence};
 
     use super::{checksum, *};
-    use crate::hex_script;
     use crate::miniscript::context::ScriptContextError;
     #[cfg(feature = "compiler")]
     use crate::policy;
+    use crate::{hex_script, ElementsSig};
 
     type StdDescriptor = Descriptor<PublicKey>;
-    const TEST_PK: &str = "pk(020000000000000000000000000000000000000000000000000000000000000002)";
+    const TEST_PK: &str =
+        "elpk(020000000000000000000000000000000000000000000000000000000000000002)";
+
+    fn with_checksum(desc: &str) -> String {
+        let mut checksum_eng = checksum::Engine::new();
+        checksum_eng.input(desc).unwrap();
+        format!("{}#{}", desc, checksum_eng.checksum())
+    }
 
     fn roundtrip_descriptor(s: &str) {
         let desc = Descriptor::<String>::from_str(s).unwrap();
         let output = desc.to_string();
         let normalize_aliases = s.replace("c:pk_k(", "pk(").replace("c:pk_h(", "pkh(");
 
-        let mut checksum_eng = checksum::Engine::new();
-        checksum_eng.input(&normalize_aliases).unwrap();
-        assert_eq!(format!("{}#{}", normalize_aliases, checksum_eng.checksum()), output);
+        assert_eq!(with_checksum(&normalize_aliases), output);
+    }
+
+    // Builds an Elements input with the given scriptSig and witness.
+    fn elements_txin(script_sig: Script, witness: Vec<Vec<u8>>) -> TxIn {
+        TxIn {
+            previous_output: elements::OutPoint::default(),
+            script_sig,
+            sequence: Sequence::from_height(100),
+            is_pegin: false,
+            asset_issuance: elements::AssetIssuance::default(),
+            witness: elements::TxInWitness {
+                script_witness: elements::Witness::from_slice(&witness),
+                ..Default::default()
+            },
+        }
     }
 
     #[test]
@@ -1256,63 +1291,69 @@ mod tests {
         // in terms of the in-memory representation -- OrI(False, False).
         // Test that the way we display the ambiguous fragment doesn't
         // change, in case somebody somehow is depending on it.
-        let desc = StdDescriptor::from_str("sh(u:0)").unwrap();
-        assert_eq!("sh(u:0)#ncq3yf9h", desc.to_string());
+        let desc = StdDescriptor::from_str("elsh(u:0)").unwrap();
+        assert_eq!(with_checksum("elsh(u:0)"), desc.to_string());
 
         // This is a regression test for https://github.com/rust-bitcoin/rust-miniscript/pull/735
         // which was found at the same time. It's just a bug plain and simple.
-        let desc = StdDescriptor::from_str("sh(and_n(u:0,1))").unwrap();
-        assert_eq!("sh(and_n(u:0,1))#5j5tw8nm", desc.to_string());
+        let desc = StdDescriptor::from_str("elsh(and_n(u:0,1))").unwrap();
+        assert_eq!(with_checksum("elsh(and_n(u:0,1))"), desc.to_string());
     }
 
     #[test]
     fn desc_rtt_tests() {
-        roundtrip_descriptor("c:pk_k()");
-        roundtrip_descriptor("wsh(pk())");
-        roundtrip_descriptor("wsh(c:pk_k())");
-        roundtrip_descriptor("c:pk_h()");
+        roundtrip_descriptor("elc:pk_k()");
+        roundtrip_descriptor("elwsh(pk())");
+        roundtrip_descriptor("elwsh(c:pk_k())");
+        roundtrip_descriptor("elc:pk_h()");
     }
     #[test]
     fn parse_descriptor() {
         StdDescriptor::from_str("(").unwrap_err();
         StdDescriptor::from_str("(x()").unwrap_err();
         StdDescriptor::from_str("(\u{7f}()3").unwrap_err();
-        StdDescriptor::from_str("pk()").unwrap_err();
-        StdDescriptor::from_str("nl:0").unwrap_err(); //issue 63
+        StdDescriptor::from_str("elpk()").unwrap_err();
+        StdDescriptor::from_str("elnl:0").unwrap_err(); //issue 63
         assert_eq!(
-            StdDescriptor::from_str("sh(sortedmulti)")
+            StdDescriptor::from_str("elsh(sortedmulti)")
                 .unwrap_err()
                 .to_string(),
             "expected threshold, found terminal"
         ); //issue 202
         assert_eq!(
-            StdDescriptor::from_str(&format!("sh(sortedmulti(2,{}))", &TEST_PK[3..69]))
+            StdDescriptor::from_str(&format!("elsh(sortedmulti(2,{}))", &TEST_PK[5..71]))
                 .unwrap_err()
                 .to_string(),
             "invalid threshold 2-of-1; cannot have k > n",
         ); //issue 202
 
         StdDescriptor::from_str(TEST_PK).unwrap();
+        // Bitcoin descriptors are not Elements descriptors
+        StdDescriptor::from_str(&TEST_PK[2..]).unwrap_err();
 
         let uncompressed_pk =
         "0414fc03b8df87cd7b872996810db8458d61da8448e531569c8517b469a119d267be5645686309c6e6736dbd93940707cc9143d3cf29f1b877ff340e2cb2d259cf";
 
         // Context tests
-        StdDescriptor::from_str(&format!("pk({})", uncompressed_pk)).unwrap();
-        StdDescriptor::from_str(&format!("pkh({})", uncompressed_pk)).unwrap();
-        StdDescriptor::from_str(&format!("sh(pk({}))", uncompressed_pk)).unwrap();
-        StdDescriptor::from_str(&format!("wpkh({})", uncompressed_pk)).unwrap_err();
-        StdDescriptor::from_str(&format!("sh(wpkh({}))", uncompressed_pk)).unwrap_err();
-        StdDescriptor::from_str(&format!("wsh(pk{})", uncompressed_pk)).unwrap_err();
-        StdDescriptor::from_str(&format!("sh(wsh(pk{}))", uncompressed_pk)).unwrap_err();
-        StdDescriptor::from_str(&format!("or_i(pk({}),pk({}))", uncompressed_pk, uncompressed_pk))
-            .unwrap_err();
+        StdDescriptor::from_str(&format!("elpk({})", uncompressed_pk)).unwrap();
+        StdDescriptor::from_str(&format!("elpkh({})", uncompressed_pk)).unwrap();
+        StdDescriptor::from_str(&format!("elsh(pk({}))", uncompressed_pk)).unwrap();
+        StdDescriptor::from_str(&format!("elwpkh({})", uncompressed_pk)).unwrap_err();
+        StdDescriptor::from_str(&format!("elsh(wpkh({}))", uncompressed_pk)).unwrap_err();
+        StdDescriptor::from_str(&format!("elwsh(pk{})", uncompressed_pk)).unwrap_err();
+        StdDescriptor::from_str(&format!("elsh(wsh(pk{}))", uncompressed_pk)).unwrap_err();
+        StdDescriptor::from_str(&format!(
+            "elor_i(pk({}),pk({}))",
+            uncompressed_pk, uncompressed_pk
+        ))
+        .unwrap_err();
     }
 
     #[test]
     pub fn script_pubkey() {
+        let params = &elements::AddressParams::ELEMENTS;
         let bare = StdDescriptor::from_str(
-            "multi(1,020000000000000000000000000000000000000000000000000000000000000002)",
+            "elmulti(1,020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         assert_eq!(
@@ -1322,14 +1363,14 @@ mod tests {
             )
         );
         assert_eq!(
-            bare.address(Network::Bitcoin).unwrap_err().to_string(),
+            bare.address(params).unwrap_err().to_string(),
             "Bare descriptors don't have address"
         );
 
         let pk = StdDescriptor::from_str(TEST_PK).unwrap();
         assert_eq!(
             pk.script_pubkey(),
-            ScriptBuf::from(vec![
+            Script::from(vec![
                 0x21, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xac,
@@ -1337,7 +1378,7 @@ mod tests {
         );
 
         let pkh = StdDescriptor::from_str(
-            "pkh(\
+            "elpkh(\
              020000000000000000000000000000000000000000000000000000000000000002\
              )",
         )
@@ -1348,7 +1389,7 @@ mod tests {
                 .push_opcode(opcodes::all::OP_DUP)
                 .push_opcode(opcodes::all::OP_HASH160)
                 .push_slice(
-                    hash160::Hash::from_str("84e9ed95a38613f0527ff685a9928abe2d4754d4",)
+                    &hash160::Hash::from_str("84e9ed95a38613f0527ff685a9928abe2d4754d4",)
                         .unwrap()
                         .to_byte_array()
                 )
@@ -1356,13 +1397,10 @@ mod tests {
                 .push_opcode(opcodes::all::OP_CHECKSIG)
                 .into_script()
         );
-        assert_eq!(
-            pkh.address(Network::Bitcoin,).unwrap().to_string(),
-            "1D7nRvrRgzCg9kYBwhPH3j3Gs6SmsRg3Wq"
-        );
+        assert_eq!(pkh.address(params).unwrap().to_string(), "2dmYXpSu8YP6aLcJYhHfB1C19mdzSx2GPB9");
 
         let wpkh = StdDescriptor::from_str(
-            "wpkh(\
+            "elwpkh(\
              020000000000000000000000000000000000000000000000000000000000000002\
              )",
         )
@@ -1372,19 +1410,19 @@ mod tests {
             script::Builder::new()
                 .push_opcode(opcodes::all::OP_PUSHBYTES_0)
                 .push_slice(
-                    hash160::Hash::from_str("84e9ed95a38613f0527ff685a9928abe2d4754d4",)
+                    &hash160::Hash::from_str("84e9ed95a38613f0527ff685a9928abe2d4754d4",)
                         .unwrap()
                         .to_byte_array()
                 )
                 .into_script()
         );
         assert_eq!(
-            wpkh.address(Network::Bitcoin,).unwrap().to_string(),
-            "bc1qsn57m9drscflq5nl76z6ny52hck5w4x5wqd9yt"
+            wpkh.address(params).unwrap().to_string(),
+            "ert1qsn57m9drscflq5nl76z6ny52hck5w4x57m69k3"
         );
 
         let shwpkh = StdDescriptor::from_str(
-            "sh(wpkh(\
+            "elsh(wpkh(\
              020000000000000000000000000000000000000000000000000000000000000002\
              ))",
         )
@@ -1394,7 +1432,7 @@ mod tests {
             script::Builder::new()
                 .push_opcode(opcodes::all::OP_HASH160)
                 .push_slice(
-                    hash160::Hash::from_str("f1c3b9a431134cb90a500ec06e0067cfa9b8bba7",)
+                    &hash160::Hash::from_str("f1c3b9a431134cb90a500ec06e0067cfa9b8bba7",)
                         .unwrap()
                         .to_byte_array()
                 )
@@ -1402,12 +1440,12 @@ mod tests {
                 .into_script()
         );
         assert_eq!(
-            shwpkh.address(Network::Bitcoin,).unwrap().to_string(),
-            "3PjMEzoveVbvajcnDDuxcJhsuqPHgydQXq"
+            shwpkh.address(params).unwrap().to_string(),
+            "XZPaAbg6M83Fq5NqvbEGZ5kwy9RKSTke2s"
         );
 
         let sh = StdDescriptor::from_str(
-            "sh(c:pk_k(\
+            "elsh(c:pk_k(\
              020000000000000000000000000000000000000000000000000000000000000002\
              ))",
         )
@@ -1417,20 +1455,17 @@ mod tests {
             script::Builder::new()
                 .push_opcode(opcodes::all::OP_HASH160)
                 .push_slice(
-                    hash160::Hash::from_str("aa5282151694d3f2f32ace7d00ad38f927a33ac8",)
+                    &hash160::Hash::from_str("aa5282151694d3f2f32ace7d00ad38f927a33ac8",)
                         .unwrap()
                         .to_byte_array()
                 )
                 .push_opcode(opcodes::all::OP_EQUAL)
                 .into_script()
         );
-        assert_eq!(
-            sh.address(Network::Bitcoin,).unwrap().to_string(),
-            "3HDbdvM9CQ6ASnQFUkWw6Z4t3qNwMesJE9"
-        );
+        assert_eq!(sh.address(params).unwrap().to_string(), "XSspZXDJu2XVh8AKC7qF3L7x79Qy67JhQb");
 
         let wsh = StdDescriptor::from_str(
-            "wsh(c:pk_k(\
+            "elwsh(c:pk_k(\
              020000000000000000000000000000000000000000000000000000000000000002\
              ))",
         )
@@ -1440,7 +1475,7 @@ mod tests {
             script::Builder::new()
                 .push_opcode(opcodes::all::OP_PUSHBYTES_0)
                 .push_slice(
-                    sha256::Hash::from_str(
+                    &sha256::Hash::from_str(
                         "\
                          f9379edc8983152dc781747830075bd5\
                          3896e4b0ce5bff73777fd77d124ba085\
@@ -1452,12 +1487,12 @@ mod tests {
                 .into_script()
         );
         assert_eq!(
-            wsh.address(Network::Bitcoin,).unwrap().to_string(),
-            "bc1qlymeahyfsv2jm3upw3urqp6m65ufde9seedl7umh0lth6yjt5zzsk33tv6"
+            wsh.address(params).unwrap().to_string(),
+            "ert1qlymeahyfsv2jm3upw3urqp6m65ufde9seedl7umh0lth6yjt5zzsan9u2t"
         );
 
         let shwsh = StdDescriptor::from_str(
-            "sh(wsh(c:pk_k(\
+            "elsh(wsh(c:pk_k(\
              020000000000000000000000000000000000000000000000000000000000000002\
              )))",
         )
@@ -1467,7 +1502,7 @@ mod tests {
             script::Builder::new()
                 .push_opcode(opcodes::all::OP_HASH160)
                 .push_slice(
-                    hash160::Hash::from_str("4bec5d7feeed99e1d0a23fe32a4afe126a7ff07e",)
+                    &hash160::Hash::from_str("4bec5d7feeed99e1d0a23fe32a4afe126a7ff07e",)
                         .unwrap()
                         .to_byte_array()
                 )
@@ -1475,9 +1510,17 @@ mod tests {
                 .into_script()
         );
         assert_eq!(
-            shwsh.address(Network::Bitcoin,).unwrap().to_string(),
-            "38cTksiyPT2b1uGRVbVqHdDhW9vKs84N6Z"
+            shwsh.address(params).unwrap().to_string(),
+            "XJGggUb965TvGF2VCxp9EQGmZTxMeDjwQQ"
         );
+
+        let blinder = secp256k1_zkp::PublicKey::from_str(
+            "020000000000000000000000000000000000000000000000000000000000000002",
+        )
+        .unwrap();
+        let blinded = shwsh.blinded_address(blinder, params).unwrap();
+        assert_eq!(blinded.blinding_pubkey, Some(blinder));
+        assert_eq!(blinded.to_unconfidential(), shwsh.address(params).unwrap());
     }
 
     #[test]
@@ -1498,15 +1541,9 @@ mod tests {
         }
 
         impl Satisfier<bitcoin::PublicKey> for SimpleSat {
-            fn lookup_ecdsa_sig(
-                &self,
-                pk: &bitcoin::PublicKey,
-            ) -> Option<bitcoin::ecdsa::Signature> {
+            fn lookup_ecdsa_sig(&self, pk: &bitcoin::PublicKey) -> Option<ElementsSig> {
                 if *pk == self.pk {
-                    Some(bitcoin::ecdsa::Signature {
-                        signature: self.sig,
-                        sighash_type: bitcoin::sighash::EcdsaSighashType::All,
-                    })
+                    Some((self.sig, elements::EcdsaSighashType::All))
                 } else {
                     None
                 }
@@ -1516,101 +1553,65 @@ mod tests {
         let satisfier = SimpleSat { sig, pk };
         let ms = ms_str!("c:pk_k({})", pk);
 
-        let mut txin = bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint::default(),
-            script_sig: bitcoin::ScriptBuf::new(),
-            sequence: Sequence::from_height(100),
-            witness: Witness::default(),
-        };
+        let mut txin = elements_txin(Script::new(), vec![]);
         let bare = Descriptor::new_bare(ms).unwrap();
 
         bare.satisfy(&mut txin, &satisfier).expect("satisfaction");
         assert_eq!(
             txin,
-            bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: script::Builder::new()
-                    .push_slice(<&PushBytes>::try_from(sigser.as_slice()).unwrap())
-                    .into_script(),
-                sequence: Sequence::from_height(100),
-                witness: Witness::default(),
-            }
+            elements_txin(script::Builder::new().push_slice(&sigser).into_script(), vec![])
         );
-        assert_eq!(bare.unsigned_script_sig(), bitcoin::ScriptBuf::new());
+        assert_eq!(bare.unsigned_script_sig(), Script::new());
 
         let pkh = Descriptor::new_pkh(pk).unwrap();
         pkh.satisfy(&mut txin, &satisfier).expect("satisfaction");
         assert_eq!(
             txin,
-            bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: script::Builder::new()
-                    .push_slice(<&PushBytes>::try_from(sigser.as_slice()).unwrap())
+            elements_txin(
+                script::Builder::new()
+                    .push_slice(&sigser)
                     .push_key(&pk)
                     .into_script(),
-                sequence: Sequence::from_height(100),
-                witness: Witness::default(),
-            }
+                vec![]
+            )
         );
-        assert_eq!(pkh.unsigned_script_sig(), bitcoin::ScriptBuf::new());
+        assert_eq!(pkh.unsigned_script_sig(), Script::new());
 
         let wpkh = Descriptor::new_wpkh(pk).unwrap();
         wpkh.satisfy(&mut txin, &satisfier).expect("satisfaction");
-        assert_eq!(
-            txin,
-            bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: Sequence::from_height(100),
-                witness: Witness::from_slice(&[sigser.clone(), pk.to_bytes()]),
-            }
-        );
-        assert_eq!(wpkh.unsigned_script_sig(), bitcoin::ScriptBuf::new());
+        assert_eq!(txin, elements_txin(Script::new(), vec![sigser.clone(), pk.to_bytes()]));
+        assert_eq!(wpkh.unsigned_script_sig(), Script::new());
 
         let shwpkh = Descriptor::new_sh_wpkh(pk).unwrap();
         shwpkh.satisfy(&mut txin, &satisfier).expect("satisfaction");
         let redeem_script = script::Builder::new()
             .push_opcode(opcodes::all::OP_PUSHBYTES_0)
             .push_slice(
-                hash160::Hash::from_str("d1b2a1faf62e73460af885c687dee3b7189cd8ab")
+                &hash160::Hash::from_str("d1b2a1faf62e73460af885c687dee3b7189cd8ab")
                     .unwrap()
                     .to_byte_array(),
             )
             .into_script();
-        assert_eq!(
-            txin,
-            bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: script::Builder::new()
-                    .push_slice(<&PushBytes>::try_from(redeem_script.as_bytes()).unwrap())
-                    .into_script(),
-                sequence: Sequence::from_height(100),
-                witness: Witness::from_slice(&[sigser.clone(), pk.to_bytes()]),
-            }
-        );
-        assert_eq!(
-            shwpkh.unsigned_script_sig(),
-            script::Builder::new()
-                .push_slice(<&PushBytes>::try_from(redeem_script.as_bytes()).unwrap())
-                .into_script()
-        );
+        let expected_ssig = script::Builder::new()
+            .push_slice(redeem_script.as_bytes())
+            .into_script();
+        assert_eq!(txin, elements_txin(expected_ssig.clone(), vec![sigser.clone(), pk.to_bytes()]));
+        assert_eq!(shwpkh.unsigned_script_sig(), expected_ssig);
 
         let ms = ms_str!("c:pk_k({})", pk);
         let sh = Descriptor::new_sh(ms.clone()).unwrap();
         sh.satisfy(&mut txin, &satisfier).expect("satisfaction");
         assert_eq!(
             txin,
-            bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: script::Builder::new()
-                    .push_slice(<&PushBytes>::try_from(sigser.as_slice()).unwrap())
-                    .push_slice(<&PushBytes>::try_from(ms.encode().as_bytes()).unwrap())
+            elements_txin(
+                script::Builder::new()
+                    .push_slice(&sigser)
+                    .push_slice(ms.encode().as_bytes())
                     .into_script(),
-                sequence: Sequence::from_height(100),
-                witness: Witness::default(),
-            }
+                vec![]
+            )
         );
-        assert_eq!(sh.unsigned_script_sig(), bitcoin::ScriptBuf::new());
+        assert_eq!(sh.unsigned_script_sig(), Script::new());
 
         let ms = ms_str!("c:pk_k({})", pk);
 
@@ -1618,39 +1619,25 @@ mod tests {
         wsh.satisfy(&mut txin, &satisfier).expect("satisfaction");
         assert_eq!(
             txin,
-            bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: Sequence::from_height(100),
-                witness: Witness::from_slice(&[sigser.clone(), ms.encode().into_bytes()]),
-            }
+            elements_txin(Script::new(), vec![sigser.clone(), ms.encode().into_bytes()])
         );
-        assert_eq!(wsh.unsigned_script_sig(), bitcoin::ScriptBuf::new());
+        assert_eq!(wsh.unsigned_script_sig(), Script::new());
 
         let shwsh = Descriptor::new_sh_wsh(ms.clone()).unwrap();
         shwsh.satisfy(&mut txin, &satisfier).expect("satisfaction");
+        let expected_ssig = script::Builder::new()
+            .push_slice(ms.encode().to_v0_p2wsh().as_bytes())
+            .into_script();
         assert_eq!(
             txin,
-            bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::default(),
-                script_sig: script::Builder::new()
-                    .push_slice(<&PushBytes>::try_from(ms.encode().to_p2wsh().as_bytes()).unwrap())
-                    .into_script(),
-                sequence: Sequence::from_height(100),
-                witness: Witness::from_slice(&[sigser.clone(), ms.encode().into_bytes()]),
-            }
+            elements_txin(expected_ssig.clone(), vec![sigser.clone(), ms.encode().into_bytes()])
         );
-        assert_eq!(
-            shwsh.unsigned_script_sig(),
-            script::Builder::new()
-                .push_slice(<&PushBytes>::try_from(ms.encode().to_p2wsh().as_bytes()).unwrap())
-                .into_script()
-        );
+        assert_eq!(shwsh.unsigned_script_sig(), expected_ssig);
     }
 
     #[test]
     fn after_is_cltv() {
-        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("wsh(after(1000))").unwrap();
+        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("elwsh(after(1000))").unwrap();
         let script = descriptor.explicit_script().unwrap();
 
         let actual_instructions: Vec<_> = script.instructions().collect();
@@ -1661,7 +1648,7 @@ mod tests {
 
     #[test]
     fn older_is_csv() {
-        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("wsh(older(1000))").unwrap();
+        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("elwsh(older(1000))").unwrap();
         let script = descriptor.explicit_script().unwrap();
 
         let actual_instructions: Vec<_> = script.instructions().collect();
@@ -1672,22 +1659,22 @@ mod tests {
 
     #[test]
     fn tr_roundtrip_key() {
-        let script = Tr::<String>::from_str("tr()").unwrap().to_string();
-        assert_eq!(script, "tr()#x4ml3kxd");
+        let script = Tr::<String>::from_str("eltr()").unwrap().to_string();
+        assert_eq!(script, "eltr()#sux3r82e");
     }
 
     #[test]
     fn tr_roundtrip_script() {
-        let descriptor = Tr::<String>::from_str("tr(,{pk(),pk()})")
+        let descriptor = Tr::<String>::from_str("eltr(,{pk(),pk()})")
             .unwrap()
             .to_string();
 
-        assert_eq!(descriptor, "tr(,{pk(),pk()})#7dqr6v8r");
+        assert_eq!(descriptor, "eltr(,{pk(),pk()})#lxgcxh02");
 
-        let descriptor = Descriptor::<String>::from_str("tr(A,{pk(B),pk(C)})")
+        let descriptor = Descriptor::<String>::from_str("eltr(A,{pk(B),pk(C)})")
             .unwrap()
             .to_string();
-        assert_eq!(descriptor, "tr(A,{pk(B),pk(C)})#y0uc9t6x");
+        assert_eq!(descriptor, "eltr(A,{pk(B),pk(C)})#cx98s50f");
     }
 
     #[test]
@@ -1698,7 +1685,7 @@ mod tests {
         let p4 = "020000000000000000000000000000000000000000000000000000000000000004";
         let p5 = "03f8551772d66557da28c1de858124f365a8eb30ce6ad79c10e0f4c546d0ab0f82";
         let descriptor = Tr::<PublicKey>::from_str(&format!(
-            "tr({},{{pk({}),{{pk({}),or_d(pk({}),pkh({}))}}}})",
+            "eltr({},{{pk({}),{{pk({}),or_d(pk({}),pkh({}))}}}})",
             p1, p2, p3, p4, p5
         ))
         .unwrap();
@@ -1707,25 +1694,21 @@ mod tests {
         assert_eq!(
             descriptor.to_string(),
             format!(
-                "tr({},{{pk({}),{{pk({}),or_d(pk({}),pkh({}))}}}})#tvu28c0s",
+                "eltr({},{{pk({}),{{pk({}),or_d(pk({}),pkh({}))}}}})#y9kzzx3w",
                 p1, p2, p3, p4, p5
             )
-        );
-        assert_eq!(
-            descriptor.spend_info().merkle_root().unwrap().to_string(),
-            "e1597abcb76f7cbc0792cf04a9c2d4f39caed1ede0afef772064126f28c69b09"
         );
     }
 
     #[test]
     fn tr_script_pubkey() {
         let key = Descriptor::<bitcoin::PublicKey>::from_str(
-            "tr(02e20e746af365e86647826397ba1c0e0d5cb685752976fe2f326ab76bdc4d6ee9)",
+            "eltr(02e20e746af365e86647826397ba1c0e0d5cb685752976fe2f326ab76bdc4d6ee9)",
         )
         .unwrap();
         assert_eq!(
-            key.script_pubkey().to_hex_string(),
-            "51209c19294f03757da3dc235a5960631e3c55751632f5889b06b7a053bdc0bcfbcb"
+            format!("{:x}", key.script_pubkey()),
+            "51203f48e7c6203a75722733e3d9d06638da38d946066159c64684caf1622b2b0e33"
         )
     }
 
@@ -1735,7 +1718,7 @@ mod tests {
 
         assert!(matches!(
             StdDescriptor::from_str(
-                "tr(0202d44008000010100000000084F0000000dd0dd00000000000201dceddd00d00,abc{0,0})"
+                "eltr(0202d44008000010100000000084F0000000dd0dd00000000000201dceddd00d00,abc{0,0})"
             ),
             Err(Error::Parse(ParseError::Tree(ParseTreeError::IncorrectName {
                 expected: "",
@@ -1746,13 +1729,13 @@ mod tests {
 
     #[test]
     fn roundtrip_tests() {
-        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("multi");
+        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("elmulti");
         assert_eq!(descriptor.unwrap_err().to_string(), "expected threshold, found terminal",);
     }
 
     #[test]
     fn empty_thresh() {
-        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("thresh");
+        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("elthresh");
         assert_eq!(descriptor.unwrap_err().to_string(), "expected threshold, found terminal");
     }
 
@@ -1772,29 +1755,18 @@ mod tests {
         let sig_b = secp256k1::ecdsa::Signature::from_str("3044022075b7b65a7e6cd386132c5883c9db15f9a849a0f32bc680e9986398879a57c276022056d94d12255a4424f51c700ac75122cb354895c9f2f88f0cbb47ba05c9c589ba").unwrap();
 
         let descriptor = Descriptor::<bitcoin::PublicKey>::from_str(&format!(
-            "wsh(and_v(v:pk({A}),pk({B})))",
+            "elwsh(and_v(v:pk({A}),pk({B})))",
             A = a,
             B = b
         ))
         .unwrap();
 
-        let mut txin = bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint::default(),
-            script_sig: bitcoin::ScriptBuf::new(),
-            sequence: Sequence::ZERO,
-            witness: Witness::default(),
-        };
+        let mut txin = elements_txin(Script::new(), vec![]);
         let satisfier = {
             let mut satisfier = BTreeMap::new();
 
-            satisfier.insert(
-                a,
-                bitcoin::ecdsa::Signature { signature: sig_a, sighash_type: EcdsaSighashType::All },
-            );
-            satisfier.insert(
-                b,
-                bitcoin::ecdsa::Signature { signature: sig_b, sighash_type: EcdsaSighashType::All },
-            );
+            satisfier.insert(a, (sig_a, elements::EcdsaSighashType::All));
+            satisfier.insert(b, (sig_b, elements::EcdsaSighashType::All));
 
             satisfier
         };
@@ -1803,7 +1775,7 @@ mod tests {
         descriptor.satisfy(&mut txin, &satisfier).unwrap();
 
         // assert
-        let wit = txin.witness.to_vec();
+        let wit = txin.witness.script_witness.to_vec();
         let witness0 = &wit[0];
         let witness1 = &wit[1];
 
@@ -1822,7 +1794,7 @@ mod tests {
     fn test_scriptcode() {
         // P2WPKH (from bip143 test vectors)
         let descriptor = Descriptor::<PublicKey>::from_str(
-            "wpkh(025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357)",
+            "elwpkh(025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357)",
         )
         .unwrap();
         assert_eq!(
@@ -1832,7 +1804,7 @@ mod tests {
 
         // P2SH-P2WPKH (from bip143 test vectors)
         let descriptor = Descriptor::<PublicKey>::from_str(
-            "sh(wpkh(03ad1d8e89212f0b92c74d23bb710c00662ad1470198ac48c43f7d6f93a2a26873))",
+            "elsh(wpkh(03ad1d8e89212f0b92c74d23bb710c00662ad1470198ac48c43f7d6f93a2a26873))",
         )
         .unwrap();
         assert_eq!(
@@ -1842,7 +1814,7 @@ mod tests {
 
         // P2WSH (from bitcoind's `createmultisig`)
         let descriptor = Descriptor::<PublicKey>::from_str(
-            "wsh(multi(2,03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd,03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626))",
+            "elwsh(multi(2,03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd,03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626))",
         )
         .unwrap();
         assert_eq!(
@@ -1853,7 +1825,7 @@ mod tests {
         );
 
         // P2SH-P2WSH (from bitcoind's `createmultisig`)
-        let descriptor = Descriptor::<PublicKey>::from_str("sh(wsh(multi(2,03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd,03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626)))").unwrap();
+        let descriptor = Descriptor::<PublicKey>::from_str("elsh(wsh(multi(2,03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd,03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626)))").unwrap();
         assert_eq!(
             *descriptor
                 .script_code().unwrap()
@@ -1988,17 +1960,15 @@ mod tests {
                 .derive_at_index(index)
                 .unwrap()
                 .derived_descriptor(&secp_ctx)
-                .address(bitcoin::Network::Bitcoin)
+                .address(&elements::AddressParams::ELEMENTS)
                 .unwrap();
             let addr_two = desc_two
                 .derive_at_index(index)
                 .unwrap()
                 .derived_descriptor(&secp_ctx)
-                .address(bitcoin::Network::Bitcoin)
+                .address(&elements::AddressParams::ELEMENTS)
                 .unwrap();
-            let addr_expected = bitcoin::Address::from_str(raw_addr_expected)
-                .unwrap()
-                .assume_checked();
+            let addr_expected = elements::Address::from_str(raw_addr_expected).unwrap();
             assert_eq!(addr_one, addr_expected);
             assert_eq!(addr_two, addr_expected);
         }
@@ -2008,18 +1978,17 @@ mod tests {
         // P2SH and pubkeys (no wildcard — descriptors are fully defined)
         {
             let desc_strs = [
-                "sh(sortedmulti(1,03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556,0250863ad64a87ae8a2fe83c1af1a8403cb53f53e486d8511dad8a04887e5b2352))#uetvewm2",
-                "sh(sortedmulti(1,0250863ad64a87ae8a2fe83c1af1a8403cb53f53e486d8511dad8a04887e5b2352,03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556))#7l8smyg9",
+                "elsh(sortedmulti(1,03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556,0250863ad64a87ae8a2fe83c1af1a8403cb53f53e486d8511dad8a04887e5b2352))#tse3qz98",
+                "elsh(sortedmulti(1,0250863ad64a87ae8a2fe83c1af1a8403cb53f53e486d8511dad8a04887e5b2352,03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556))#ptnf05qc",
             ];
-            let addr_expected = bitcoin::Address::from_str("3JZJNxvDKe6Y55ZaF5223XHwfF2eoMNnoV")
-                .unwrap()
-                .assume_checked();
+            let addr_expected =
+                elements::Address::from_str("XUDXJZnP2GXsKRKdxSLKzJM1iZ4gbbyrGh").unwrap();
             for desc_str in desc_strs {
                 let desc = Descriptor::<DefiniteDescriptorKey>::from_str(desc_str).unwrap();
                 assert_eq!(desc.to_string(), desc_str);
                 let addr = desc
                     .derived_descriptor(&secp_ctx)
-                    .address(bitcoin::Network::Bitcoin)
+                    .address(&elements::AddressParams::ELEMENTS)
                     .unwrap();
                 assert_eq!(addr, addr_expected);
             }
@@ -2028,20 +1997,19 @@ mod tests {
         // P2WSH and xpub descriptor (no wildcard)
         {
             let desc_strs = [
-                "wsh(sortedmulti(1,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH))#7etm7zk7",
-                "wsh(sortedmulti(1,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB))#ppmeel9k",
+                "elwsh(sortedmulti(1,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH))#a8h2v83d",
+                "elwsh(sortedmulti(1,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB))#qfcn7ujk",
             ];
-            let addr_expected = bitcoin::Address::from_str(
-                "bc1qpq2cfgz5lktxzr5zqv7nrzz46hsvq3492ump9pz8rzcl8wqtwqcspx5y6a",
+            let addr_expected = elements::Address::from_str(
+                "ert1qpq2cfgz5lktxzr5zqv7nrzz46hsvq3492ump9pz8rzcl8wqtwqcs2yqnuv",
             )
-            .unwrap()
-            .assume_checked();
+            .unwrap();
             for desc_str in desc_strs {
                 let desc = Descriptor::<DefiniteDescriptorKey>::from_str(desc_str).unwrap();
                 assert_eq!(desc.to_string(), desc_str);
                 let addr = desc
                     .derived_descriptor(&secp_ctx)
-                    .address(bitcoin::Network::Bitcoin)
+                    .address(&elements::AddressParams::ELEMENTS)
                     .unwrap();
                 assert_eq!(addr, addr_expected);
             }
@@ -2049,17 +2017,30 @@ mod tests {
 
         // P2WSH-P2SH and ranged descriptor
         _test_sortedmulti(
-            "sh(wsh(sortedmulti(1,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/1/0/*,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH/0/0/*)))#u60cee0u",
-            "sh(wsh(sortedmulti(1,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH/0/0/*,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/1/0/*)))#75dkf44w",
-            "325zcVBN5o2eqqqtGwPjmtDd8dJRyYP82s",
+            "elsh(wsh(sortedmulti(1,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/1/0/*,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH/0/0/*)))#l7qy253t",
+            "elsh(wsh(sortedmulti(1,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH/0/0/*,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/1/0/*)))#0gpee5cl",
+            "XBkDY63XnRTz6BbwzJi3ifGhBwLTomEzkq",
         );
+    }
+
+    #[test]
+    fn missing_elements_prefix_does_not_expose_private_keys() {
+        let secp = secp256k1::Secp256k1::new();
+        let private =
+            bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Bitcoin, &[42; 32]).unwrap();
+        let text = format!("wpkh({}/0/*)", private);
+        let error = Descriptor::parse_descriptor(&secp, &text)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(&private.to_string()));
+        assert!(error.contains("missing Elements descriptor prefix"));
     }
 
     #[test]
     fn test_parse_descriptor() {
         let secp = &secp256k1::Secp256k1::signing_only();
-        let (descriptor, key_map) = Descriptor::parse_descriptor(secp, "wpkh(tprv8ZgxMBicQKsPcwcD4gSnMti126ZiETsuX7qwrtMypr6FBwAP65puFn4v6c3jrN9VwtMRMph6nyT63NrfUL4C3nBzPcduzVSuHD7zbX2JKVc/44'/0'/0'/0/*)").unwrap();
-        assert_eq!(descriptor.to_string(), "wpkh([2cbe2a6d/44'/0'/0']tpubDCvNhURocXGZsLNqWcqD3syHTqPXrMSTwi8feKVwAcpi29oYKsDD3Vex7x2TDneKMVN23RbLprfxB69v94iYqdaYHsVz3kPR37NQXeqouVz/0/*)#nhdxg96s");
+        let (descriptor, key_map) = Descriptor::parse_descriptor(secp, "elwpkh(tprv8ZgxMBicQKsPcwcD4gSnMti126ZiETsuX7qwrtMypr6FBwAP65puFn4v6c3jrN9VwtMRMph6nyT63NrfUL4C3nBzPcduzVSuHD7zbX2JKVc/44'/0'/0'/0/*)").unwrap();
+        assert_eq!(descriptor.to_string(), "elwpkh([2cbe2a6d/44'/0'/0']tpubDCvNhURocXGZsLNqWcqD3syHTqPXrMSTwi8feKVwAcpi29oYKsDD3Vex7x2TDneKMVN23RbLprfxB69v94iYqdaYHsVz3kPR37NQXeqouVz/0/*)#pznhhta9");
         assert_eq!(key_map.len(), 1);
 
         // https://github.com/bitcoin/bitcoin/blob/7ae86b3c6845873ca96650fc69beb4ae5285c801/src/test/descriptor_tests.cpp#L355-L360
@@ -2076,21 +2057,21 @@ mod tests {
             };
         }
         check_invalid_checksum!(secp,
-            "sh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#",
-            "sh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#",
-            "sh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#ggrsrxfyq",
-            "sh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#tjg09x5tq",
-            "sh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#ggrsrxf",
-            "sh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#tjg09x5",
-            "sh(multi(3,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#ggrsrxfy",
-            "sh(multi(3,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#tjg09x5t",
-            "sh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#tjq09x4t",
-            "sh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))##ggssrxfy",
-            "sh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))##tjq09x4t"
+            "elsh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#",
+            "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#",
+            "elsh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#9s2ngs7uq",
+            "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#uklept69q",
+            "elsh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#9s2ngs7",
+            "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#uklept6",
+            "elsh(multi(3,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#9s2ngs7u",
+            "elsh(multi(3,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#uklept69",
+            "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#ukleqt69",
+            "elsh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))##9s2ngs7u",
+            "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))##uklept69"
         );
 
-        Descriptor::parse_descriptor(secp, "sh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#ggrsrxfy").expect("Valid descriptor with checksum");
-        Descriptor::parse_descriptor(secp, "sh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#tjg09x5t").expect("Valid descriptor with checksum");
+        Descriptor::parse_descriptor(secp, "elsh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))#9s2ngs7u").expect("Valid descriptor with checksum");
+        Descriptor::parse_descriptor(secp, "elsh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))#uklept69").expect("Valid descriptor with checksum");
     }
 
     #[test]
@@ -2118,11 +2099,11 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     #[test]
     fn parse_with_secrets() {
         let secp = &secp256k1::Secp256k1::signing_only();
-        let descriptor_str = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)#v20xlvm9";
+        let descriptor_str = "elwpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)#xldrpn5u";
         let (descriptor, keymap) =
             Descriptor::<DescriptorPublicKey>::parse_descriptor(secp, descriptor_str).unwrap();
 
-        let expected = "wpkh([a12b02f4/44'/0'/0']xpub6BzhLAQUDcBUfHRQHZxDF2AbcJqp4Kaeq6bzJpXrjrWuK26ymTFwkEFbxPra2bJ7yeZKbDjfDeFwxe93JMqpo5SsPJH6dZdvV9kMzJkAZ69/0/*)#u37l7u8u";
+        let expected = "elwpkh([a12b02f4/44'/0'/0']xpub6BzhLAQUDcBUfHRQHZxDF2AbcJqp4Kaeq6bzJpXrjrWuK26ymTFwkEFbxPra2bJ7yeZKbDjfDeFwxe93JMqpo5SsPJH6dZdvV9kMzJkAZ69/0/*)#20ufqv7z";
         assert_eq!(expected, descriptor.to_string());
         assert_eq!(keymap.len(), 1);
 
@@ -2137,10 +2118,12 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         let secp = &secp256k1::Secp256k1::signing_only();
 
         for desc in [
-            "pk(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/*)#dl4n4vmp",
+            "elpk(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/*)",
             // xprv containing "pub"
-            "pk(xprv9s21ZrQH143K3MByafknWupz9D5c3Wz3MrAZpC5KFxUuwwbefg6BVSWFwyUbEcqxGTpubCGtQyC3m3vm8rZkmN1TNoc7n6VdZBt5NeXdxwV/*)#nyw8pgdu",
+            "elpk(xprv9s21ZrQH143K3MByafknWupz9D5c3Wz3MrAZpC5KFxUuwwbefg6BVSWFwyUbEcqxGTpubCGtQyC3m3vm8rZkmN1TNoc7n6VdZBt5NeXdxwV/*)",
         ] {
+            let desc = with_checksum(desc);
+            let desc = desc.as_str();
             assert_eq!(desc.parse::<Descriptor<DescriptorPublicKey>>().unwrap_err().to_string(), DescriptorKeyParseError::UnexpectedXPrivateKey.to_string());
 
             let (descriptor, key_map) =
@@ -2152,13 +2135,13 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
     #[test]
     fn checksum_for_nested_sh() {
-        let descriptor_str = "sh(wpkh(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL))";
+        let descriptor_str = "elsh(wpkh(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL))";
         let descriptor: Descriptor<DescriptorPublicKey> = descriptor_str.parse().unwrap();
-        assert_eq!(descriptor.to_string(), "sh(wpkh(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL))#tjp2zm88");
+        assert_eq!(descriptor.to_string(), "elsh(wpkh(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL))#2040pn7l");
 
-        let descriptor_str = "sh(wsh(pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL)))";
+        let descriptor_str = "elsh(wsh(pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL)))";
         let descriptor: Descriptor<DescriptorPublicKey> = descriptor_str.parse().unwrap();
-        assert_eq!(descriptor.to_string(), "sh(wsh(pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL)))#6c6hwr22");
+        assert_eq!(descriptor.to_string(), "elsh(wsh(pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL)))#pqs0de7e");
     }
 
     #[test]
@@ -2167,25 +2150,25 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         let x_only_key = "08c0fcf8895f4361b4fc77afe2ad53b0bd27dcebfd863421b2b246dc283d4103";
 
         // Both x-only keys and comp keys allowed in tr
-        Descriptor::<DescriptorPublicKey>::from_str(&format!("tr({})", comp_key)).unwrap();
-        Descriptor::<DescriptorPublicKey>::from_str(&format!("tr({})", x_only_key)).unwrap();
+        Descriptor::<DescriptorPublicKey>::from_str(&format!("eltr({})", comp_key)).unwrap();
+        Descriptor::<DescriptorPublicKey>::from_str(&format!("eltr({})", x_only_key)).unwrap();
 
         // Only compressed keys allowed in wsh
-        Descriptor::<DescriptorPublicKey>::from_str(&format!("wsh(pk({}))", comp_key)).unwrap();
-        Descriptor::<DescriptorPublicKey>::from_str(&format!("wsh(pk({}))", x_only_key))
+        Descriptor::<DescriptorPublicKey>::from_str(&format!("elwsh(pk({}))", comp_key)).unwrap();
+        Descriptor::<DescriptorPublicKey>::from_str(&format!("elwsh(pk({}))", x_only_key))
             .unwrap_err();
     }
 
     #[test]
     fn test_find_derivation_index_for_spk() {
         let secp = secp256k1::Secp256k1::verification_only();
-        let descriptor = Descriptor::from_str("tr([73c5da0a/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)").unwrap();
-        let script_at_0_1 = ScriptBuf::from_hex(
-            "5120a82f29944d65b86ae6b5e5cc75e294ead6c59391a1edc5e016e3498c67fc7bbb",
-        )
-        .unwrap();
+        let descriptor = Descriptor::from_str("eltr([73c5da0a/86'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)").unwrap();
+        // Elements Taproot output for `/0/1`; it differs from the BIP 86 vector because
+        // Elements uses its own Taproot tagged hashes.
+        let script_at_0_1 =
+            hex_script("5120c73ac1b7a518499b9642aed8cfa15d5401e5bd85ad760b937b69521c297722f0");
         let expected_concrete = Descriptor::from_str(
-            "tr(0283dfe85a3151d2517290da461fe2815591ef69f2b18a2ce63f01697a8b313145)",
+            "eltr(0283dfe85a3151d2517290da461fe2815591ef69f2b18a2ce63f01697a8b313145)",
         )
         .unwrap();
 
@@ -2203,116 +2186,116 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     #[test]
     fn display_alternate() {
         let bare = StdDescriptor::from_str(
-            "pk(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elpk(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         assert_eq!(
             format!("{}", bare),
-            "pk(020000000000000000000000000000000000000000000000000000000000000002)#7yxkn84h",
+            "elpk(020000000000000000000000000000000000000000000000000000000000000002)#vlpqwfjv",
         );
         assert_eq!(
             format!("{:#}", bare),
-            "pk(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elpk(020000000000000000000000000000000000000000000000000000000000000002)",
         );
 
         let pkh = StdDescriptor::from_str(
-            "pkh(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elpkh(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         assert_eq!(
             format!("{}", pkh),
-            "pkh(020000000000000000000000000000000000000000000000000000000000000002)#ma7nspkf",
+            "elpkh(020000000000000000000000000000000000000000000000000000000000000002)#jzq8e832",
         );
         assert_eq!(
             format!("{:#}", pkh),
-            "pkh(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elpkh(020000000000000000000000000000000000000000000000000000000000000002)",
         );
 
         let wpkh = StdDescriptor::from_str(
-            "wpkh(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elwpkh(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         assert_eq!(
             format!("{}", wpkh),
-            "wpkh(020000000000000000000000000000000000000000000000000000000000000002)#d3xz2xye",
+            "elwpkh(020000000000000000000000000000000000000000000000000000000000000002)#vxhqdpz9",
         );
         assert_eq!(
             format!("{:#}", wpkh),
-            "wpkh(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elwpkh(020000000000000000000000000000000000000000000000000000000000000002)",
         );
 
         let shwpkh = StdDescriptor::from_str(
-            "sh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))",
+            "elsh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))",
         )
         .unwrap();
         assert_eq!(
             format!("{}", shwpkh),
-            "sh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))#45zpjtet",
+            "elsh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))#h9ajn2ft",
         );
         assert_eq!(
             format!("{:#}", shwpkh),
-            "sh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))",
+            "elsh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))",
         );
 
-        let wsh = StdDescriptor::from_str("wsh(1)").unwrap();
-        assert_eq!(format!("{}", wsh), "wsh(1)#mrg7xj7p");
-        assert_eq!(format!("{:#}", wsh), "wsh(1)");
+        let wsh = StdDescriptor::from_str("elwsh(1)").unwrap();
+        assert_eq!(format!("{}", wsh), "elwsh(1)#s78w5gmj");
+        assert_eq!(format!("{:#}", wsh), "elwsh(1)");
 
-        let sh = StdDescriptor::from_str("sh(1)").unwrap();
-        assert_eq!(format!("{}", sh), "sh(1)#l8r75ggs");
-        assert_eq!(format!("{:#}", sh), "sh(1)");
+        let sh = StdDescriptor::from_str("elsh(1)").unwrap();
+        assert_eq!(format!("{}", sh), "elsh(1)#k4aqrx5p");
+        assert_eq!(format!("{:#}", sh), "elsh(1)");
 
-        let shwsh = StdDescriptor::from_str("sh(wsh(1))").unwrap();
-        assert_eq!(format!("{}", shwsh), "sh(wsh(1))#hcyfl07f");
-        assert_eq!(format!("{:#}", shwsh), "sh(wsh(1))");
+        let shwsh = StdDescriptor::from_str("elsh(wsh(1))").unwrap();
+        assert_eq!(format!("{}", shwsh), "elsh(wsh(1))#d05z4wjl");
+        assert_eq!(format!("{:#}", shwsh), "elsh(wsh(1))");
 
         let tr = StdDescriptor::from_str(
-            "tr(020000000000000000000000000000000000000000000000000000000000000002)",
+            "eltr(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         assert_eq!(
             format!("{}", tr),
-            "tr(020000000000000000000000000000000000000000000000000000000000000002)#8hc7wq5h",
+            "eltr(020000000000000000000000000000000000000000000000000000000000000002)#e874qu8z",
         );
         assert_eq!(
             format!("{:#}", tr),
-            "tr(020000000000000000000000000000000000000000000000000000000000000002)",
+            "eltr(020000000000000000000000000000000000000000000000000000000000000002)",
         );
     }
 
     #[test]
     fn multipath_descriptors() {
         // We can parse a multipath descriptors, and make it into separate single-path descriptors.
-        let desc = Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<7';8h;20>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/<0;1;987>/*)))").unwrap();
+        let desc = Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<7';8h;20>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/<0;1;987>/*)))").unwrap();
         assert!(desc.is_multipath());
         assert_eq!(desc.into_single_descriptors().unwrap(), vec![
-            Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/7'/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/0/*)))").unwrap(),
-            Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/8h/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/1/*)))").unwrap(),
-            Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/20/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/987/*)))").unwrap()
+            Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/7'/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/0/*)))").unwrap(),
+            Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/8h/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/1/*)))").unwrap(),
+            Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/20/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/987/*)))").unwrap()
         ]);
 
         // Even if only one of the keys is multipath.
-        let desc = Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
+        let desc = Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
         assert!(desc.is_multipath());
         assert_eq!(desc.into_single_descriptors().unwrap(), vec![
-            Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/0/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap(),
-            Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/1/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap(),
+            Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/0/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap(),
+            Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/1/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap(),
         ]);
 
         // We can detect regular single-path descriptors.
-        let notmulti_desc = Descriptor::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
+        let notmulti_desc = Descriptor::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/4567/*)))").unwrap();
         assert!(!notmulti_desc.is_multipath());
         assert_eq!(notmulti_desc.clone().into_single_descriptors().unwrap(), vec![notmulti_desc]);
 
         // We refuse to parse multipath descriptors with a mismatch in the number of derivation paths between keys.
-        Descriptor::<DescriptorPublicKey>::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/<0;1;2;3;4>/*)))").unwrap_err();
-        Descriptor::<DescriptorPublicKey>::from_str("wsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1;2;3>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/<0;1;2>/*)))").unwrap_err();
+        Descriptor::<DescriptorPublicKey>::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/<0;1;2;3;4>/*)))").unwrap_err();
+        Descriptor::<DescriptorPublicKey>::from_str("elwsh(andor(pk(tpubDEN9WSToTyy9ZQfaYqSKfmVqmq1VVLNtYfj3Vkqh67et57eJ5sTKZQBkHqSwPUsoSskJeaYnPttHe2VrkCsKA27kUaN9SDc5zhqeLzKa1rr/0'/<0;1;2;3>/*),older(10000),pk(tpubD8LYfn6njiA2inCoxwM7EuN3cuLVcaHAwLYeups13dpevd3nHLRdK9NdQksWXrhLQVxcUZRpnp5CkJ1FhE61WRAsHxDNAkvGkoQkAeWDYjV/8/<0;1;2>/*)))").unwrap_err();
     }
 
     #[test]
     fn regression_736() {
         Descriptor::<DescriptorPublicKey>::from_str(
-            "tr(0000000000000000000000000000000000000000000000000000000000000002,)",
+            "eltr(0000000000000000000000000000000000000000000000000000000000000002,)",
         )
         .unwrap_err();
     }
@@ -2320,15 +2303,15 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     #[test]
     fn regression_734() {
         Descriptor::<DescriptorPublicKey>::from_str(
-            "wsh(or_i(pk(0202baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a),1))",
+            "elwsh(or_i(pk(0202baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a),1))",
         )
         .unwrap();
         Descriptor::<DescriptorPublicKey>::from_str(
-            "sh(or_i(pk(0202baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a),1))",
+            "elsh(or_i(pk(0202baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a),1))",
         )
         .unwrap();
         Descriptor::<DescriptorPublicKey>::from_str(
-            "tr(02baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a,1)",
+            "eltr(02baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a,1)",
         )
         .unwrap_err();
     }
@@ -2338,15 +2321,15 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         use crate::policy::Liftable as _;
 
         // Taproot structure is erased but key order preserved..
-        let desc = Descriptor::<String>::from_str("tr(ROOT,{pk(A1),{pk(B1),pk(B2)}})").unwrap();
+        let desc = Descriptor::<String>::from_str("eltr(ROOT,{pk(A1),{pk(B1),pk(B2)}})").unwrap();
         let lift = desc.lift().unwrap();
         assert_eq!(lift.to_string(), "(pk(ROOT) ∨ (pk(A1) ∨ pk(B1) ∨ pk(B2)))");
-        let desc = Descriptor::<String>::from_str("tr(ROOT,{{pk(A1),pk(B1)},pk(B2)})").unwrap();
+        let desc = Descriptor::<String>::from_str("eltr(ROOT,{{pk(A1),pk(B1)},pk(B2)})").unwrap();
         let lift = desc.lift().unwrap();
         assert_eq!(lift.to_string(), "(pk(ROOT) ∨ (pk(A1) ∨ pk(B1) ∨ pk(B2)))");
 
         // And normalization happens
-        let desc = Descriptor::<String>::from_str("tr(ROOT,{0,{0,0}})").unwrap();
+        let desc = Descriptor::<String>::from_str("eltr(ROOT,{0,{0,0}})").unwrap();
         let lift = desc.lift().unwrap();
         assert_eq!(lift.to_string(), "(pk(ROOT) ∨ UNSATISFIABLE)");
     }
@@ -2366,39 +2349,39 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         type Desc = Descriptor<DescriptorPublicKey>;
 
         // Legacy tests, x-only keys are not supported
-        Desc::from_str(&format!("sh(pk({}))", comp_key)).unwrap();
-        Desc::from_str(&format!("sh(pk({}))", uncomp_key)).unwrap();
-        Desc::from_str(&format!("sh(pk({}))", x_only_key)).unwrap_err();
+        Desc::from_str(&format!("elsh(pk({}))", comp_key)).unwrap();
+        Desc::from_str(&format!("elsh(pk({}))", uncomp_key)).unwrap();
+        Desc::from_str(&format!("elsh(pk({}))", x_only_key)).unwrap_err();
 
         // bare tests, x-only keys not supported
-        Desc::from_str(&format!("pk({})", comp_key)).unwrap();
-        Desc::from_str(&format!("pk({})", uncomp_key)).unwrap();
-        Desc::from_str(&format!("pk({})", x_only_key)).unwrap_err();
+        Desc::from_str(&format!("elpk({})", comp_key)).unwrap();
+        Desc::from_str(&format!("elpk({})", uncomp_key)).unwrap();
+        Desc::from_str(&format!("elpk({})", x_only_key)).unwrap_err();
 
         // pkh tests, x-only keys not supported
-        Desc::from_str(&format!("pkh({})", comp_key)).unwrap();
-        Desc::from_str(&format!("pkh({})", uncomp_key)).unwrap();
-        Desc::from_str(&format!("pkh({})", x_only_key)).unwrap_err();
+        Desc::from_str(&format!("elpkh({})", comp_key)).unwrap();
+        Desc::from_str(&format!("elpkh({})", uncomp_key)).unwrap();
+        Desc::from_str(&format!("elpkh({})", x_only_key)).unwrap_err();
 
         // wpkh tests, uncompressed and x-only keys not supported
-        Desc::from_str(&format!("wpkh({})", comp_key)).unwrap();
-        Desc::from_str(&format!("wpkh({})", uncomp_key)).unwrap_err();
-        Desc::from_str(&format!("wpkh({})", x_only_key)).unwrap_err();
+        Desc::from_str(&format!("elwpkh({})", comp_key)).unwrap();
+        Desc::from_str(&format!("elwpkh({})", uncomp_key)).unwrap_err();
+        Desc::from_str(&format!("elwpkh({})", x_only_key)).unwrap_err();
 
         // Segwitv0 tests, uncompressed and x-only keys not supported
-        Desc::from_str(&format!("wsh(pk({}))", comp_key)).unwrap();
-        Desc::from_str(&format!("wsh(pk({}))", uncomp_key)).unwrap_err();
-        Desc::from_str(&format!("wsh(pk({}))", x_only_key)).unwrap_err();
+        Desc::from_str(&format!("elwsh(pk({}))", comp_key)).unwrap();
+        Desc::from_str(&format!("elwsh(pk({}))", uncomp_key)).unwrap_err();
+        Desc::from_str(&format!("elwsh(pk({}))", x_only_key)).unwrap_err();
 
         // Tap tests, key path
-        Desc::from_str(&format!("tr({})", comp_key)).unwrap();
-        Desc::from_str(&format!("tr({})", uncomp_key)).unwrap_err();
-        Desc::from_str(&format!("tr({})", x_only_key)).unwrap();
+        Desc::from_str(&format!("eltr({})", comp_key)).unwrap();
+        Desc::from_str(&format!("eltr({})", uncomp_key)).unwrap_err();
+        Desc::from_str(&format!("eltr({})", x_only_key)).unwrap();
 
         // Tap tests, script path
-        Desc::from_str(&format!("tr({},pk({}))", x_only_key, comp_key)).unwrap();
-        Desc::from_str(&format!("tr({},pk({}))", x_only_key, uncomp_key)).unwrap_err();
-        Desc::from_str(&format!("tr({},pk({}))", x_only_key, x_only_key)).unwrap();
+        Desc::from_str(&format!("eltr({},pk({}))", x_only_key, comp_key)).unwrap();
+        Desc::from_str(&format!("eltr({},pk({}))", x_only_key, uncomp_key)).unwrap_err();
+        Desc::from_str(&format!("eltr({},pk({}))", x_only_key, x_only_key)).unwrap();
     }
 
     #[test]
@@ -2406,19 +2389,19 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         let secp = secp256k1::Secp256k1::signing_only();
         type Desc = Descriptor<DescriptorPublicKey>;
         // OK
-        Desc::from_str("pkh(111111111111111111111111111111110000008375319363688624584A111111)")
+        Desc::from_str("elpkh(111111111111111111111111111111110000008375319363688624584A111111)")
             .unwrap_err();
         // ERR: crashes in translate_pk
         Desc::parse_descriptor(
             &secp,
-            "pkh(111111111111111111111111111111110000008375319363688624584A111111)",
+            "elpkh(111111111111111111111111111111110000008375319363688624584A111111)",
         )
         .unwrap_err();
     }
 
     #[test]
     fn convert_public_key_descriptor_to_definite_key() {
-        let descriptor_str = "wsh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6)))";
+        let descriptor_str = "elwsh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6)))";
         let full_pk_descriptor: Descriptor<PublicKey> =
             Descriptor::from_str(descriptor_str).unwrap();
 
@@ -2445,7 +2428,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         assert_eq!(full_pk_descriptor.to_string(), converted_descriptor.to_string());
 
-        let xonly_descriptor_str = "tr(1d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b,pk(02c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6))";
+        let xonly_descriptor_str = "eltr(1d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b,pk(02c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6))";
         let xonly_pk_descriptor: Descriptor<XOnlyPublicKey> =
             Descriptor::from_str(xonly_descriptor_str).unwrap();
 
@@ -2474,7 +2457,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     fn test_iter_pk() {
         // Test Bare descriptor
         let bare_desc = Descriptor::<PublicKey>::from_str(
-            "pk(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elpk(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         let keys: Vec<_> = bare_desc.iter_pk().collect();
@@ -2486,7 +2469,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Pkh descriptor
         let pkh_desc = Descriptor::<PublicKey>::from_str(
-            "pkh(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elpkh(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         let keys: Vec<_> = pkh_desc.iter_pk().collect();
@@ -2498,7 +2481,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Wpkh descriptor
         let wpkh_desc = Descriptor::<PublicKey>::from_str(
-            "wpkh(020000000000000000000000000000000000000000000000000000000000000002)",
+            "elwpkh(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         let keys: Vec<_> = wpkh_desc.iter_pk().collect();
@@ -2510,7 +2493,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Sh descriptor with a miniscript
         let sh_desc = Descriptor::<PublicKey>::from_str(
-            "sh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6)))"
+            "elsh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6)))"
         ).unwrap();
         let keys: Vec<_> = sh_desc.iter_pk().collect();
         assert_eq!(keys.len(), 2);
@@ -2525,7 +2508,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Sh-Wpkh descriptor
         let shwpkh_desc = Descriptor::<PublicKey>::from_str(
-            "sh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))",
+            "elsh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))",
         )
         .unwrap();
         let keys: Vec<_> = shwpkh_desc.iter_pk().collect();
@@ -2537,7 +2520,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Sh-Wsh descriptor
         let shwsh_desc = Descriptor::<PublicKey>::from_str(
-            "sh(wsh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6))))"
+            "elsh(wsh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6))))"
         ).unwrap();
         let keys: Vec<_> = shwsh_desc.iter_pk().collect();
         assert_eq!(keys.len(), 2);
@@ -2552,7 +2535,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Wsh descriptor
         let wsh_desc = Descriptor::<PublicKey>::from_str(
-            "wsh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6)))"
+            "elwsh(or_d(pk(021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b),pk(0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6)))"
         ).unwrap();
         let keys: Vec<_> = wsh_desc.iter_pk().collect();
         assert_eq!(keys.len(), 2);
@@ -2567,7 +2550,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test SortedMulti descriptors
         let sortedmulti_desc = Descriptor::<PublicKey>::from_str(
-            "sh(sortedmulti(2,021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b,0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6,03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556))"
+            "elsh(sortedmulti(2,021d4ea7132d4e1a362ee5efd8d0b59dd4d1fe8906eefa7dd812b05a46b73d829b,0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6,03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556))"
         ).unwrap();
         let keys: Vec<_> = sortedmulti_desc.iter_pk().collect();
         assert_eq!(keys.len(), 3);
@@ -2581,7 +2564,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Taproot descriptor with only key path
         let tr_key_only_desc = Descriptor::<PublicKey>::from_str(
-            "tr(020000000000000000000000000000000000000000000000000000000000000002)",
+            "eltr(020000000000000000000000000000000000000000000000000000000000000002)",
         )
         .unwrap();
         let keys: Vec<_> = tr_key_only_desc.iter_pk().collect();
@@ -2598,7 +2581,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         let script_key2 = "0302c8bbbb393f32c843149ce36d56405595aaabab2d0e1f4ca5f9de67dd7419f6";
 
         let tr_with_script_desc = Descriptor::<PublicKey>::from_str(&format!(
-            "tr({},{{pk({}),pk({})}})",
+            "eltr({},{{pk({}),pk({})}})",
             internal_key, script_key1, script_key2,
         ))
         .unwrap();
@@ -2615,7 +2598,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
         // Test Taproot descriptor with complex script tree
         let tr_complex_desc = Descriptor::<PublicKey>::from_str(&format!(
-            "tr({},{{pk({}),{{pk({}),or_d(pk({}),pk({}))}}}})",
+            "eltr({},{{pk({}),{{pk({}),or_d(pk({}),pk({}))}}}})",
             internal_key,
             script_key1,
             script_key2,
@@ -2681,11 +2664,11 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         // Basic single key scenarios
         let basic_tests = vec![
             // Single mainnet xpub
-            (format!("wpkh({})", mainnet_xpubs[0]), XKeyNetwork::Single(NetworkKind::Main)),
+            (format!("elwpkh({})", mainnet_xpubs[0]), XKeyNetwork::Single(NetworkKind::Main)),
             // Single testnet tpub
-            (format!("wpkh({})", testnet_tpubs[0]), XKeyNetwork::Single(NetworkKind::Test)),
+            (format!("elwpkh({})", testnet_tpubs[0]), XKeyNetwork::Single(NetworkKind::Test)),
             // Single public key (no extended keys)
-            (format!("wpkh({})", single_keys[0]), XKeyNetwork::NoXKeys),
+            (format!("elwpkh({})", single_keys[0]), XKeyNetwork::NoXKeys),
         ];
 
         for (desc_str, expected) in basic_tests {
@@ -2697,18 +2680,18 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         let multi_key_tests = vec![
             // Mixed networks: mainnet + testnet
             (
-                format!("wsh(multi(2,{},{}))", mainnet_xpubs[0], testnet_tpubs[0]),
+                format!("elwsh(multi(2,{},{}))", mainnet_xpubs[0], testnet_tpubs[0]),
                 XKeyNetwork::Mixed,
             ),
             // Consistent mainnet keys
             (
-                format!("wsh(multi(2,{},{}))", mainnet_xpubs[0], mainnet_xpubs[1]),
+                format!("elwsh(multi(2,{},{}))", mainnet_xpubs[0], mainnet_xpubs[1]),
                 XKeyNetwork::Single(NetworkKind::Main),
             ),
             // Consistent testnet multisig
             (
                 format!(
-                    "wsh(multi(2,{},{},{}))",
+                    "elwsh(multi(2,{},{},{}))",
                     testnet_tpubs[0], testnet_tpubs[1], testnet_tpubs[2]
                 ),
                 XKeyNetwork::Single(NetworkKind::Test),
@@ -2716,7 +2699,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
             // Sorted multisig with mixed key types
             (
                 format!(
-                    "wsh(sortedmulti(2,{},{},{}))",
+                    "elwsh(sortedmulti(2,{},{},{}))",
                     mainnet_xpubs[0], testnet_tpubs[0], single_keys[0]
                 ),
                 XKeyNetwork::Mixed,
@@ -2724,7 +2707,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
             // 3-of-4 multisig with all mainnet keys
             (
                 format!(
-                    "wsh(multi(3,{},{},{},{}))",
+                    "elwsh(multi(3,{},{},{},{}))",
                     mainnet_xpubs[0], mainnet_xpubs[1], mainnet_xpubs[2], mainnet_xpubs[3]
                 ),
                 XKeyNetwork::Single(NetworkKind::Main),
@@ -2746,25 +2729,25 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
             // Threshold with mixed key types
             (
                 format!(
-                    "wsh(thresh(2,c:pk_k({}),sc:pk_k({}),sc:pk_k({})))",
+                    "elwsh(thresh(2,c:pk_k({}),sc:pk_k({}),sc:pk_k({})))",
                     single_keys[0], mainnet_xpubs[0], testnet_tpubs[0]
                 ),
                 XKeyNetwork::Mixed,
             ),
             // OR with mixed networks
             (
-                format!("wsh(or_d(pk({}),pk({})))", mainnet_xpubs[0], testnet_tpubs[0]),
+                format!("elwsh(or_d(pk({}),pk({})))", mainnet_xpubs[0], testnet_tpubs[0]),
                 XKeyNetwork::Mixed,
             ),
             // AND with consistent mainnet keys
             (
-                format!("wsh(and_v(v:pk({}),pk({})))", mainnet_xpubs[0], mainnet_xpubs[1]),
+                format!("elwsh(and_v(v:pk({}),pk({})))", mainnet_xpubs[0], mainnet_xpubs[1]),
                 XKeyNetwork::Single(NetworkKind::Main),
             ),
             // Complex threshold with all testnet keys
             (
                 format!(
-                    "wsh(thresh(3,c:pk_k({}),sc:pk_k({}),sc:pk_k({}),sc:pk_k({})))",
+                    "elwsh(thresh(3,c:pk_k({}),sc:pk_k({}),sc:pk_k({}),sc:pk_k({})))",
                     testnet_tpubs[0], testnet_tpubs[1], testnet_tpubs[2], testnet_tpubs[3]
                 ),
                 XKeyNetwork::Single(NetworkKind::Test),
@@ -2784,17 +2767,17 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         // Taproot and complex miniscript tests
         let complex_tests = vec![
             // Taproot with mixed networks
-            (format!("tr({},pk({}))", mainnet_xpubs[0], testnet_tpubs[0]), XKeyNetwork::Mixed),
+            (format!("eltr({},pk({}))", mainnet_xpubs[0], testnet_tpubs[0]), XKeyNetwork::Mixed),
             // Taproot with consistent mainnet keys
-            (format!("tr({},pk({}))", mainnet_xpubs[0], mainnet_xpubs[1]), XKeyNetwork::Single(NetworkKind::Main)),
+            (format!("eltr({},pk({}))", mainnet_xpubs[0], mainnet_xpubs[1]), XKeyNetwork::Single(NetworkKind::Main)),
             // HTLC-like pattern with mixed networks
-            (format!("wsh(andor(pk({}),sha256(1111111111111111111111111111111111111111111111111111111111111111),and_v(v:pkh({}),older(144))))", mainnet_xpubs[0], testnet_tpubs[0]), XKeyNetwork::Mixed),
+            (format!("elwsh(andor(pk({}),sha256(1111111111111111111111111111111111111111111111111111111111111111),and_v(v:pkh({}),older(144))))", mainnet_xpubs[0], testnet_tpubs[0]), XKeyNetwork::Mixed),
             // Multi-path spending with testnet keys
-            (format!("wsh(or_d(multi(2,{},{}),and_v(v:pk({}),older(1000))))", testnet_tpubs[0], testnet_tpubs[1], testnet_tpubs[2]), XKeyNetwork::Single(NetworkKind::Test)),
+            (format!("elwsh(or_d(multi(2,{},{}),and_v(v:pk({}),older(1000))))", testnet_tpubs[0], testnet_tpubs[1], testnet_tpubs[2]), XKeyNetwork::Single(NetworkKind::Test)),
             // Nested conditions with only single keys
-            (format!("wsh(thresh(3,c:pk_k({}),sc:pk_k({}),sc:pk_k({}),sc:pk_k({})))", single_keys[0], single_keys[1], single_keys[2], single_keys[3]), XKeyNetwork::NoXKeys),
+            (format!("elwsh(thresh(3,c:pk_k({}),sc:pk_k({}),sc:pk_k({}),sc:pk_k({})))", single_keys[0], single_keys[1], single_keys[2], single_keys[3]), XKeyNetwork::NoXKeys),
             // Complex pattern with mainnet keys
-            (format!("wsh(or_d(multi(2,{},{}),and_v(v:pk({}),older(1000))))", mainnet_xpubs[0], mainnet_xpubs[1], mainnet_xpubs[2]), XKeyNetwork::Single(NetworkKind::Main)),
+            (format!("elwsh(or_d(multi(2,{},{}),and_v(v:pk({}),older(1000))))", mainnet_xpubs[0], mainnet_xpubs[1], mainnet_xpubs[2]), XKeyNetwork::Single(NetworkKind::Main)),
         ];
 
         for (desc_str, expected) in complex_tests {
@@ -2821,34 +2804,34 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         // DefiniteDescriptorKey tests (no wildcards, specific derivation paths)
         let definite_key_tests = vec![
             // Basic single key scenarios
-            (format!("wpkh({})", mainnet_xpubs[0]), XKeyNetwork::Single(NetworkKind::Main)),
-            (format!("wpkh({})", testnet_tpubs[0]), XKeyNetwork::Single(NetworkKind::Test)),
-            (format!("wpkh({})", single_keys[0]), XKeyNetwork::NoXKeys),
+            (format!("elwpkh({})", mainnet_xpubs[0]), XKeyNetwork::Single(NetworkKind::Main)),
+            (format!("elwpkh({})", testnet_tpubs[0]), XKeyNetwork::Single(NetworkKind::Test)),
+            (format!("elwpkh({})", single_keys[0]), XKeyNetwork::NoXKeys),
             // Multi-key scenarios with specific derivation paths
             (
-                format!("wsh(multi(2,{},{}))", mainnet_xpubs[0], testnet_tpubs[0]),
+                format!("elwsh(multi(2,{},{}))", mainnet_xpubs[0], testnet_tpubs[0]),
                 XKeyNetwork::Mixed,
             ),
             (
-                format!("wsh(multi(2,{}/0,{}/1))", testnet_tpubs[0], testnet_tpubs[1]),
+                format!("elwsh(multi(2,{}/0,{}/1))", testnet_tpubs[0], testnet_tpubs[1]),
                 XKeyNetwork::Single(NetworkKind::Test),
             ),
             (
-                format!("wsh(multi(2,{}/0,{}/1))", mainnet_xpubs[0], mainnet_xpubs[1]),
+                format!("elwsh(multi(2,{}/0,{}/1))", mainnet_xpubs[0], mainnet_xpubs[1]),
                 XKeyNetwork::Single(NetworkKind::Main),
             ),
             // Sorted multisig with specific paths
             (
                 format!(
-                    "wsh(sortedmulti(2,{}/0,{}/1,{}))",
+                    "elwsh(sortedmulti(2,{}/0,{}/1,{}))",
                     mainnet_xpubs[0], testnet_tpubs[0], single_keys[0]
                 ),
                 XKeyNetwork::Mixed,
             ),
             // Taproot scenarios
-            (format!("tr({})", mainnet_xpubs[0]), XKeyNetwork::Single(NetworkKind::Main)),
+            (format!("eltr({})", mainnet_xpubs[0]), XKeyNetwork::Single(NetworkKind::Main)),
             (
-                format!("tr({},pk({}/0))", mainnet_xpubs[0], testnet_tpubs[0]),
+                format!("eltr({},pk({}/0))", mainnet_xpubs[0], testnet_tpubs[0]),
                 XKeyNetwork::Mixed,
             ),
         ];
@@ -2869,7 +2852,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         use crate::descriptor::DescriptorPublicKey;
         // Descriptor with no wildcard — all keys are fully specified
         let desc = Descriptor::<DescriptorPublicKey>::from_str(
-            "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
+            "elwpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
         ).unwrap();
         assert!(!desc.has_wildcard());
         assert!(matches!(
@@ -2883,7 +2866,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         use crate::descriptor::DescriptorPublicKey;
         // One key has wildcard, one doesn't
         let desc = Descriptor::<DescriptorPublicKey>::from_str(
-            "wsh(multi(1,xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/*,xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/2))"
+            "elwsh(multi(1,xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/*,xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/2))"
         ).unwrap();
         assert!(desc.has_wildcard());
         assert!(matches!(desc.derive_at_index(0), DerivationResult::Ok(_)));
@@ -2893,7 +2876,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     fn derive_at_index_works_with_wildcard() {
         use crate::descriptor::DescriptorPublicKey;
         let desc = Descriptor::<DescriptorPublicKey>::from_str(
-            "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/*)"
+            "elwpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/*)"
         ).unwrap();
         assert!(desc.has_wildcard());
         let d0 = desc.derive_at_index(0).unwrap();
@@ -2907,7 +2890,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
         use crate::descriptor::DescriptorPublicKey;
         // Deprecated at_derivation_index still works for non-wildcard (old behavior)
         let desc = Descriptor::<DescriptorPublicKey>::from_str(
-            "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
+            "elwpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
         ).unwrap();
         assert!(!desc.has_wildcard());
         // Old behavior: silently succeeds even without wildcard
@@ -2918,7 +2901,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     fn try_from_non_wildcard() {
         use crate::descriptor::DescriptorPublicKey;
         let desc = Descriptor::<DescriptorPublicKey>::from_str(
-            "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
+            "elwpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/2)"
         ).unwrap();
         let definite: Result<Descriptor<DefiniteDescriptorKey>, _> = desc.try_into();
         assert!(definite.is_ok());
@@ -2928,7 +2911,7 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
     fn try_from_wildcard_fails() {
         use crate::descriptor::DescriptorPublicKey;
         let desc = Descriptor::<DescriptorPublicKey>::from_str(
-            "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/*)"
+            "elwpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/*)"
         ).unwrap();
         let definite: Result<Descriptor<DefiniteDescriptorKey>, _> = desc.try_into();
         assert!(matches!(definite, Err(NonDefiniteKeyError::Wildcard)));

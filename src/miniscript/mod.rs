@@ -16,7 +16,7 @@ use core::{hash, str};
 
 use bitcoin::hashes::hash160;
 use bitcoin::script;
-use bitcoin::taproot::{LeafVersion, TapLeafHash};
+use elements::taproot::{LeafVersion, TapLeafHash};
 
 pub use self::context::{BareCtx, Legacy, Segwitv0, Tap};
 use crate::iter::{StackExt as _, TreeLike};
@@ -519,12 +519,14 @@ impl<Pk: MiniscriptKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
     /// Get a reference to the inner `AstElem` representing the root of miniscript
     pub fn as_inner(&self) -> &Terminal<Pk, Ctx> { &self.node }
 
-    /// Encode as a Bitcoin script
-    pub fn encode(&self) -> script::ScriptBuf
+    /// Encode as an Elements script
+    pub fn encode(&self) -> elements::Script
     where
         Pk: ToPublicKey,
     {
-        self.node.encode(script::Builder::new()).into_script()
+        self.node
+            .encode(elements::script::Builder::new())
+            .into_script()
     }
 
     /// Size, in bytes of the script-pubkey. If this Miniscript is used outside
@@ -710,7 +712,7 @@ impl<Pk: ToPublicKey> Miniscript<Pk, Tap> {
     ///
     /// Note that this method is only implemented for Taproot Miniscripts.
     pub fn leaf_hash(&self) -> TapLeafHash {
-        TapLeafHash::from_script(&self.encode(), LeafVersion::TapScript)
+        TapLeafHash::from_script(&self.encode(), LeafVersion::default())
     }
 }
 
@@ -721,16 +723,21 @@ impl<Ctx: ScriptContext> Miniscript<Ctx::Key, Ctx> {
     /// It may make sense to use this method when parsing Script that is already
     /// embedded in the chain. While it is inadvisable to use insane Miniscripts,
     /// once it's on the chain you don't have much choice anymore.
-    pub fn decode_consensus(script: &script::Script) -> Result<Self, Error> {
+    pub fn decode_consensus(script: &elements::Script) -> Result<Self, Error> {
         Self::decode_with_validation_params(script, &Ctx::CONSENSUS)
     }
 
     /// Attempt to decode a Miniscript from Script, specifying which validation parameters to apply.
     pub fn decode_with_validation_params(
-        script: &script::Script,
+        script: &elements::Script,
         params: &ValidationParams,
     ) -> Result<Self, Error> {
-        let tokens = lex(script)?;
+        Self::decode_bytes(script.as_bytes(), params)
+    }
+
+    /// [`Self::decode_with_validation_params`] for borrowed Script bytes, such as a witness push.
+    pub(crate) fn decode_bytes(script: &[u8], params: &ValidationParams) -> Result<Self, Error> {
+        let tokens = lex(script::Script::from_bytes(script))?;
         let mut iter = TokenIter::new(tokens);
 
         let top = decode::decode(&mut iter)?;
@@ -753,30 +760,30 @@ impl<Ctx: ScriptContext> Miniscript<Ctx::Key, Ctx> {
     /// ## Decode/Parse a miniscript from script hex
     ///
     /// ```rust
-    /// use miniscript::{Miniscript, Segwitv0, Tap};
-    /// use miniscript::bitcoin::secp256k1::XOnlyPublicKey;
+    /// use elements_miniscript::{Miniscript, Segwitv0, Tap};
+    /// use elements_miniscript::bitcoin::secp256k1::XOnlyPublicKey;
     ///
     /// type Segwitv0Script = Miniscript<bitcoin::PublicKey, Segwitv0>;
     /// type TapScript = Miniscript<XOnlyPublicKey, Tap>;
     ///
     /// // parse x-only miniscript in Taproot context
-    /// let tapscript_ms = TapScript::decode(&bitcoin::ScriptBuf::from_hex(
+    /// let tapscript_ms = TapScript::decode(&elements_miniscript::elements::Script::from_hex_no_prefix(
     ///     "202788ee41e76f4f3af603da5bc8fa22997bc0344bb0f95666ba6aaff0242baa99ac",
     /// ).expect("Even length hex"))
     ///     .expect("Xonly keys are valid only in taproot context");
     /// // tapscript fails decoding when we use them with compressed keys
-    /// let err = TapScript::decode(&bitcoin::ScriptBuf::from_hex(
+    /// let err = TapScript::decode(&elements_miniscript::elements::Script::from_hex_no_prefix(
     ///     "21022788ee41e76f4f3af603da5bc8fa22997bc0344bb0f95666ba6aaff0242baa99ac",
     /// ).expect("Even length hex"))
     ///     .expect_err("Compressed keys cannot be used in Taproot context");
     /// // Segwitv0 succeeds decoding with full keys.
-    /// Segwitv0Script::decode(&bitcoin::ScriptBuf::from_hex(
+    /// Segwitv0Script::decode(&elements_miniscript::elements::Script::from_hex_no_prefix(
     ///     "21022788ee41e76f4f3af603da5bc8fa22997bc0344bb0f95666ba6aaff0242baa99ac",
     /// ).expect("Even length hex"))
     ///     .expect("Compressed keys are allowed in Segwit context");
     ///
     /// ```
-    pub fn decode(script: &script::Script) -> Result<Self, Error> {
+    pub fn decode(script: &elements::Script) -> Result<Self, Error> {
         let ms = Self::decode_with_validation_params(script, &Ctx::SANE)?;
         Ok(ms)
     }
@@ -995,8 +1002,35 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> FromTree for Arc<Miniscript<Pk, Ctx>> {
     }
 }
 
+// The wrappers and the fragment name of `node`, without `prefix` if `node` is `root`.
+fn split_name<'s>(
+    root: TreeIterItem<'s>,
+    prefix: &str,
+    node: TreeIterItem<'s>,
+) -> Result<(Option<&'s str>, &'s str), crate::ParseTreeError> {
+    let (wrap, name) = node.name_separated(':')?;
+    if node.index() != root.index() {
+        return Ok((wrap, name));
+    }
+    Ok(match wrap {
+        Some(wrap) => (Some(wrap.strip_prefix(prefix).unwrap_or(wrap)), name),
+        None => (None, name.strip_prefix(prefix).unwrap_or(name)),
+    })
+}
+
 impl<Pk: FromStrKey, Ctx: ScriptContext> FromTree for Miniscript<Pk, Ctx> {
     fn from_tree(root: TreeIterItem) -> Result<Self, Error> {
+        Self::from_tree_with_root_prefix(root, "")
+    }
+}
+
+impl<Pk: FromStrKey, Ctx: ScriptContext> Miniscript<Pk, Ctx> {
+    /// Parses the Miniscript at `root` as [`FromTree::from_tree`] does, ignoring `prefix` at the
+    /// start of the name of `root`, as in the bare descriptor `elpk(KEY)`.
+    pub(crate) fn from_tree_with_root_prefix(
+        root: TreeIterItem,
+        prefix: &str,
+    ) -> Result<Self, Error> {
         #[allow(clippy::type_complexity)]
         fn binary<Pk: MiniscriptKey, Ctx: ScriptContext>(
             node: expression::TreeIterItem,
@@ -1032,8 +1066,7 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> FromTree for Miniscript<Pk, Ctx> {
                     continue;
                 }
 
-                let (_, parent_name) = parent
-                    .name_separated(':')
+                let (_, parent_name) = split_name(root, prefix, parent)
                     .map_err(From::from)
                     .map_err(Error::Parse)?;
 
@@ -1045,8 +1078,7 @@ impl<Pk: FromStrKey, Ctx: ScriptContext> FromTree for Miniscript<Pk, Ctx> {
                 }
             }
 
-            let (frag_wrap, frag_name) = node
-                .name_separated(':')
+            let (frag_wrap, frag_name) = split_name(root, prefix, node)
                 .map_err(From::from)
                 .map_err(Error::Parse)?;
 
@@ -1220,7 +1252,7 @@ mod tests {
 
     use bitcoin::hashes::{hash160, sha256, Hash};
     use bitcoin::secp256k1::XOnlyPublicKey;
-    use bitcoin::taproot::TapLeafHash;
+    use elements::taproot::TapLeafHash;
     use sync::Arc;
 
     use super::*;
@@ -1326,7 +1358,7 @@ mod tests {
         assert_eq!(tree.ty.corr.base, types::Base::B);
         let ser = tree.encode();
         assert_eq!(ser.len(), tree.script_size());
-        assert_eq!(ser.to_string(), s);
+        assert_eq!(ser.asm(), s);
         let deser =
             Segwitv0Script::decode_consensus(&ser).expect("deserialize result of serialize");
         assert_eq!(*tree, deser);
@@ -1550,7 +1582,7 @@ mod tests {
              OP_EQUALVERIFY OP_CHECKSIG\
              ";
         assert_eq!(ser.len(), tree.script_size());
-        assert_eq!(ser.to_string(), s);
+        assert_eq!(ser.asm(), s);
 
         roundtrip(
             &ms_str!("pk({})", keys[0]),
@@ -1810,10 +1842,10 @@ mod tests {
                 &self,
                 _pk: &Pk,
                 _h: &TapLeafHash,
-            ) -> Option<bitcoin::taproot::Signature> {
-                Some(bitcoin::taproot::Signature {
-                    signature: self.0,
-                    sighash_type: bitcoin::sighash::TapSighashType::Default,
+            ) -> Option<elements::SchnorrSig> {
+                Some(elements::SchnorrSig {
+                    sig: self.0,
+                    hash_ty: elements::SchnorrSighashType::Default,
                 })
             }
         }
@@ -2016,11 +2048,11 @@ mod tests {
                 &self,
                 pk: &bitcoin::PublicKey,
                 _h: &TapLeafHash,
-            ) -> Option<bitcoin::taproot::Signature> {
+            ) -> Option<elements::SchnorrSig> {
                 if pk == &self.1 {
-                    Some(bitcoin::taproot::Signature {
-                        signature: self.0,
-                        sighash_type: bitcoin::sighash::TapSighashType::Default,
+                    Some(elements::SchnorrSig {
+                        sig: self.0,
+                        hash_ty: elements::SchnorrSighashType::Default,
                     })
                 } else {
                     None
@@ -2058,9 +2090,9 @@ mod tests {
 
     #[test]
     fn test_script_parse_dos() {
-        let mut script = bitcoin::script::Builder::new().push_opcode(bitcoin::opcodes::OP_TRUE);
+        let mut script = elements::script::Builder::new().push_opcode(elements::opcodes::OP_TRUE);
         for _ in 0..10000 {
-            script = script.push_opcode(bitcoin::opcodes::all::OP_0NOTEQUAL);
+            script = script.push_opcode(elements::opcodes::all::OP_0NOTEQUAL);
         }
         Tapscript::decode_consensus(&script.into_script()).unwrap_err();
     }

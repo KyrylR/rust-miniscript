@@ -5,10 +5,10 @@
 //! Implementation of Segwit Descriptors. Contains the implementation
 //! of wsh, wpkh and sortedmulti inside wsh.
 
-use core::convert::TryFrom;
 use core::fmt;
 
-use bitcoin::{Address, Network, ScriptBuf, Weight};
+use bitcoin::Weight;
+use elements::{secp256k1_zkp, Script};
 
 use crate::descriptor::write_descriptor;
 use crate::expression::{self, FromTree};
@@ -20,8 +20,8 @@ use crate::policy::{semantic, Liftable};
 use crate::prelude::*;
 use crate::util::varint_len;
 use crate::{
-    Error, ForEachKey, FromStrKey, Miniscript, MiniscriptKey, Satisfier, Segwitv0, Terminal,
-    Threshold, ToPublicKey, TranslateErr, Translator,
+    elementssig_to_rawsig, Error, ForEachKey, FromStrKey, Miniscript, MiniscriptKey, Satisfier,
+    Segwitv0, Terminal, Threshold, ToPublicKey, TranslateErr, Translator,
 };
 /// A Segwitv0 wsh descriptor
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
@@ -116,43 +116,47 @@ impl<Pk: MiniscriptKey> Wsh<Pk> {
 
 impl<Pk: MiniscriptKey + ToPublicKey> Wsh<Pk> {
     /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn script_pubkey(&self) -> ScriptBuf { self.inner_script().to_p2wsh() }
+    pub fn script_pubkey(&self) -> Script { self.inner_script().to_v0_p2wsh() }
 
-    /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn address(&self, network: Network) -> Address {
-        Address::p2wsh(&self.ms.encode(), network)
+    /// Obtains the corresponding address for this descriptor, blinded if `blinder` is given.
+    pub fn address(
+        &self,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static elements::AddressParams,
+    ) -> elements::Address {
+        elements::Address::p2wsh(&self.ms.encode(), blinder, params)
     }
 
     /// Obtains the underlying miniscript for this descriptor.
-    pub fn inner_script(&self) -> ScriptBuf { self.ms.encode() }
+    pub fn inner_script(&self) -> Script { self.ms.encode() }
 
     /// Obtains the pre bip-340 signature script code for this descriptor.
-    pub fn ecdsa_sighash_script_code(&self) -> ScriptBuf { self.inner_script() }
+    pub fn ecdsa_sighash_script_code(&self) -> Script { self.inner_script() }
 
     /// Returns satisfying non-malleable witness and scriptSig with minimum
     /// weight to spend an output controlled by the given descriptor if it is
     /// possible to construct one using the `satisfier`.
-    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
         let mut witness = self.ms.satisfy(satisfier)?;
         let witness_script = self.inner_script();
         witness.push(witness_script.into_bytes());
-        let script_sig = ScriptBuf::new();
+        let script_sig = Script::new();
         Ok((witness, script_sig))
     }
 
     /// Returns satisfying, possibly malleable, witness and scriptSig with
     /// minimum weight to spend an output controlled by the given descriptor if
     /// it is possible to construct one using the `satisfier`.
-    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
         let mut witness = self.ms.satisfy_malleable(satisfier)?;
         witness.push(self.inner_script().into_bytes());
-        let script_sig = ScriptBuf::new();
+        let script_sig = Script::new();
         Ok((witness, script_sig))
     }
 
@@ -184,7 +188,7 @@ impl<Pk: MiniscriptKey> Liftable<Pk> for Wsh<Pk> {
 impl<Pk: FromStrKey> crate::expression::FromTree for Wsh<Pk> {
     fn from_tree(top: expression::TreeIterItem) -> Result<Self, Error> {
         let top = top
-            .verify_toplevel("wsh", 1..=1)
+            .verify_toplevel("elwsh", 1..=1)
             .map_err(From::from)
             .map_err(Error::Parse)?;
 
@@ -195,12 +199,12 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Wsh<Pk> {
 }
 
 impl<Pk: MiniscriptKey> fmt::Debug for Wsh<Pk> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "wsh({:?})", self.ms) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "elwsh({:?})", self.ms) }
 }
 
 impl<Pk: MiniscriptKey> fmt::Display for Wsh<Pk> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_descriptor!(f, "wsh({})", self.ms)
+        write_descriptor!(f, "elwsh({})", self.ms)
     }
 }
 
@@ -285,47 +289,47 @@ impl<Pk: MiniscriptKey> Wpkh<Pk> {
 
 impl<Pk: MiniscriptKey + ToPublicKey> Wpkh<Pk> {
     /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn script_pubkey(&self) -> ScriptBuf {
-        let pk = self.pk.to_public_key();
-        let compressed = bitcoin::key::CompressedPublicKey::try_from(pk)
-            .expect("wpkh descriptors have compressed keys");
-
-        let addr = Address::p2wpkh(&compressed, Network::Bitcoin);
+    pub fn script_pubkey(&self) -> Script {
+        let addr = self.address(None, &elements::AddressParams::ELEMENTS);
         addr.script_pubkey()
     }
 
-    /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn address(&self, network: Network) -> Address {
-        let pk = self.pk.to_public_key();
-        let compressed = bitcoin::key::CompressedPublicKey::try_from(pk)
-            .expect("Rust Miniscript types don't allow uncompressed pks in segwit descriptors");
-
-        Address::p2wpkh(&compressed, network)
+    /// Obtains the corresponding address for this descriptor, blinded if `blinder` is given.
+    pub fn address(
+        &self,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static elements::AddressParams,
+    ) -> elements::Address {
+        elements::Address::p2wpkh(&self.pk.to_public_key(), blinder, params)
     }
 
     /// Obtains the underlying miniscript for this descriptor.
-    pub fn inner_script(&self) -> ScriptBuf { self.script_pubkey() }
+    pub fn inner_script(&self) -> Script { self.script_pubkey() }
 
     /// Obtains the pre bip-340 signature script code for this descriptor.
-    pub fn ecdsa_sighash_script_code(&self) -> ScriptBuf {
+    pub fn ecdsa_sighash_script_code(&self) -> Script {
         // For SegWit outputs, it is defined by bip-0143 (quoted below) and is different from
         // the previous txo's scriptPubKey.
         // The item 5:
         //     - For P2WPKH witness program, the scriptCode is `0x1976a914{20-byte-pubkey-hash}88ac`.
-        let addr = Address::p2pkh(self.pk.to_public_key(), Network::Bitcoin);
+        let addr = elements::Address::p2pkh(
+            &self.pk.to_public_key(),
+            None,
+            &elements::AddressParams::ELEMENTS,
+        );
         addr.script_pubkey()
     }
 
     /// Returns satisfying non-malleable witness and scriptSig with minimum
     /// weight to spend an output controlled by the given descriptor if it is
     /// possible to construct one using the `satisfier`.
-    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
         if let Some(sig) = satisfier.lookup_ecdsa_sig(&self.pk) {
-            let sig_vec = sig.to_vec();
-            let script_sig = ScriptBuf::new();
+            let sig_vec = elementssig_to_rawsig(&sig);
+            let script_sig = Script::new();
             let witness = vec![sig_vec, self.pk.to_public_key().to_bytes()];
             Ok((witness, script_sig))
         } else {
@@ -336,7 +340,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Wpkh<Pk> {
     /// Returns satisfying, possibly malleable, witness and scriptSig with
     /// minimum weight to spend an output controlled by the given descriptor if
     /// it is possible to construct one using the `satisfier`.
-    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -371,12 +375,12 @@ impl<Pk: MiniscriptKey + ToPublicKey> Wpkh<Pk> {
 }
 
 impl<Pk: MiniscriptKey> fmt::Debug for Wpkh<Pk> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "wpkh({:?})", self.pk) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "elwpkh({:?})", self.pk) }
 }
 
 impl<Pk: MiniscriptKey> fmt::Display for Wpkh<Pk> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_descriptor!(f, "wpkh({})", self.pk)
+        write_descriptor!(f, "elwpkh({})", self.pk)
     }
 }
 
@@ -389,7 +393,7 @@ impl<Pk: MiniscriptKey> Liftable<Pk> for Wpkh<Pk> {
 impl<Pk: FromStrKey> crate::expression::FromTree for Wpkh<Pk> {
     fn from_tree(top: expression::TreeIterItem) -> Result<Self, Error> {
         let pk = top
-            .verify_terminal_parent("wpkh", "public key")
+            .verify_terminal_parent("elwpkh", "public key")
             .map_err(Error::Parse)?;
         Self::new(pk).map_err(Error::ContextError)
     }

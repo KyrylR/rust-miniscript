@@ -7,11 +7,10 @@
 //! sh(miniscript), and sh(wpkh)
 //!
 
-use core::convert::TryFrom;
 use core::fmt;
 
-use bitcoin::script::PushBytes;
-use bitcoin::{script, Address, Network, ScriptBuf, Weight};
+use bitcoin::Weight;
+use elements::{script, secp256k1_zkp, Script};
 
 use super::{Wpkh, Wsh};
 use crate::descriptor::write_descriptor;
@@ -59,9 +58,9 @@ impl<Pk: MiniscriptKey> Liftable<Pk> for Sh<Pk> {
 impl<Pk: MiniscriptKey> fmt::Debug for Sh<Pk> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.inner {
-            ShInner::Wsh(ref wsh_inner) => write!(f, "sh({:?})", wsh_inner),
-            ShInner::Wpkh(ref pk) => write!(f, "sh({:?})", pk),
-            ShInner::Ms(ref ms) => write!(f, "sh({:?})", ms),
+            ShInner::Wsh(ref wsh) => write!(f, "elsh(wsh({:?}))", wsh.as_inner()),
+            ShInner::Wpkh(ref pk) => write!(f, "elsh(wpkh({:?}))", pk.as_inner()),
+            ShInner::Ms(ref ms) => write!(f, "elsh({:?})", ms),
         }
     }
 }
@@ -69,9 +68,9 @@ impl<Pk: MiniscriptKey> fmt::Debug for Sh<Pk> {
 impl<Pk: MiniscriptKey> fmt::Display for Sh<Pk> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.inner {
-            ShInner::Wsh(ref wsh) => write_descriptor!(f, "sh({:#})", wsh),
-            ShInner::Wpkh(ref pk) => write_descriptor!(f, "sh({:#})", pk),
-            ShInner::Ms(ref ms) => write_descriptor!(f, "sh({})", ms),
+            ShInner::Wsh(ref wsh) => write_descriptor!(f, "elsh(wsh({}))", wsh.as_inner()),
+            ShInner::Wpkh(ref pk) => write_descriptor!(f, "elsh(wpkh({}))", pk.as_inner()),
+            ShInner::Ms(ref ms) => write_descriptor!(f, "elsh({})", ms),
         }
     }
 }
@@ -79,13 +78,25 @@ impl<Pk: MiniscriptKey> fmt::Display for Sh<Pk> {
 impl<Pk: FromStrKey> crate::expression::FromTree for Sh<Pk> {
     fn from_tree(top: expression::TreeIterItem) -> Result<Self, Error> {
         let top = top
-            .verify_toplevel("sh", 1..=1)
+            .verify_toplevel("elsh", 1..=1)
             .map_err(From::from)
             .map_err(Error::Parse)?;
 
+        // Descriptors nested inside `elsh` are written without the `el` prefix.
         let inner = match top.name() {
-            "wsh" => ShInner::Wsh(Wsh::from_tree(top)?),
-            "wpkh" => ShInner::Wpkh(Wpkh::from_tree(top)?),
+            "wsh" => {
+                let ms = top
+                    .verify_toplevel("wsh", 1..=1)
+                    .map_err(From::from)
+                    .map_err(Error::Parse)?;
+                ShInner::Wsh(Wsh::new(Miniscript::from_tree(ms)?)?)
+            }
+            "wpkh" => {
+                let pk = top
+                    .verify_terminal_parent("wpkh", "public key")
+                    .map_err(Error::Parse)?;
+                ShInner::Wpkh(Wpkh::new(pk)?)
+            }
             _ => {
                 let sub = Miniscript::from_tree(top)?;
                 Legacy::top_level_checks(&sub)?;
@@ -244,7 +255,7 @@ impl<Pk: MiniscriptKey> Sh<Pk> {
 
 impl<Pk: MiniscriptKey + ToPublicKey> Sh<Pk> {
     /// Obtains the corresponding script pubkey for this descriptor.
-    pub fn script_pubkey(&self) -> ScriptBuf {
+    pub fn script_pubkey(&self) -> Script {
         match self.inner {
             ShInner::Wsh(ref wsh) => wsh.script_pubkey().to_p2sh(),
             ShInner::Wpkh(ref wpkh) => wpkh.script_pubkey().to_p2sh(),
@@ -252,28 +263,22 @@ impl<Pk: MiniscriptKey + ToPublicKey> Sh<Pk> {
         }
     }
 
-    /// Obtains the corresponding address for this descriptor.
-    pub fn address(&self, network: Network) -> Address {
-        let addr = self.address_fallible(network);
-
-        // Size is checked in `check_global_consensus_validity`.
-        assert!(addr.is_ok());
-        addr.expect("only fails if size > MAX_SCRIPT_ELEMENT_SIZE")
-    }
-
-    fn address_fallible(&self, network: Network) -> Result<Address, Error> {
+    /// Obtains the corresponding address for this descriptor, blinded if `blinder` is given.
+    pub fn address(
+        &self,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static elements::AddressParams,
+    ) -> elements::Address {
         let script = match self.inner {
             ShInner::Wsh(ref wsh) => wsh.script_pubkey(),
             ShInner::Wpkh(ref wpkh) => wpkh.script_pubkey(),
             ShInner::Ms(ref ms) => ms.encode(),
         };
-        let address = Address::p2sh(&script, network)?;
-
-        Ok(address)
+        elements::Address::p2sh(&script, blinder, params)
     }
 
     /// Obtain the underlying miniscript for this descriptor
-    pub fn inner_script(&self) -> ScriptBuf {
+    pub fn inner_script(&self) -> Script {
         match self.inner {
             ShInner::Wsh(ref wsh) => wsh.inner_script(),
             ShInner::Wpkh(ref wpkh) => wpkh.script_pubkey(),
@@ -282,7 +287,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Sh<Pk> {
     }
 
     /// Obtains the pre bip-340 signature script code for this descriptor.
-    pub fn ecdsa_sighash_script_code(&self) -> ScriptBuf {
+    pub fn ecdsa_sighash_script_code(&self) -> Script {
         match self.inner {
             //     - For P2WSH witness program, if the witnessScript does not contain any `OP_CODESEPARATOR`,
             //       the `scriptCode` is the `witnessScript` serialized as scripts inside CTxOut.
@@ -300,29 +305,29 @@ impl<Pk: MiniscriptKey + ToPublicKey> Sh<Pk> {
     /// This is used in Segwit transactions to produce an unsigned transaction
     /// whose txid will not change during signing (since only the witness data
     /// will change).
-    pub fn unsigned_script_sig(&self) -> ScriptBuf {
+    pub fn unsigned_script_sig(&self) -> Script {
         match self.inner {
             ShInner::Wsh(ref wsh) => {
                 // wsh explicit must contain exactly 1 element
-                let witness_script = wsh.inner_script().to_p2wsh();
-                let push_bytes = <&PushBytes>::try_from(witness_script.as_bytes())
-                    .expect("Witness script is not too large");
-                script::Builder::new().push_slice(push_bytes).into_script()
+                let witness_script = wsh.inner_script().to_v0_p2wsh();
+                script::Builder::new()
+                    .push_slice(witness_script.as_bytes())
+                    .into_script()
             }
             ShInner::Wpkh(ref wpkh) => {
                 let redeem_script = wpkh.script_pubkey();
-                let push_bytes: &PushBytes =
-                    <&PushBytes>::try_from(redeem_script.as_bytes()).expect("Script not too large");
-                script::Builder::new().push_slice(push_bytes).into_script()
+                script::Builder::new()
+                    .push_slice(redeem_script.as_bytes())
+                    .into_script()
             }
-            ShInner::Ms(..) => ScriptBuf::new(),
+            ShInner::Ms(..) => Script::new(),
         }
     }
 
     /// Returns satisfying non-malleable witness and scriptSig with minimum
     /// weight to spend an output controlled by the given descriptor if it is
     /// possible to construct one using the `satisfier`.
-    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {
@@ -349,7 +354,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Sh<Pk> {
     /// Returns satisfying, possibly malleable, witness and scriptSig with
     /// minimum weight to spend an output controlled by the given descriptor if
     /// it is possible to construct one using the `satisfier`.
-    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error>
+    pub fn get_satisfaction_mall<S>(&self, satisfier: S) -> Result<(Vec<Vec<u8>>, Script), Error>
     where
         S: Satisfier<Pk>,
     {

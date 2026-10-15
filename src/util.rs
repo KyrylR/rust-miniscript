@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-use core::convert::TryFrom;
-
 use bitcoin::constants::MAX_SCRIPT_ELEMENT_SIZE;
 use bitcoin::hashes::Hash;
-use bitcoin::script::{self, PushBytes, ScriptBuf};
 use bitcoin::PubkeyHash;
+use elements::script;
 
 use crate::miniscript::context;
 use crate::miniscript::satisfy::Placeholder;
@@ -49,7 +47,7 @@ pub(crate) fn witness_size<T: ItemSize>(wit: &[T]) -> usize {
     wit.iter().map(T::size).sum::<usize>() + varint_len(wit.len())
 }
 
-pub(crate) fn witness_to_scriptsig(witness: &[Vec<u8>]) -> ScriptBuf {
+pub(crate) fn witness_to_scriptsig(witness: &[Vec<u8>]) -> elements::Script {
     let mut b = script::Builder::new();
     for (i, wit) in witness.iter().enumerate() {
         if let Ok(n) = script::read_scriptint(wit) {
@@ -60,8 +58,7 @@ pub(crate) fn witness_to_scriptsig(witness: &[Vec<u8>]) -> ScriptBuf {
             } else {
                 assert!(wit.len() <= MAX_SCRIPT_ELEMENT_SIZE, "P2SH redeem script is <= 520 bytes");
             }
-            let push = <&PushBytes>::try_from(wit.as_slice()).expect("checked above");
-            b = b.push_slice(push)
+            b = b.push_slice(wit)
         }
     }
     b.into_script()
@@ -90,7 +87,7 @@ impl MsKeyBuilder for script::Builder {
     {
         match Ctx::sig_type() {
             context::SigType::Ecdsa => self.push_key(&key.to_public_key()),
-            context::SigType::Schnorr => self.push_slice(key.to_x_only_pubkey().serialize()),
+            context::SigType::Schnorr => self.push_slice(&key.to_x_only_pubkey().serialize()),
         }
     }
 
@@ -100,10 +97,11 @@ impl MsKeyBuilder for script::Builder {
         Ctx: ScriptContext,
     {
         match Ctx::sig_type() {
-            context::SigType::Ecdsa => self.push_slice(key.to_public_key().pubkey_hash()),
-            context::SigType::Schnorr => {
-                self.push_slice(PubkeyHash::hash(&key.to_x_only_pubkey().serialize()))
+            context::SigType::Ecdsa => {
+                self.push_slice(key.to_public_key().pubkey_hash().as_byte_array())
             }
+            context::SigType::Schnorr => self
+                .push_slice(PubkeyHash::hash(&key.to_x_only_pubkey().serialize()).as_byte_array()),
         }
     }
 }

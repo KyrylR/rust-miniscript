@@ -12,8 +12,9 @@ use core::{cmp, fmt, mem};
 
 use bitcoin::hashes::hash160;
 use bitcoin::key::XOnlyPublicKey;
-use bitcoin::taproot::{ControlBlock, LeafVersion, TapLeafHash, TapNodeHash};
-use bitcoin::{absolute, relative, ScriptBuf, Sequence};
+use bitcoin::{absolute, relative};
+use elements::secp256k1_zkp;
+use elements::taproot::{ControlBlock, LeafVersion, TapLeafHash, TapNodeHash};
 
 use super::context::SigType;
 use crate::plan::AssetProvider;
@@ -21,8 +22,31 @@ use crate::prelude::*;
 use crate::util::witness_size;
 use crate::{AbsLockTime, Miniscript, MiniscriptKey, RelLockTime, ScriptContext, ToPublicKey};
 
+/// Type alias for an ECDSA signature and its Elements sighash type.
+pub type ElementsSig = (secp256k1_zkp::ecdsa::Signature, elements::EcdsaSighashType);
 /// Type alias for 32 byte Preimage.
 pub type Preimage32 = [u8; 32];
+
+/// Serializes an [`ElementsSig`] as it appears on the stack: DER followed by the sighash byte.
+pub fn elementssig_to_rawsig(sig: &ElementsSig) -> Vec<u8> {
+    let ser_sig = sig.0.serialize_der();
+    let mut raw_sig = Vec::with_capacity(ser_sig.len() + 1);
+    raw_sig.extend_from_slice(&ser_sig);
+    raw_sig.push(sig.1 as u8);
+    raw_sig
+}
+
+/// Parses an [`ElementsSig`] from its stack serialization.
+pub fn elementssig_from_rawsig(rawsig: &[u8]) -> Result<ElementsSig, crate::interpreter::Error> {
+    let (flag, sig) = rawsig
+        .split_last()
+        .ok_or_else(|| crate::interpreter::Error::NonStandardSighash(rawsig.to_vec()))?;
+    let flag = elements::EcdsaSighashType::from_standard(u32::from(*flag))
+        .map_err(|_| crate::interpreter::Error::NonStandardSighash(rawsig.to_vec()))?;
+    let sig = secp256k1_zkp::ecdsa::Signature::from_der(sig)?;
+    Ok((sig, flag))
+}
+
 /// Trait describing a lookup table for signatures, hash preimages, etc.
 ///
 /// Every method has a default implementation that simply returns `None`
@@ -30,24 +54,20 @@ pub type Preimage32 = [u8; 32];
 /// have data for.
 pub trait Satisfier<Pk: MiniscriptKey + ToPublicKey> {
     /// Given a public key, look up an ECDSA signature with that key
-    fn lookup_ecdsa_sig(&self, _: &Pk) -> Option<bitcoin::ecdsa::Signature> { None }
+    fn lookup_ecdsa_sig(&self, _: &Pk) -> Option<ElementsSig> { None }
 
     /// Lookup the tap key spend sig
-    fn lookup_tap_key_spend_sig(&self, _: &Pk) -> Option<bitcoin::taproot::Signature> { None }
+    fn lookup_tap_key_spend_sig(&self, _: &Pk) -> Option<elements::SchnorrSig> { None }
 
     /// Given a public key and a associated leaf hash, look up an schnorr signature with that key
-    fn lookup_tap_leaf_script_sig(
-        &self,
-        _: &Pk,
-        _: &TapLeafHash,
-    ) -> Option<bitcoin::taproot::Signature> {
+    fn lookup_tap_leaf_script_sig(&self, _: &Pk, _: &TapLeafHash) -> Option<elements::SchnorrSig> {
         None
     }
 
     /// Obtain a reference to the control block for a ver and script
     fn lookup_tap_control_block_map(
         &self,
-    ) -> Option<&BTreeMap<ControlBlock, (bitcoin::ScriptBuf, LeafVersion)>> {
+    ) -> Option<&BTreeMap<ControlBlock, (elements::Script, LeafVersion)>> {
         None
     }
 
@@ -65,7 +85,7 @@ pub trait Satisfier<Pk: MiniscriptKey + ToPublicKey> {
     fn lookup_raw_pkh_ecdsa_sig(
         &self,
         _: &hash160::Hash,
-    ) -> Option<(bitcoin::PublicKey, bitcoin::ecdsa::Signature)> {
+    ) -> Option<(bitcoin::PublicKey, ElementsSig)> {
         None
     }
 
@@ -77,7 +97,7 @@ pub trait Satisfier<Pk: MiniscriptKey + ToPublicKey> {
     fn lookup_raw_pkh_tap_leaf_script_sig(
         &self,
         _: &(hash160::Hash, TapLeafHash),
-    ) -> Option<(XOnlyPublicKey, bitcoin::taproot::Signature)> {
+    ) -> Option<(XOnlyPublicKey, elements::SchnorrSig)> {
         None
     }
 
@@ -113,13 +133,20 @@ pub trait Satisfier<Pk: MiniscriptKey + ToPublicKey> {
 // Allow use of `()` as a "no conditions available" satisfier
 impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for () {}
 
-impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for Sequence {
+impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for elements::Sequence {
     fn check_older(&self, n: relative::LockTime) -> bool {
-        if let Some(lt) = self.to_relative_lock_time() {
+        if let Some(lt) = bitcoin::Sequence(self.to_consensus_u32()).to_relative_lock_time() {
             Satisfier::<Pk>::check_older(&lt, n)
         } else {
             false
         }
+    }
+}
+
+impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk> for elements::LockTime {
+    fn check_after(&self, n: absolute::LockTime) -> bool {
+        let lock_time = absolute::LockTime::from_consensus(self.to_consensus_u32());
+        Satisfier::<Pk>::check_after(&lock_time, n)
     }
 }
 
@@ -141,9 +168,9 @@ macro_rules! impl_satisfier_for_map_key_to_ecdsa_sig {
     ($(#[$($attr:meta)*])* impl Satisfier<Pk> for $map:ident<$key:ty, $val:ty>) => {
         $(#[$($attr)*])*
         impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk>
-            for $map<Pk, bitcoin::ecdsa::Signature>
+            for $map<Pk, ElementsSig>
         {
-            fn lookup_ecdsa_sig(&self, key: &Pk) -> Option<bitcoin::ecdsa::Signature> {
+            fn lookup_ecdsa_sig(&self, key: &Pk) -> Option<ElementsSig> {
                 self.get(key).copied()
             }
         }
@@ -151,25 +178,25 @@ macro_rules! impl_satisfier_for_map_key_to_ecdsa_sig {
 }
 
 impl_satisfier_for_map_key_to_ecdsa_sig! {
-    impl Satisfier<Pk> for BTreeMap<Pk, bitcoin::ecdsa::Signature>
+    impl Satisfier<Pk> for BTreeMap<Pk, ElementsSig>
 }
 
 impl_satisfier_for_map_key_to_ecdsa_sig! {
     #[cfg(feature = "std")]
-    impl Satisfier<Pk> for HashMap<Pk, bitcoin::ecdsa::Signature>
+    impl Satisfier<Pk> for HashMap<Pk, ElementsSig>
 }
 
 macro_rules! impl_satisfier_for_map_key_hash_to_taproot_sig {
     ($(#[$($attr:meta)*])* impl Satisfier<Pk> for $map:ident<$key:ty, $val:ty>) => {
         $(#[$($attr)*])*
         impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk>
-            for $map<(Pk, TapLeafHash), bitcoin::taproot::Signature>
+            for $map<(Pk, TapLeafHash), elements::SchnorrSig>
         {
             fn lookup_tap_leaf_script_sig(
                 &self,
                 key: &Pk,
                 h: &TapLeafHash,
-            ) -> Option<bitcoin::taproot::Signature> {
+            ) -> Option<elements::SchnorrSig> {
                 // Unfortunately, there is no way to get a &(a, b) from &a and &b without allocating
                 // If we change the signature the of lookup_tap_leaf_script_sig to accept a tuple. We would
                 // face the same problem while satisfying PkK.
@@ -181,23 +208,23 @@ macro_rules! impl_satisfier_for_map_key_hash_to_taproot_sig {
 }
 
 impl_satisfier_for_map_key_hash_to_taproot_sig! {
-    impl Satisfier<Pk> for BTreeMap<(Pk, TapLeafHash), bitcoin::taproot::Signature>
+    impl Satisfier<Pk> for BTreeMap<(Pk, TapLeafHash), elements::SchnorrSig>
 }
 
 impl_satisfier_for_map_key_hash_to_taproot_sig! {
     #[cfg(feature = "std")]
-    impl Satisfier<Pk> for HashMap<(Pk, TapLeafHash), bitcoin::taproot::Signature>
+    impl Satisfier<Pk> for HashMap<(Pk, TapLeafHash), elements::SchnorrSig>
 }
 
 macro_rules! impl_satisfier_for_map_hash_to_key_ecdsa_sig {
     ($(#[$($attr:meta)*])* impl Satisfier<Pk> for $map:ident<$key:ty, $val:ty>) => {
         $(#[$($attr)*])*
         impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk>
-            for $map<hash160::Hash, (Pk, bitcoin::ecdsa::Signature)>
+            for $map<hash160::Hash, (Pk, ElementsSig)>
         where
             Pk: MiniscriptKey + ToPublicKey,
         {
-            fn lookup_ecdsa_sig(&self, key: &Pk) -> Option<bitcoin::ecdsa::Signature> {
+            fn lookup_ecdsa_sig(&self, key: &Pk) -> Option<ElementsSig> {
                 self.get(&key.to_pubkeyhash(SigType::Ecdsa)).map(|x| x.1)
             }
 
@@ -208,7 +235,7 @@ macro_rules! impl_satisfier_for_map_hash_to_key_ecdsa_sig {
             fn lookup_raw_pkh_ecdsa_sig(
                 &self,
                 pk_hash: &hash160::Hash,
-            ) -> Option<(bitcoin::PublicKey, bitcoin::ecdsa::Signature)> {
+            ) -> Option<(bitcoin::PublicKey, ElementsSig)> {
                 self.get(pk_hash)
                     .map(|&(ref pk, sig)| (pk.to_public_key(), sig))
             }
@@ -217,19 +244,19 @@ macro_rules! impl_satisfier_for_map_hash_to_key_ecdsa_sig {
 }
 
 impl_satisfier_for_map_hash_to_key_ecdsa_sig! {
-    impl Satisfier<Pk> for BTreeMap<hash160::Hash, (Pk, bitcoin::ecdsa::Signature)>
+    impl Satisfier<Pk> for BTreeMap<hash160::Hash, (Pk, ElementsSig)>
 }
 
 impl_satisfier_for_map_hash_to_key_ecdsa_sig! {
     #[cfg(feature = "std")]
-    impl Satisfier<Pk> for HashMap<hash160::Hash, (Pk, bitcoin::ecdsa::Signature)>
+    impl Satisfier<Pk> for HashMap<hash160::Hash, (Pk, ElementsSig)>
 }
 
 macro_rules! impl_satisfier_for_map_hash_tapleafhash_to_key_taproot_sig {
     ($(#[$($attr:meta)*])* impl Satisfier<Pk> for $map:ident<$key:ty, $val:ty>) => {
         $(#[$($attr)*])*
         impl<Pk: MiniscriptKey + ToPublicKey> Satisfier<Pk>
-            for $map<(hash160::Hash, TapLeafHash), (Pk, bitcoin::taproot::Signature)>
+            for $map<(hash160::Hash, TapLeafHash), (Pk, elements::SchnorrSig)>
         where
             Pk: MiniscriptKey + ToPublicKey,
         {
@@ -237,7 +264,7 @@ macro_rules! impl_satisfier_for_map_hash_tapleafhash_to_key_taproot_sig {
                 &self,
                 key: &Pk,
                 h: &TapLeafHash,
-            ) -> Option<bitcoin::taproot::Signature> {
+            ) -> Option<elements::SchnorrSig> {
                 self.get(&(key.to_pubkeyhash(SigType::Schnorr), *h))
                     .map(|x| x.1)
             }
@@ -245,7 +272,7 @@ macro_rules! impl_satisfier_for_map_hash_tapleafhash_to_key_taproot_sig {
             fn lookup_raw_pkh_tap_leaf_script_sig(
                 &self,
                 pk_hash: &(hash160::Hash, TapLeafHash),
-            ) -> Option<(XOnlyPublicKey, bitcoin::taproot::Signature)> {
+            ) -> Option<(XOnlyPublicKey, elements::SchnorrSig)> {
                 self.get(pk_hash)
                     .map(|&(ref pk, sig)| (pk.to_x_only_pubkey(), sig))
             }
@@ -254,24 +281,18 @@ macro_rules! impl_satisfier_for_map_hash_tapleafhash_to_key_taproot_sig {
 }
 
 impl_satisfier_for_map_hash_tapleafhash_to_key_taproot_sig! {
-    impl Satisfier<Pk> for BTreeMap<(hash160::Hash, TapLeafHash), (Pk, bitcoin::taproot::Signature)>
+    impl Satisfier<Pk> for BTreeMap<(hash160::Hash, TapLeafHash), (Pk, elements::SchnorrSig)>
 }
 
 impl_satisfier_for_map_hash_tapleafhash_to_key_taproot_sig! {
     #[cfg(feature = "std")]
-    impl Satisfier<Pk> for HashMap<(hash160::Hash, TapLeafHash), (Pk, bitcoin::taproot::Signature)>
+    impl Satisfier<Pk> for HashMap<(hash160::Hash, TapLeafHash), (Pk, elements::SchnorrSig)>
 }
 
 impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &S {
-    fn lookup_ecdsa_sig(&self, p: &Pk) -> Option<bitcoin::ecdsa::Signature> {
-        (**self).lookup_ecdsa_sig(p)
-    }
+    fn lookup_ecdsa_sig(&self, p: &Pk) -> Option<ElementsSig> { (**self).lookup_ecdsa_sig(p) }
 
-    fn lookup_tap_leaf_script_sig(
-        &self,
-        p: &Pk,
-        h: &TapLeafHash,
-    ) -> Option<bitcoin::taproot::Signature> {
+    fn lookup_tap_leaf_script_sig(&self, p: &Pk, h: &TapLeafHash) -> Option<elements::SchnorrSig> {
         (**self).lookup_tap_leaf_script_sig(p, h)
     }
 
@@ -286,24 +307,24 @@ impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &S {
     fn lookup_raw_pkh_ecdsa_sig(
         &self,
         pkh: &hash160::Hash,
-    ) -> Option<(bitcoin::PublicKey, bitcoin::ecdsa::Signature)> {
+    ) -> Option<(bitcoin::PublicKey, ElementsSig)> {
         (**self).lookup_raw_pkh_ecdsa_sig(pkh)
     }
 
-    fn lookup_tap_key_spend_sig(&self, pk: &Pk) -> Option<bitcoin::taproot::Signature> {
+    fn lookup_tap_key_spend_sig(&self, pk: &Pk) -> Option<elements::SchnorrSig> {
         (**self).lookup_tap_key_spend_sig(pk)
     }
 
     fn lookup_raw_pkh_tap_leaf_script_sig(
         &self,
         pkh: &(hash160::Hash, TapLeafHash),
-    ) -> Option<(XOnlyPublicKey, bitcoin::taproot::Signature)> {
+    ) -> Option<(XOnlyPublicKey, elements::SchnorrSig)> {
         (**self).lookup_raw_pkh_tap_leaf_script_sig(pkh)
     }
 
     fn lookup_tap_control_block_map(
         &self,
-    ) -> Option<&BTreeMap<ControlBlock, (bitcoin::ScriptBuf, LeafVersion)>> {
+    ) -> Option<&BTreeMap<ControlBlock, (elements::Script, LeafVersion)>> {
         (**self).lookup_tap_control_block_map()
     }
 
@@ -323,19 +344,13 @@ impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &S {
 }
 
 impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &mut S {
-    fn lookup_ecdsa_sig(&self, p: &Pk) -> Option<bitcoin::ecdsa::Signature> {
-        (**self).lookup_ecdsa_sig(p)
-    }
+    fn lookup_ecdsa_sig(&self, p: &Pk) -> Option<ElementsSig> { (**self).lookup_ecdsa_sig(p) }
 
-    fn lookup_tap_leaf_script_sig(
-        &self,
-        p: &Pk,
-        h: &TapLeafHash,
-    ) -> Option<bitcoin::taproot::Signature> {
+    fn lookup_tap_leaf_script_sig(&self, p: &Pk, h: &TapLeafHash) -> Option<elements::SchnorrSig> {
         (**self).lookup_tap_leaf_script_sig(p, h)
     }
 
-    fn lookup_tap_key_spend_sig(&self, pk: &Pk) -> Option<bitcoin::taproot::Signature> {
+    fn lookup_tap_key_spend_sig(&self, pk: &Pk) -> Option<elements::SchnorrSig> {
         (**self).lookup_tap_key_spend_sig(pk)
     }
 
@@ -350,20 +365,20 @@ impl<Pk: MiniscriptKey + ToPublicKey, S: Satisfier<Pk>> Satisfier<Pk> for &mut S
     fn lookup_raw_pkh_ecdsa_sig(
         &self,
         pkh: &hash160::Hash,
-    ) -> Option<(bitcoin::PublicKey, bitcoin::ecdsa::Signature)> {
+    ) -> Option<(bitcoin::PublicKey, ElementsSig)> {
         (**self).lookup_raw_pkh_ecdsa_sig(pkh)
     }
 
     fn lookup_raw_pkh_tap_leaf_script_sig(
         &self,
         pkh: &(hash160::Hash, TapLeafHash),
-    ) -> Option<(XOnlyPublicKey, bitcoin::taproot::Signature)> {
+    ) -> Option<(XOnlyPublicKey, elements::SchnorrSig)> {
         (**self).lookup_raw_pkh_tap_leaf_script_sig(pkh)
     }
 
     fn lookup_tap_control_block_map(
         &self,
-    ) -> Option<&BTreeMap<ControlBlock, (bitcoin::ScriptBuf, LeafVersion)>> {
+    ) -> Option<&BTreeMap<ControlBlock, (elements::Script, LeafVersion)>> {
         (**self).lookup_tap_control_block_map()
     }
 
@@ -390,7 +405,7 @@ macro_rules! impl_tuple_satisfier {
             Pk: MiniscriptKey + ToPublicKey,
             $($ty: Satisfier< Pk>,)*
         {
-            fn lookup_ecdsa_sig(&self, key: &Pk) -> Option<bitcoin::ecdsa::Signature> {
+            fn lookup_ecdsa_sig(&self, key: &Pk) -> Option<ElementsSig> {
                 let &($(ref $ty,)*) = self;
                 $(
                     if let Some(result) = $ty.lookup_ecdsa_sig(key) {
@@ -400,7 +415,7 @@ macro_rules! impl_tuple_satisfier {
                 None
             }
 
-            fn lookup_tap_key_spend_sig(&self, pk: &Pk) -> Option<bitcoin::taproot::Signature> {
+            fn lookup_tap_key_spend_sig(&self, pk: &Pk) -> Option<elements::SchnorrSig> {
                 let &($(ref $ty,)*) = self;
                 $(
                     if let Some(result) = $ty.lookup_tap_key_spend_sig(pk) {
@@ -410,7 +425,7 @@ macro_rules! impl_tuple_satisfier {
                 None
             }
 
-            fn lookup_tap_leaf_script_sig(&self, key: &Pk, h: &TapLeafHash) -> Option<bitcoin::taproot::Signature> {
+            fn lookup_tap_leaf_script_sig(&self, key: &Pk, h: &TapLeafHash) -> Option<elements::SchnorrSig> {
                 let &($(ref $ty,)*) = self;
                 $(
                     if let Some(result) = $ty.lookup_tap_leaf_script_sig(key, h) {
@@ -423,7 +438,7 @@ macro_rules! impl_tuple_satisfier {
             fn lookup_raw_pkh_ecdsa_sig(
                 &self,
                 key_hash: &hash160::Hash,
-            ) -> Option<(bitcoin::PublicKey, bitcoin::ecdsa::Signature)> {
+            ) -> Option<(bitcoin::PublicKey, ElementsSig)> {
                 let &($(ref $ty,)*) = self;
                 $(
                     if let Some(result) = $ty.lookup_raw_pkh_ecdsa_sig(key_hash) {
@@ -436,7 +451,7 @@ macro_rules! impl_tuple_satisfier {
             fn lookup_raw_pkh_tap_leaf_script_sig(
                 &self,
                 key_hash: &(hash160::Hash, TapLeafHash),
-            ) -> Option<(XOnlyPublicKey, bitcoin::taproot::Signature)> {
+            ) -> Option<(XOnlyPublicKey, elements::SchnorrSig)> {
                 let &($(ref $ty,)*) = self;
                 $(
                     if let Some(result) = $ty.lookup_raw_pkh_tap_leaf_script_sig(key_hash) {
@@ -473,7 +488,7 @@ macro_rules! impl_tuple_satisfier {
 
             fn lookup_tap_control_block_map(
                 &self,
-            ) -> Option<&BTreeMap<ControlBlock, (bitcoin::ScriptBuf, LeafVersion)>> {
+            ) -> Option<&BTreeMap<ControlBlock, (elements::Script, LeafVersion)>> {
                 let &($(ref $ty,)*) = self;
                 $(
                     if let Some(result) = $ty.lookup_tap_control_block_map() {
@@ -602,7 +617,7 @@ pub enum Placeholder<Pk: MiniscriptKey> {
     /// \<empty item\>
     PushZero,
     /// Taproot leaf script
-    TapScript(ScriptBuf),
+    TapScript(elements::Script),
     /// Taproot control block
     TapControlBlock(ControlBlock),
 }
@@ -667,8 +682,10 @@ impl<Pk: MiniscriptKey + ToPublicKey> Placeholder<Pk> {
             Self::Sha256Preimage(h) => sat.lookup_sha256(h).map(|p| p.to_vec()),
             Self::Hash160Preimage(h) => sat.lookup_hash160(h).map(|p| p.to_vec()),
             Self::Ripemd160Preimage(h) => sat.lookup_ripemd160(h).map(|p| p.to_vec()),
-            Self::EcdsaSigPk(pk) => sat.lookup_ecdsa_sig(pk).map(|s| s.to_vec()),
-            Self::EcdsaSigPkHash(pkh) => sat.lookup_raw_pkh_ecdsa_sig(pkh).map(|(_, s)| s.to_vec()),
+            Self::EcdsaSigPk(pk) => sat.lookup_ecdsa_sig(pk).map(|s| elementssig_to_rawsig(&s)),
+            Self::EcdsaSigPkHash(pkh) => sat
+                .lookup_raw_pkh_ecdsa_sig(pkh)
+                .map(|(_, s)| elementssig_to_rawsig(&s)),
             Self::SchnorrSigPk(pk, SchnorrSigType::ScriptSpend { leaf_hash }, size) => sat
                 .lookup_tap_leaf_script_sig(pk, leaf_hash)
                 .map(|s| s.to_vec())
@@ -1212,9 +1229,16 @@ mod tests {
 
     use bitcoin::{absolute, relative, PublicKey};
 
-    use super::{Satisfaction, Witness};
+    use super::{elementssig_to_rawsig, ElementsSig, Satisfaction, Witness};
     use crate::descriptor::Descriptor;
     use crate::{Miniscript, Segwitv0};
+
+    fn dummy_sig() -> ElementsSig {
+        (
+            secp256k1::ecdsa::Signature::from_compact(&[1; 64]).unwrap(),
+            elements::EcdsaSighashType::All,
+        )
+    }
 
     #[test]
     fn regression_1037() {
@@ -1222,9 +1246,7 @@ mod tests {
             "02eb64639a17f7334bb5a1a3aad857d6fec65faef439db3de72f85c88bc2906ad1",
         )
         .unwrap();
-        let sig = bitcoin::ecdsa::Signature::sighash_all(
-            secp256k1::ecdsa::Signature::from_compact(&[1; 64]).unwrap(),
-        );
+        let sig = dummy_sig();
         let mut signatures = std::collections::BTreeMap::new();
         signatures.insert(key, sig);
         let satisfier = (
@@ -1246,7 +1268,7 @@ mod tests {
             // Only the first timelock is met. The mandatory signature prevents
             // a third party from changing the transaction's timelock to select
             // the other branch, so this witness is actually non-malleable.
-            let expected = vec![vec![1], sig.to_vec()];
+            let expected = vec![vec![1], elementssig_to_rawsig(&sig)];
             assert_eq!(ms.satisfy_malleable(&satisfier).unwrap(), expected);
 
             // FIXME: The root's erased signature property makes the unmet
@@ -1293,9 +1315,7 @@ mod tests {
                 .unwrap(),
         ];
         let available_key_map = {
-            let dummy_sig = bitcoin::ecdsa::Signature::sighash_all(
-                secp256k1::ecdsa::Signature::from_compact(&[1; 64]).unwrap(),
-            );
+            let dummy_sig = dummy_sig();
             let mut map = std::collections::BTreeMap::new();
             map.insert(
                 crate::DefiniteDescriptorKey::new(available_keys[0].into()).unwrap(),
@@ -1366,7 +1386,7 @@ mod tests {
         // we "did not notice" the after(144) since it appears as part of a dissatisfaction,
         // leading to a plan that did not match the actual timelock requirement.
         let descriptor_str = format!(
-            "wsh(or_b(n:or_i(and_v(v:after(144),and_v(v:pk({}),pk({}))),{expensive_threshold}),ajt:and_v(v:after(50),v:pk({}))))",
+            "elwsh(or_b(n:or_i(and_v(v:after(144),and_v(v:pk({}),pk({}))),{expensive_threshold}),ajt:and_v(v:after(50),v:pk({}))))",
             available_keys[0], unavailable_keys[0], available_keys[1],
         );
         // Need DefiniteDescriptorKey https://github.com/rust-bitcoin/rust-miniscript/issues/927
@@ -1387,7 +1407,7 @@ mod tests {
         // becomes `Witness::Impossible`. Plan building then fails or selects an alternate path.
         // Parallel per-kind tracking remains future work (see #979 discussion).
         let descriptor_str = format!(
-            "wsh(or_b(n:or_i(and_v(v:after(144),and_v(v:pk({}),pk({}))),{expensive_threshold}),ajt:and_v(v:after(1000000000),v:pk({}))))",
+            "elwsh(or_b(n:or_i(and_v(v:after(144),and_v(v:pk({}),pk({}))),{expensive_threshold}),ajt:and_v(v:after(1000000000),v:pk({}))))",
             available_keys[0], unavailable_keys[0], available_keys[1],
         );
         let descriptor =

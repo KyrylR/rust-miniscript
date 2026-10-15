@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use miniscript::bitcoin::consensus::encode::deserialize_hex;
-use miniscript::bitcoin::psbt::{self, Psbt};
-use miniscript::bitcoin::sighash::SighashCache;
-use miniscript::bitcoin::{
-    secp256k1, transaction, Address, Amount, Network, OutPoint, PrivateKey, Script, Sequence,
-    Transaction, TxIn, TxOut,
+use elements_miniscript::bitcoin::{secp256k1, PrivateKey};
+use elements_miniscript::elements::encode::serialize_hex;
+use elements_miniscript::elements::pset::{self, PartiallySignedTransaction as Psbt};
+use elements_miniscript::elements::sighash::SighashCache;
+use elements_miniscript::elements::{
+    confidential, Address, AddressParams, AssetId, BlockHash, EcdsaSighashType, LockTime, OutPoint,
+    Script, Sequence, Transaction, TxIn, TxOut, Txid,
 };
-use miniscript::psbt::{PsbtExt, PsbtInputExt};
-use miniscript::Descriptor;
+use elements_miniscript::psbt::{PsbtExt, PsbtInputExt};
+use elements_miniscript::{elementssig_to_rawsig, Descriptor};
 
 fn main() {
     let secp256k1 = secp256k1::Secp256k1::new();
 
-    let s = "wsh(t:or_c(pk(027a3565454fe1b749bccaef22aff72843a9c3efefd7b16ac54537a0c23f0ec0de),v:thresh(1,pkh(032d672a1a91cc39d154d366cd231983661b0785c7f27bc338447565844f4a6813),a:pkh(03417129311ed34c242c012cd0a3e0b9bca0065f742d0dfb63c78083ea6a02d4d9),a:pkh(025a687659658baeabdfc415164528065be7bcaade19342241941e556557f01e28))))#7hut9ukn";
+    let s = "elwsh(t:or_c(pk(027a3565454fe1b749bccaef22aff72843a9c3efefd7b16ac54537a0c23f0ec0de),v:thresh(1,pkh(032d672a1a91cc39d154d366cd231983661b0785c7f27bc338447565844f4a6813),a:pkh(03417129311ed34c242c012cd0a3e0b9bca0065f742d0dfb63c78083ea6a02d4d9),a:pkh(025a687659658baeabdfc415164528065be7bcaade19342241941e556557f01e28))))#tdp6ld3e";
     let bridge_descriptor = Descriptor::from_str(s).unwrap();
     //let bridge_descriptor = Descriptor::<bitcoin::PublicKey>::from_str(&s).expect("parse descriptor string");
     println!("Bridge pubkey script: {}", bridge_descriptor.script_pubkey());
-    println!("Bridge address: {}", bridge_descriptor.address(Network::Regtest).unwrap());
+    println!(
+        "Bridge address: {}",
+        bridge_descriptor.address(&AddressParams::ELEMENTS).unwrap()
+    );
     println!(
         "Weight for witness satisfaction cost {}",
         bridge_descriptor.max_weight_to_satisfy().unwrap()
@@ -50,71 +53,69 @@ fn main() {
     println!("Backup3 public key: {}", _backup3_private.public_key(&secp256k1));
 
     let spend_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::from_consensus(5000),
+        version: 2,
+        lock_time: LockTime::from_height(5000).unwrap(),
         input: vec![],
         output: vec![],
     };
 
     // Spend one input and spend one output for simplicity.
-    let mut psbt = Psbt {
-        unsigned_tx: spend_tx,
-        unknown: BTreeMap::new(),
-        proprietary: BTreeMap::new(),
-        xpub: BTreeMap::new(),
-        version: 0,
-        inputs: vec![],
-        outputs: vec![],
-    };
-
-    let hex_tx = "020000000001018ff27041f3d738f5f84fd5ee62f1c5b36afebfb15f6da0c9d1382ddd0eaaa23c0000000000feffffff02b3884703010000001600142ca3b4e53f17991582d47b15a053b3201891df5200e1f50500000000220020c0ebf552acd2a6f5dee4e067daaef17b3521e283aeaa44a475278617e3d2238a0247304402207b820860a9d425833f729775880b0ed59dd12b64b9a3d1ab677e27e4d6b370700220576003163f8420fe0b9dc8df726cff22cbc191104a2d4ae4f9dfedb087fcec72012103817e1da42a7701df4db94db8576f0e3605f3ab3701608b7e56f92321e4d8999100000000";
-    let depo_tx: Transaction = deserialize_hex(hex_tx).unwrap();
-
-    let receiver = Address::from_str("bcrt1qsdks5za4t6sevaph6tz9ddfjzvhkdkxe9tfrcy")
-        .unwrap()
-        .assume_checked();
+    let mut psbt = Psbt::from_tx(spend_tx);
 
     let amount = 100000000;
 
+    // In practice the deposit transaction comes from the chain; here it pays the
+    // bridge from an arbitrary outpoint.
+    let depo_tx = deposit_transaction(bridge_descriptor.script_pubkey(), amount);
+
+    let receiver =
+        Address::from_str("ert1qpq2cfgz5lktxzr5zqv7nrzz46hsvq3492ump9pz8rzcl8wqtwqcs2yqnuv")
+            .unwrap();
+
     let (outpoint, witness_utxo) = get_vout(&depo_tx, &bridge_descriptor.script_pubkey());
 
-    let txin = TxIn {
-        previous_output: outpoint,
-        sequence: Sequence::from_height(26),
-        ..Default::default()
-    };
-    psbt.unsigned_tx.input.push(txin);
+    let mut input = pset::Input::from_prevout(outpoint);
+    input.sequence = Some(Sequence::from_height(26));
+    psbt.add_input(input);
 
-    psbt.unsigned_tx.output.push(TxOut {
-        script_pubkey: receiver.script_pubkey(),
-        value: Amount::from_sat(amount / 5 - 500),
-    });
+    psbt.add_output(pset::Output::new_explicit(
+        receiver.script_pubkey(),
+        amount / 5 - 500,
+        bitcoin_asset(),
+        None,
+    ));
 
-    psbt.unsigned_tx.output.push(TxOut {
-        script_pubkey: bridge_descriptor.script_pubkey(),
-        value: Amount::from_sat(amount * 4 / 5),
-    });
+    psbt.add_output(pset::Output::new_explicit(
+        bridge_descriptor.script_pubkey(),
+        amount * 4 / 5,
+        bitcoin_asset(),
+        None,
+    ));
+
+    // Elements transactions pay their fee in an explicit output with an empty script pubkey.
+    psbt.add_output(pset::Output::new_explicit(Script::new(), 500, bitcoin_asset(), None));
 
     // Generating signatures & witness data
 
-    let mut input = psbt::Input::default();
-    input
+    psbt.inputs_mut()[0]
         .update_with_descriptor_unchecked(&bridge_descriptor)
         .unwrap();
 
-    input.witness_utxo = Some(witness_utxo.clone());
-    psbt.inputs.push(input);
-    psbt.outputs.push(psbt::Output::default());
+    psbt.inputs_mut()[0].witness_utxo = Some(witness_utxo.clone());
 
-    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+    let unsigned_tx = psbt.extract_tx().expect("failed to extract unsigned tx");
+    let mut sighash_cache = SighashCache::new(&unsigned_tx);
+
+    // Only Taproot sighashes commit to the chain's genesis hash, so any value will do here.
+    let genesis_hash = BlockHash::from_byte_array([0; 32]);
 
     let msg = psbt
-        .sighash_msg(0, &mut sighash_cache, None)
+        .sighash_msg(0, &mut sighash_cache, None, genesis_hash)
         .unwrap()
         .to_secp_msg();
 
     // Fixme: Take a parameter
-    let hash_ty = bitcoin::sighash::EcdsaSighashType::All;
+    let hash_ty = EcdsaSighashType::All;
 
     let sk1 = backup1_private.inner;
     let sk2 = backup2_private.inner;
@@ -129,26 +130,55 @@ fn main() {
     let pk2 = backup2_private.public_key(&secp256k1);
     assert!(secp256k1.verify_ecdsa(&msg, &sig2, &pk2.inner).is_ok());
 
-    psbt.inputs[0]
+    psbt.inputs_mut()[0]
         .partial_sigs
-        .insert(pk1, bitcoin::ecdsa::Signature { signature: sig1, sighash_type: hash_ty });
+        .insert(pk1, elementssig_to_rawsig(&(sig1, hash_ty)));
 
     println!("{:#?}", psbt);
     println!("{}", psbt);
 
-    psbt.finalize_mut(&secp256k1).unwrap();
+    psbt.finalize_mut(&secp256k1, genesis_hash).unwrap();
     println!("{:#?}", psbt);
 
     let tx = psbt.extract_tx().expect("failed to extract tx");
-    println!("{}", bitcoin::consensus::encode::serialize_hex(&tx));
+    println!("{}", serialize_hex(&tx));
 }
 
 // Find the Outpoint by spk
 fn get_vout(tx: &Transaction, spk: &Script) -> (OutPoint, TxOut) {
     for (i, txout) in tx.clone().output.into_iter().enumerate() {
         if spk == &txout.script_pubkey {
-            return (OutPoint::new(tx.compute_txid(), i as u32), txout);
+            return (OutPoint::new(tx.txid(), i as u32), txout);
         }
     }
     panic!("Only call get vout on functions which have the expected outpoint");
+}
+
+// An arbitrary asset standing in for the chain's policy asset.
+fn bitcoin_asset() -> AssetId { AssetId::LIQUID_BTC }
+
+// A transaction paying `amount` to `spk` from an arbitrary outpoint.
+fn deposit_transaction(spk: Script, amount: u64) -> Transaction {
+    let explicit_txout = |script_pubkey, value| TxOut {
+        asset: confidential::Asset::Explicit(bitcoin_asset()),
+        value: confidential::Value::Explicit(value),
+        script_pubkey,
+        ..Default::default()
+    };
+    Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([0x3c; 32]), 0),
+            is_pegin: false,
+            script_sig: Script::new(),
+            sequence: Sequence::MAX,
+            asset_issuance: Default::default(),
+            witness: Default::default(),
+        }],
+        output: vec![
+            explicit_txout(spk, amount),
+            explicit_txout(Script::new(), 1_000),
+        ],
+    }
 }

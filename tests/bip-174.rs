@@ -1,30 +1,100 @@
 // SPDX-License-Identifier: CC0-1.0
 
-use bitcoin::consensus::encode::deserialize;
-use bitcoin::psbt::Psbt;
-use miniscript::psbt::PsbtExt;
+//! The BIP 174 finalizer and extractor flow over an Elements PSET.
+//!
+//! BIP 174's test vectors are Bitcoin PSBTs, which this Elements crate does not
+//! handle. This runs the same flow as those vectors, a P2SH multisig input and a
+//! P2SH-wrapped P2WSH multisig input that are finalized and then extracted, on a
+//! PSET whose keys, signatures and transaction are built here.
 
-fn main() {
-    // Test vectors from BIP 174
+use std::str::FromStr;
 
-    let mut psbt = Psbt::deserialize(&hex::decode_to_vec("70736274ff01009a020000000258e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd750000000000ffffffff838d0427d0ec650a68aa46bb0b098aea4422c071b2ca78352a077959d07cea1d0100000000ffffffff0270aaf00800000000160014d85c2b71d0060b09c9886aeb815e50991dda124d00e1f5050000000016001400aea9a2e5f0f876a588df5546e8742d1d87008f00000000000100bb0200000001aad73931018bd25f84ae400b68848be09db706eac2ac18298babee71ab656f8b0000000048473044022058f6fc7c6a33e1b31548d481c826c015bd30135aad42cd67790dab66d2ad243b02204a1ced2604c6735b6393e5b41691dd78b00f0c5942fb9f751856faa938157dba01feffffff0280f0fa020000000017a9140fb9463421696b82c833af241c78c17ddbde493487d0f20a270100000017a91429ca74f8a08f81999428185c97b5d852e4063f6187650000002202029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f473044022074018ad4180097b873323c0015720b3684cc8123891048e7dbcd9b55ad679c99022073d369b740e3eb53dcefa33823c8070514ca55a7dd9544f157c167913261118c01220202dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d7483045022100f61038b308dc1da865a34852746f015772934208c6d24454393cd99bdf2217770220056e675a675a6d0a02b85b14e5e29074d8a25a9b5760bea2816f661910a006ea01010304010000000104475221029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f2102dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d752ae2206029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f10d90c6a4f000000800000008000000080220602dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d710d90c6a4f0000008000000080010000800001012000c2eb0b0000000017a914b7f5faf40e3d40a5a459b1db3535f2b72fa921e887220203089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc473044022062eb7a556107a7c73f45ac4ab5a1dddf6f7075fb1275969a7f383efff784bcb202200c05dbb7470dbf2f08557dd356c7325c1ed30913e996cd3840945db12228da5f012202023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e73473044022065f45ba5998b59a27ffe1a7bed016af1f1f90d54b3aa8f7450aa5f56a25103bd02207f724703ad1edb96680b284b56d4ffcb88f7fb759eabbe08aa30f29b851383d2010103040100000001042200208c2353173743b595dfb4a07b72ba8e42e3797da74e87fe7d9d7497e3b2028903010547522103089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc21023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7352ae2206023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7310d90c6a4f000000800000008003000080220603089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc10d90c6a4f00000080000000800200008000220203a9a4c37f5996d3aa25dbac6b570af0650394492942460b354753ed9eeca5877110d90c6a4f000000800000008004000080002202027f6399757d2eff55a136ad02c684b1838b6556e5f1b6b34282a94b6b5005109610d90c6a4f00000080000000800500008000").unwrap()).unwrap();
-    // println!("{:?}", psbt);
+use elements_miniscript::bitcoin::secp256k1::{Secp256k1, SecretKey};
+use elements_miniscript::bitcoin::PublicKey;
+use elements_miniscript::elements::pset::{Input, Output, PartiallySignedTransaction as Psbt};
+use elements_miniscript::elements::sighash::SighashCache;
+use elements_miniscript::elements::{
+    confidential, AssetId, BlockHash, EcdsaSighashType, OutPoint, Script, TxOut, Txid,
+};
+use elements_miniscript::psbt::{PsbtExt, PsbtInputExt};
+use elements_miniscript::{elementssig_to_rawsig, DefiniteDescriptorKey, Descriptor};
 
-    let expected_finalized_psbt = Psbt::deserialize(&hex::decode_to_vec("70736274ff01009a020000000258e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd750000000000ffffffff838d0427d0ec650a68aa46bb0b098aea4422c071b2ca78352a077959d07cea1d0100000000ffffffff0270aaf00800000000160014d85c2b71d0060b09c9886aeb815e50991dda124d00e1f5050000000016001400aea9a2e5f0f876a588df5546e8742d1d87008f00000000000100bb0200000001aad73931018bd25f84ae400b68848be09db706eac2ac18298babee71ab656f8b0000000048473044022058f6fc7c6a33e1b31548d481c826c015bd30135aad42cd67790dab66d2ad243b02204a1ced2604c6735b6393e5b41691dd78b00f0c5942fb9f751856faa938157dba01feffffff0280f0fa020000000017a9140fb9463421696b82c833af241c78c17ddbde493487d0f20a270100000017a91429ca74f8a08f81999428185c97b5d852e4063f6187650000000107da00473044022074018ad4180097b873323c0015720b3684cc8123891048e7dbcd9b55ad679c99022073d369b740e3eb53dcefa33823c8070514ca55a7dd9544f157c167913261118c01483045022100f61038b308dc1da865a34852746f015772934208c6d24454393cd99bdf2217770220056e675a675a6d0a02b85b14e5e29074d8a25a9b5760bea2816f661910a006ea01475221029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f2102dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d752ae0001012000c2eb0b0000000017a914b7f5faf40e3d40a5a459b1db3535f2b72fa921e8870107232200208c2353173743b595dfb4a07b72ba8e42e3797da74e87fe7d9d7497e3b20289030108da0400473044022062eb7a556107a7c73f45ac4ab5a1dddf6f7075fb1275969a7f383efff784bcb202200c05dbb7470dbf2f08557dd356c7325c1ed30913e996cd3840945db12228da5f01473044022065f45ba5998b59a27ffe1a7bed016af1f1f90d54b3aa8f7450aa5f56a25103bd02207f724703ad1edb96680b284b56d4ffcb88f7fb759eabbe08aa30f29b851383d20147522103089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc21023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7352ae00220203a9a4c37f5996d3aa25dbac6b570af0650394492942460b354753ed9eeca5877110d90c6a4f000000800000008004000080002202027f6399757d2eff55a136ad02c684b1838b6556e5f1b6b34282a94b6b5005109610d90c6a4f00000080000000800500008000").unwrap()).unwrap();
+#[test]
+fn finalize_and_extract() {
+    let secp = Secp256k1::new();
+    // Taproot sighashes commit to the chain; these inputs only need a fixed value.
+    let genesis_hash = BlockHash::from_byte_array([0x42; 32]);
+    let keys: Vec<(SecretKey, PublicKey)> = (1..=4u8)
+        .map(|i| {
+            let sk = SecretKey::from_slice(&[i; 32]).unwrap();
+            (sk, PublicKey::new(sk.public_key(&secp)))
+        })
+        .collect();
+    let descs: Vec<Descriptor<DefiniteDescriptorKey>> = [
+        format!("elsh(multi(2,{},{}))", keys[0].1, keys[1].1),
+        format!("elsh(wsh(multi(2,{},{})))", keys[2].1, keys[3].1),
+    ]
+    .iter()
+    .map(|d| Descriptor::from_str(d).unwrap())
+    .collect();
 
-    // Construct a secp context for transaction signature verification
-    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
-    // Assuming all partial sigs are filled in.
-    // Construct a generic finalizer
-    psbt.finalize_mut(&secp).unwrap();
-    // println!("{:?}", psbt);
+    let mut psbt = Psbt::new_v2();
+    for (vout, desc) in descs.iter().enumerate() {
+        let prevout = OutPoint::new(Txid::from_byte_array([1; 32]), vout as u32);
+        let mut input = Input::from_prevout(prevout);
+        input.witness_utxo = Some(TxOut {
+            asset: confidential::Asset::Explicit(AssetId::LIQUID_BTC),
+            value: confidential::Value::Explicit(100_000),
+            script_pubkey: desc.script_pubkey(),
+            ..Default::default()
+        });
+        input.update_with_descriptor_unchecked(desc).unwrap();
+        psbt.add_input(input);
+    }
+    let asset = AssetId::LIQUID_BTC;
+    psbt.add_output(Output::new_explicit(descs[0].script_pubkey(), 190_000, asset, None));
+    // An empty script pubkey marks the Elements fee output.
+    psbt.add_output(Output::new_explicit(Script::new(), 10_000, asset, None));
 
-    assert_eq!(psbt, expected_finalized_psbt);
+    // Each input is signed by both of its keys.
+    let unsigned_tx = psbt.extract_tx().unwrap();
+    let mut cache = SighashCache::new(&unsigned_tx);
+    for (idx, signers) in [&keys[0..2], &keys[2..4]].iter().enumerate() {
+        let msg = psbt
+            .sighash_msg(idx, &mut cache, None, genesis_hash)
+            .unwrap()
+            .to_secp_msg();
+        for (sk, pk) in signers.iter() {
+            let sig = (secp.sign_ecdsa(&msg, sk), EcdsaSighashType::All);
+            psbt.inputs_mut()[idx]
+                .partial_sigs
+                .insert(*pk, elementssig_to_rawsig(&sig));
+        }
+    }
 
-    // Extract the transaction from the psbt
-    let tx = psbt.extract(&secp).unwrap();
+    // Finalizing runs the interpreter over every input.
+    psbt.finalize_mut(&secp, genesis_hash).unwrap();
+    for input in psbt.inputs() {
+        assert!(input.partial_sigs.is_empty());
+        assert!(input.final_script_sig.is_some());
+    }
+    assert!(psbt.inputs()[0].final_script_witness.is_none());
+    // Nested P2WSH multisig: the CHECKMULTISIG dummy, two signatures and the witness script.
+    assert_eq!(
+        psbt.inputs()[1]
+            .final_script_witness
+            .as_ref()
+            .unwrap()
+            .len(),
+        4
+    );
 
-    let expected: bitcoin::Transaction = deserialize(&hex::decode_to_vec("0200000000010258e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd7500000000da00473044022074018ad4180097b873323c0015720b3684cc8123891048e7dbcd9b55ad679c99022073d369b740e3eb53dcefa33823c8070514ca55a7dd9544f157c167913261118c01483045022100f61038b308dc1da865a34852746f015772934208c6d24454393cd99bdf2217770220056e675a675a6d0a02b85b14e5e29074d8a25a9b5760bea2816f661910a006ea01475221029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f2102dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d752aeffffffff838d0427d0ec650a68aa46bb0b098aea4422c071b2ca78352a077959d07cea1d01000000232200208c2353173743b595dfb4a07b72ba8e42e3797da74e87fe7d9d7497e3b2028903ffffffff0270aaf00800000000160014d85c2b71d0060b09c9886aeb815e50991dda124d00e1f5050000000016001400aea9a2e5f0f876a588df5546e8742d1d87008f000400473044022062eb7a556107a7c73f45ac4ab5a1dddf6f7075fb1275969a7f383efff784bcb202200c05dbb7470dbf2f08557dd356c7325c1ed30913e996cd3840945db12228da5f01473044022065f45ba5998b59a27ffe1a7bed016af1f1f90d54b3aa8f7450aa5f56a25103bd02207f724703ad1edb96680b284b56d4ffcb88f7fb759eabbe08aa30f29b851383d20147522103089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc21023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7352ae00000000").unwrap()).unwrap();
-    // println!("{:?}", tx);
-    assert_eq!(tx, expected);
+    // Extracting checks the finalized inputs with the interpreter again.
+    let tx = psbt.extract(&secp, genesis_hash).unwrap();
+    assert_eq!(tx.output, unsigned_tx.output);
+    assert_eq!(tx.input.len(), 2);
+    for (txin, input) in tx.input.iter().zip(psbt.inputs()) {
+        assert_eq!(Some(&txin.script_sig), input.final_script_sig.as_ref());
+        assert_eq!(txin.previous_output, input.previous_outpoint());
+    }
 }

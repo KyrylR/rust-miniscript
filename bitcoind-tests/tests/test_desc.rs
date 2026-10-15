@@ -4,43 +4,39 @@
 //! which we know how to satisfy
 //!
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
 use std::{error, fmt};
 
-use actual_rand as rand;
-use bitcoin::blockdata::witness::Witness;
-use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::key::TapTweak as _;
-use bitcoin::psbt::Psbt;
-use bitcoin::sighash::SighashCache;
-use bitcoin::taproot::{LeafVersion, TapLeafHash};
-use bitcoin::{
-    absolute, psbt, secp256k1, sighash, transaction, Amount, OutPoint, Sequence, Transaction, TxIn,
-    TxOut, Txid,
+use bitcoin::hashes::Hash;
+use elements::hashes::hash160::Hash as ElementsHash160;
+use elements::hashes::ripemd160::Hash as ElementsRipemd160;
+use elements::hashes::sha256::Hash as ElementsSha256;
+use elements::hashes::sha256d::Hash as ElementsSha256d;
+use elements::pset::PartiallySignedTransaction as Psbt;
+use elements::sighash::SighashCache;
+use elements::taproot::{TapLeafHash, TapTweakHash};
+use elements::{
+    confidential, pset as psbt, secp256k1_zkp as secp256k1, sighash, OutPoint, SchnorrSig, Script,
+    Sequence, TxIn, TxOut, Txid,
 };
-use bitcoind::{AddressType, Client};
-use miniscript::bitcoin::{self, ecdsa, taproot, ScriptBuf};
+use elementsd::ElementsD;
 use miniscript::psbt::{PsbtExt, PsbtInputExt};
-use miniscript::{Descriptor, Miniscript, ScriptContext, ToPublicKey};
-mod setup;
-
+use miniscript::{
+    bitcoin, elements, elementssig_to_rawsig, Descriptor, Miniscript, ScriptContext, ToPublicKey,
+};
 use rand::RngCore;
-use setup::test_util::{self, TestData};
-/// Quickly create a BTC amount.
-fn btc<F: Into<f64>>(btc: F) -> Amount { Amount::from_btc(btc.into()).unwrap() }
+mod setup;
+use actual_rand as rand;
+use elements_miniscript as miniscript;
+use setup::test_util::{self, TestData, PARAMS};
+use setup::Call;
 
-// Find the Outpoint by spk
-fn get_vout(cl: &Client, txid: Txid, value: Amount, spk: ScriptBuf) -> (OutPoint, TxOut) {
-    let model = cl
-        .get_transaction(txid)
-        .expect("rpc call failed")
-        .into_model()
-        .expect("conversion to model type failed");
-    let tx = model.tx;
-
+// Find the Outpoint by value.
+// Ideally, we should find by scriptPubkey, but this
+// works for temp test case
+fn get_vout(cl: &ElementsD, txid: Txid, value: u64, spk: Script) -> (OutPoint, TxOut) {
+    let tx = cl.get_transaction(&txid);
     for (i, txout) in tx.output.into_iter().enumerate() {
-        if txout.value == value && spk == txout.script_pubkey {
+        if txout.value == confidential::Value::Explicit(value) && txout.script_pubkey == spk {
             return (OutPoint::new(txid, i as u32), txout);
         }
     }
@@ -70,98 +66,83 @@ impl fmt::Display for DescError {
 impl error::Error for DescError {}
 
 pub fn test_desc_satisfy(
-    cl: &Client,
+    cl: &ElementsD,
     testdata: &TestData,
     descriptor: &str,
-) -> Result<Witness, DescError> {
+) -> Result<Vec<Vec<u8>>, DescError> {
+    /* Convert desc into elements one by adding a prefix*/
+    let descriptor = format!("el{}", descriptor);
+    //
     let secp = secp256k1::Secp256k1::new();
     let sks = &testdata.secretdata.sks;
     let xonly_keypairs = &testdata.secretdata.x_only_keypairs;
     let pks = &testdata.pubdata.pks;
     let x_only_pks = &testdata.pubdata.x_only_pks;
     // Generate some blocks
-    let blocks = cl
-        .generate_to_address(1, &cl.new_address().unwrap())
-        .unwrap();
-    assert_eq!(blocks.0.len(), 1);
+    cl.generate(1);
 
-    let desc = test_util::parse_test_desc(descriptor, &testdata.pubdata)
-        .map_err(|_| DescError::DescParseError)?;
-    let definite_desc = if desc.has_wildcard() {
-        desc.derive_at_index(0).unwrap()
-    } else {
-        desc.into_definite().unwrap()
-    };
+    let definite_desc = test_util::parse_test_desc(&descriptor, &testdata.pubdata)
+        .map_err(|_| DescError::DescParseError)?
+        .derive_at_index(0)
+        .or_fallback()
+        .unwrap();
 
     let derived_desc = definite_desc.derived_descriptor(&secp);
-    let desc_address = derived_desc.address(bitcoin::Network::Regtest);
+    let desc_address = derived_desc.address(&PARAMS); // No blinding
     let desc_address = desc_address.map_err(|_x| DescError::AddressComputationError)?;
 
     // Next send some btc to each address corresponding to the miniscript
-    let txid = cl
-        .send_to_address(&desc_address, btc(1))
-        .expect("rpc call failed")
-        .txid()
-        .expect("conversion to model failed");
-    // Wait for the funds to mature.
-    let blocks = cl
-        .generate_to_address(2, &cl.new_address().unwrap())
-        .unwrap();
-    assert_eq!(blocks.0.len(), 2);
+    let txid = cl.send_to_address(&desc_address, "1"); // 1 BTC
+                                                       // Wait for the funds to mature.
+    cl.generate(2);
     // Create a PSBT for each transaction.
     // Spend one input and spend one output for simplicity.
-    let mut psbt = Psbt {
-        unsigned_tx: Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::from_time(1_603_866_330).expect("valid timestamp"), // 10/28/2020 @ 6:25am (UTC)
-            input: vec![],
-            output: vec![],
-        },
-        unknown: BTreeMap::new(),
-        proprietary: BTreeMap::new(),
-        xpub: BTreeMap::new(),
-        version: 0,
-        inputs: vec![],
-        outputs: vec![],
-    };
+    let mut psbt = Psbt::new_v2();
     // figure out the outpoint from the txid
-    let (outpoint, witness_utxo) = get_vout(cl, txid, btc(1.0), derived_desc.script_pubkey());
+    let (outpoint, witness_utxo) = get_vout(cl, txid, 100_000_000, derived_desc.script_pubkey());
     let txin = TxIn {
         previous_output: outpoint,
-        // set the sequence to a non-final number for the locktime transactions to be
-        // processed correctly.
-        // We waited 2 blocks, keep 1 for safety
+        is_pegin: false,
+        script_sig: Script::new(),
         sequence: Sequence::from_height(1),
-        ..Default::default()
+        asset_issuance: Default::default(),
+        witness: Default::default(),
     };
-    psbt.unsigned_tx.input.push(txin);
+    psbt.add_input(psbt::Input::from_txin(txin));
     // Get a new script pubkey from the node so that
     // the node wallet tracks the receiving transaction
     // and we can check it by gettransaction RPC.
-    let addr = cl.new_address_with_type(AddressType::Bech32).unwrap();
-    // Had to decrease 'value', so that fees can be increased
-    // (Was getting insufficient fees error, for deep script trees)
-    psbt.unsigned_tx
-        .output
-        .push(TxOut { value: Amount::from_sat(99_997_000), script_pubkey: addr.script_pubkey() });
-    let mut input = psbt::Input::default();
-    input
+    let addr = cl.get_new_address();
+    let out = TxOut {
+        // Had to decrease 'value', so that fees can be increased
+        // (Was getting insufficient fees error, for deep script trees)
+        value: confidential::Value::Explicit(99_997_000),
+        script_pubkey: addr.script_pubkey(),
+        asset: witness_utxo.asset,
+        nonce: confidential::Nonce::Null,
+        witness: Default::default(),
+    };
+    psbt.add_output(psbt::Output::from_txout(out));
+    // ELEMENTS: Add fee output
+    let fee_out = TxOut::new_fee(3_000, witness_utxo.asset.explicit().unwrap());
+    psbt.add_output(psbt::Output::from_txout(fee_out));
+
+    psbt.inputs_mut()[0]
         .update_with_descriptor_unchecked(&definite_desc)
         .unwrap();
-    input.witness_utxo = Some(witness_utxo.clone());
-    psbt.inputs.push(input);
-    psbt.outputs.push(psbt::Output::default());
+    psbt.inputs_mut()[0].witness_utxo = Some(witness_utxo.clone());
 
     // --------------------------------------------
     // Sign the transactions with all keys
     // AKA the signer role of psbt
     // Get all the pubkeys and the corresponding secret keys
 
-    let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+    let unsigned_tx = &psbt.extract_tx().unwrap();
+    let mut sighash_cache = SighashCache::new(unsigned_tx);
     match derived_desc {
         Descriptor::Tr(ref tr) => {
             // Fixme: take a parameter
-            let sighash_type = sighash::TapSighashType::Default;
+            let hash_ty = sighash::SchnorrSighashType::Default;
 
             let internal_key_present = x_only_pks
                 .iter()
@@ -172,21 +153,30 @@ pub fn test_desc_satisfy(
 
             if let Some(internal_keypair) = internal_keypair {
                 // ---------------------- Tr key spend --------------------
-                let internal_keypair =
-                    internal_keypair.tap_tweak(&secp, tr.spend_info().merkle_root());
+                let internal_keypair = internal_keypair
+                    .add_xonly_tweak(
+                        &secp,
+                        &TapTweakHash::from_key_and_tweak(
+                            tr.spend_info().internal_key(),
+                            tr.spend_info().merkle_root(),
+                        )
+                        .to_scalar(),
+                    )
+                    .expect("Tweaking failed");
                 let sighash_msg = sighash_cache
-                    .taproot_key_spend_signature_hash(0, &prevouts, sighash_type)
+                    .taproot_key_spend_signature_hash(
+                        0,
+                        &prevouts,
+                        hash_ty,
+                        testdata.pubdata.genesis_hash,
+                    )
                     .unwrap();
-                let msg = secp256k1::Message::from_digest(sighash_msg.to_byte_array());
+                let msg = secp256k1::Message::from_digest_slice(sighash_msg.as_ref()).unwrap();
                 let mut aux_rand = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut aux_rand);
-                let schnorr_sig = secp.sign_schnorr_with_aux_rand(
-                    &msg,
-                    &internal_keypair.to_keypair(),
-                    &aux_rand,
-                );
-                psbt.inputs[0].tap_key_sig =
-                    Some(taproot::Signature { signature: schnorr_sig, sighash_type });
+                let schnorr_sig =
+                    secp.sign_schnorr_with_aux_rand(&msg, &internal_keypair, &aux_rand);
+                psbt.inputs_mut()[0].tap_key_sig = Some(SchnorrSig { sig: schnorr_sig, hash_ty });
             } else {
                 // No internal key
             }
@@ -194,8 +184,7 @@ pub fn test_desc_satisfy(
             let x_only_keypairs_reqd: Vec<(secp256k1::Keypair, TapLeafHash)> = tr
                 .leaves()
                 .flat_map(|leaf| {
-                    let leaf_hash =
-                        TapLeafHash::from_script(&leaf.compute_script(), LeafVersion::TapScript);
+                    let leaf_hash = leaf.compute_tap_leaf_hash();
                     leaf.miniscript().iter_pk().filter_map(move |pk| {
                         let i = x_only_pks.iter().position(|&x| x.to_public_key() == pk);
                         i.map(|idx| (xonly_keypairs[idx], leaf_hash))
@@ -204,17 +193,25 @@ pub fn test_desc_satisfy(
                 .collect();
             for (keypair, leaf_hash) in x_only_keypairs_reqd {
                 let sighash_msg = sighash_cache
-                    .taproot_script_spend_signature_hash(0, &prevouts, leaf_hash, sighash_type)
+                    .taproot_script_spend_signature_hash(
+                        0,
+                        &prevouts,
+                        leaf_hash,
+                        hash_ty,
+                        testdata.pubdata.genesis_hash,
+                    )
                     .unwrap();
-                let msg = secp256k1::Message::from_digest(sighash_msg.to_byte_array());
+                let msg = secp256k1::Message::from_digest_slice(sighash_msg.as_ref()).unwrap();
                 let mut aux_rand = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut aux_rand);
-                let signature = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
-                let x_only_pk =
-                    x_only_pks[xonly_keypairs.iter().position(|&x| x == keypair).unwrap()];
-                psbt.inputs[0]
+                let sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
+                // FIXME: uncomment when == is supported for secp256k1::KeyPair. (next major release)
+                // let x_only_pk = pks[xonly_keypairs.iter().position(|&x| x == keypair).unwrap()];
+                // Just recalc public key
+                let (x_only_pk, _parity) = secp256k1::XOnlyPublicKey::from_keypair(&keypair);
+                psbt.inputs_mut()[0]
                     .tap_script_sigs
-                    .insert((x_only_pk, leaf_hash), taproot::Signature { signature, sighash_type });
+                    .insert((x_only_pk, leaf_hash), elements::SchnorrSig { sig, hash_ty });
             }
         }
         _ => {
@@ -237,65 +234,69 @@ pub fn test_desc_satisfy(
                 Descriptor::Tr(_tr) => unreachable!("Tr checked earlier"),
             };
             let msg = psbt
-                .sighash_msg(0, &mut sighash_cache, None)
+                .sighash_msg(0, &mut sighash_cache, None, testdata.pubdata.genesis_hash)
                 .unwrap()
                 .to_secp_msg();
 
             // Fixme: Take a parameter
-            let sighash_type = sighash::EcdsaSighashType::All;
+            let hash_ty = elements::EcdsaSighashType::All;
 
             // Finally construct the signature and add to psbt
             for sk in sks_reqd {
-                let signature = secp.sign_ecdsa(&msg, &sk);
+                let sig = secp.sign_ecdsa(&msg, &sk);
                 let pk = pks[sks.iter().position(|&x| x == sk).unwrap()];
-                assert!(secp.verify_ecdsa(&msg, &signature, &pk.inner).is_ok());
-                psbt.inputs[0]
+                assert!(secp.verify_ecdsa(&msg, &sig, &pk.inner).is_ok());
+                psbt.inputs_mut()[0]
                     .partial_sigs
-                    .insert(pk, ecdsa::Signature { signature, sighash_type });
+                    .insert(pk, elementssig_to_rawsig(&(sig, hash_ty)));
             }
         }
     }
     // Add the hash preimages to the psbt
-    psbt.inputs[0]
-        .sha256_preimages
-        .insert(testdata.pubdata.sha256, testdata.secretdata.sha256_pre.to_vec());
-    psbt.inputs[0].hash256_preimages.insert(
-        sha256d::Hash::from_byte_array(testdata.pubdata.hash256.to_byte_array()),
+    psbt.inputs_mut()[0].sha256_preimages.insert(
+        ElementsSha256::from_byte_array(testdata.pubdata.sha256.to_byte_array()),
+        testdata.secretdata.sha256_pre.to_vec(),
+    );
+    psbt.inputs_mut()[0].hash256_preimages.insert(
+        ElementsSha256d::from_byte_array(testdata.pubdata.hash256.to_byte_array()),
         testdata.secretdata.hash256_pre.to_vec(),
     );
-    psbt.inputs[0]
-        .hash160_preimages
-        .insert(testdata.pubdata.hash160, testdata.secretdata.hash160_pre.to_vec());
-    psbt.inputs[0]
-        .ripemd160_preimages
-        .insert(testdata.pubdata.ripemd160, testdata.secretdata.ripemd160_pre.to_vec());
+    psbt.inputs_mut()[0].hash160_preimages.insert(
+        ElementsHash160::from_byte_array(testdata.pubdata.hash160.to_byte_array()),
+        testdata.secretdata.hash160_pre.to_vec(),
+    );
+    psbt.inputs_mut()[0].ripemd160_preimages.insert(
+        ElementsRipemd160::from_byte_array(testdata.pubdata.ripemd160.to_byte_array()),
+        testdata.secretdata.ripemd160_pre.to_vec(),
+    );
     println!("Testing descriptor: {}", definite_desc);
     // Finalize the transaction using psbt
     // Let miniscript do it's magic!
-    if psbt.finalize_mut(&secp).is_err() {
+    if psbt
+        .finalize_mut(&secp, testdata.pubdata.genesis_hash)
+        .is_err()
+    {
         return Err(DescError::PsbtFinalizeError);
     }
-    let tx = psbt.extract(&secp).expect("Extraction error");
+    let tx = psbt
+        .extract(&secp, testdata.pubdata.genesis_hash)
+        .expect("Extraction error");
 
     // Send the transactions to bitcoin node for mining.
     // Regtest mode has standardness checks
     // Check whether the node accepts the transactions
-    let txid = cl
-        .send_raw_transaction(&tx)
-        .unwrap_or_else(|_| panic!("send tx failed for desc {}", definite_desc))
-        .txid()
-        .expect("conversion to model failed");
+    let txid = cl.send_raw_transaction(&tx);
 
     // Finally mine the blocks and await confirmations
-    let _blocks = cl
-        .generate_to_address(1, &cl.new_address().unwrap())
-        .unwrap();
+    cl.generate(1);
     // Get the required transactions from the node mined in the blocks.
     // Check whether the transaction is mined in blocks
     // Assert that the confirmations are > 0.
-    let num_conf = cl.get_transaction(txid).unwrap().confirmations;
+    let num_conf = cl.call("gettransaction", &[txid.to_string().into()])["confirmations"]
+        .as_u64()
+        .unwrap();
     assert!(num_conf > 0);
-    Ok(tx.input[0].witness.clone())
+    Ok(tx.input[0].witness.script_witness.to_vec())
 }
 
 // Find all secret corresponding to the known public keys in ms
@@ -322,7 +323,7 @@ fn find_sk_single_key(pk: bitcoin::PublicKey, testdata: &TestData) -> Vec<secp25
     i.map(|idx| vec![sks[idx]]).unwrap_or(Vec::new())
 }
 
-fn test_descs(cl: &Client, testdata: &TestData) {
+fn test_descs(cl: &ElementsD, testdata: &TestData) {
     // K : Compressed key available
     // K!: Compressed key with corresponding secret key unknown
     // X: X-only key available
@@ -360,11 +361,6 @@ fn test_descs(cl: &Client, testdata: &TestData) {
     test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),multi_a(2,X2,X3,X4!,X5!)})").unwrap();
     test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),multi_a(3,X2,X3,X4,X5!)})").unwrap();
     test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),multi_a(4,X2,X3,X4,X5)})").unwrap();
-
-    test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),sortedmulti_a(1,X2,X3!,X4!,X5!)})").unwrap();
-    test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),sortedmulti_a(2,X2,X3,X4!,X5!)})").unwrap();
-    test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),sortedmulti_a(3,X2,X3,X4,X5!)})").unwrap();
-    test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),sortedmulti_a(4,X2,X3,X4,X5)})").unwrap();
 
     // Test 7: Test script tree of depth 127 is valid, only X128 is known
     test_desc_satisfy(cl, testdata, "tr(X!,{pk(X1!),{pk(X2!),{pk(X3!),{pk(X4!),{pk(X5!),{pk(X6!),{pk(X7!),{pk(X8!),{pk(X9!),{pk(X10!),{pk(X11!),{pk(X12!),{pk(X13!),{pk(X14!),{pk(X15!),{pk(X16!),{pk(X17!),{pk(X18!),{pk(X19!),{pk(X20!),{pk(X21!),{pk(X22!),{pk(X23!),{pk(X24!),{pk(X25!),{pk(X26!),{pk(X27!),{pk(X28!),{pk(X29!),{pk(X30!),{pk(X31!),{pk(X32!),{pk(X33!),{pk(X34!),{pk(X35!),{pk(X36!),{pk(X37!),{pk(X38!),{pk(X39!),{pk(X40!),{pk(X41!),{pk(X42!),{pk(X43!),{pk(X44!),{pk(X45!),{pk(X46!),{pk(X47!),{pk(X48!),{pk(X49!),{pk(X50!),{pk(X51!),{pk(X52!),{pk(X53!),{pk(X54!),{pk(X55!),{pk(X56!),{pk(X57!),{pk(X58!),{pk(X59!),{pk(X60!),{pk(X61!),{pk(X62!),{pk(X63!),{pk(X64!),{pk(X65!),{pk(X66!),{pk(X67!),{pk(X68!),{pk(X69!),{pk(X70!),{pk(X71!),{pk(X72!),{pk(X73!),{pk(X74!),{pk(X75!),{pk(X76!),{pk(X77!),{pk(X78!),{pk(X79!),{pk(X80!),{pk(X81!),{pk(X82!),{pk(X83!),{pk(X84!),{pk(X85!),{pk(X86!),{pk(X87!),{pk(X88!),{pk(X89!),{pk(X90!),{pk(X91!),{pk(X92!),{pk(X93!),{pk(X94!),{pk(X95!),{pk(X96!),{pk(X97!),{pk(X98!),{pk(X99!),{pk(X100!),{pk(X101!),{pk(X102!),{pk(X103!),{pk(X104!),{pk(X105!),{pk(X106!),{pk(X107!),{pk(X108!),{pk(X109!),{pk(X110!),{pk(X111!),{pk(X112!),{pk(X113!),{pk(X114!),{pk(X115!),{pk(X116!),{pk(X117!),{pk(X118!),{pk(X119!),{pk(X120!),{pk(X121!),{pk(X122!),{pk(X123!),{pk(X124!),{pk(X125!),{pk(X126!),{pk(X127!),pk(X128)}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}})").unwrap();
@@ -414,145 +410,7 @@ fn test_descs(cl: &Client, testdata: &TestData) {
 
 #[test]
 fn test_satisfy() {
-    let testdata = TestData::new_fixed_data(50);
-    let cl = &setup::setup().client;
+    let (cl, genesis_hash) = &setup::setup();
+    let testdata = TestData::new_fixed_data(50, *genesis_hash);
     test_descs(cl, &testdata);
-}
-
-fn test_plan_satisfy(
-    cl: &Client,
-    testdata: &TestData,
-    descriptor: &str,
-) -> Result<Witness, DescError> {
-    use std::collections::BTreeMap;
-
-    use miniscript::plan::Assets;
-    use miniscript::DefiniteDescriptorKey;
-
-    let secp = secp256k1::Secp256k1::new();
-    let sks = &testdata.secretdata.sks;
-    let pks = &testdata.pubdata.pks;
-
-    let blocks = cl
-        .generate_to_address(1, &cl.new_address().unwrap())
-        .unwrap();
-    assert_eq!(blocks.0.len(), 1);
-
-    let desc = test_util::parse_test_desc(descriptor, &testdata.pubdata)
-        .map_err(|_| DescError::DescParseError)?;
-    let definite_desc = if desc.has_wildcard() {
-        desc.derive_at_index(0).unwrap()
-    } else {
-        desc.into_definite().unwrap()
-    };
-
-    let derived_desc = definite_desc.derived_descriptor(&secp);
-    let desc_address = derived_desc
-        .address(bitcoin::Network::Regtest)
-        .map_err(|_| DescError::AddressComputationError)?;
-
-    let txid = cl
-        .send_to_address(&desc_address, btc(1))
-        .expect("rpc call failed")
-        .txid()
-        .expect("conversion to model failed");
-
-    let blocks = cl
-        .generate_to_address(2, &cl.new_address().unwrap())
-        .unwrap();
-    assert_eq!(blocks.0.len(), 2);
-
-    let (outpoint, witness_utxo) = get_vout(cl, txid, btc(1.0), derived_desc.script_pubkey());
-
-    let mut assets = Assets::new();
-    for pk in pks.iter() {
-        let dpk = miniscript::DescriptorPublicKey::Single(miniscript::descriptor::SinglePub {
-            origin: None,
-            key: miniscript::descriptor::SinglePubKey::FullKey(*pk),
-        });
-        assets = assets.add(dpk);
-    }
-
-    let plan = definite_desc
-        .clone()
-        .into_plan(&assets)
-        .expect("plan creation failed");
-
-    let mut unsigned_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::from_time(1_603_866_330).expect("valid timestamp"),
-        input: vec![TxIn {
-            previous_output: outpoint,
-            sequence: Sequence::from_height(1),
-            ..Default::default()
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(99_997_000),
-            script_pubkey: cl
-                .new_address_with_type(AddressType::Bech32)
-                .unwrap()
-                .script_pubkey(),
-        }],
-    };
-
-    let mut sighash_cache = SighashCache::new(&unsigned_tx);
-
-    use miniscript::descriptor::DescriptorType;
-    let sighash_type = sighash::EcdsaSighashType::All;
-    let desc_type = derived_desc.desc_type();
-    let sighash_msg = match desc_type {
-        DescriptorType::Wsh | DescriptorType::ShWsh => {
-            let script_code = derived_desc.script_code().expect("has script_code");
-            sighash_cache
-                .p2wsh_signature_hash(0, &script_code, witness_utxo.value, sighash_type)
-                .expect("sighash")
-        }
-        _ => panic!("test is only for wsh descriptors, got {:?}", desc_type),
-    };
-
-    let msg = secp256k1::Message::from_digest(sighash_msg.to_byte_array());
-
-    let mut sig_map: BTreeMap<DefiniteDescriptorKey, ecdsa::Signature> = BTreeMap::new();
-    for (i, pk) in pks.iter().enumerate() {
-        let signature = secp.sign_ecdsa(&msg, &sks[i]);
-        let dpk = DefiniteDescriptorKey::from_str(&pk.to_string()).unwrap();
-        sig_map.insert(dpk, ecdsa::Signature { signature, sighash_type });
-    }
-
-    let (witness_stack, script_sig) = plan.satisfy(&sig_map).expect("satisfaction failed");
-
-    unsigned_tx.input[0].witness = Witness::from_slice(&witness_stack);
-    unsigned_tx.input[0].script_sig = script_sig;
-
-    let txid = cl
-        .send_raw_transaction(&unsigned_tx)
-        .unwrap_or_else(|e| panic!("send tx failed for desc {}: {:?}", definite_desc, e))
-        .txid()
-        .expect("conversion to model failed");
-
-    let _blocks = cl
-        .generate_to_address(1, &cl.new_address().unwrap())
-        .unwrap();
-    let num_conf = cl.get_transaction(txid).unwrap().confirmations;
-    assert!(num_conf > 0);
-
-    Ok(unsigned_tx.input[0].witness.clone())
-}
-
-#[test]
-fn test_plan_satisfy_wsh() {
-    let testdata = TestData::new_fixed_data(50);
-    let cl = &setup::setup().client;
-
-    test_plan_satisfy(cl, &testdata, "wsh(pk(K))").unwrap();
-    test_plan_satisfy(cl, &testdata, "wsh(multi(2,K1,K2,K3))").unwrap();
-}
-
-#[test]
-fn test_plan_satisfy_sh_wsh() {
-    let testdata = TestData::new_fixed_data(50);
-    let cl = &setup::setup().client;
-
-    test_plan_satisfy(cl, &testdata, "sh(wsh(pk(K)))").unwrap();
-    test_plan_satisfy(cl, &testdata, "sh(wsh(multi(2,K1,K2,K3)))").unwrap();
 }

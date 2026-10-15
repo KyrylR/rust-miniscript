@@ -11,13 +11,16 @@
 use core::fmt;
 use core::str::FromStr;
 
-use bitcoin::hashes::{hash160, ripemd160, sha256, Hash};
-use bitcoin::{absolute, relative, secp256k1, sighash, taproot, Sequence, TxOut, Witness};
+use bitcoin::hashes::{hash160, ripemd160, sha256};
+use bitcoin::{absolute, relative, Sequence};
+use elements::{secp256k1_zkp as secp256k1, sighash, TxOut, Witness};
 
 use crate::miniscript::context::{NoChecks, SigType};
 use crate::miniscript::ScriptContext;
 use crate::prelude::*;
-use crate::{hash256, Descriptor, Miniscript, Terminal, ToPublicKey};
+use crate::{
+    elementssig_from_rawsig, hash256, Descriptor, ElementsSig, Miniscript, Terminal, ToPublicKey,
+};
 
 mod error;
 mod inner;
@@ -34,36 +37,31 @@ pub struct Interpreter<'txin> {
     stack: Stack<'txin>,
     /// For non-Taproot spends, the scriptCode; for Taproot script-spends, this
     /// is the leaf script; for key-spends it is `None`.
-    script_code: Option<bitcoin::ScriptBuf>,
+    script_code: Option<elements::Script>,
     sequence: Sequence,
     lock_time: absolute::LockTime,
 }
 
-// A type representing functions for checking signatures that accept both
-// Ecdsa and Schnorr signatures
-
-/// A type for representing signatures supported as of bitcoin core 22.0
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A public key and its ECDSA or Taproot Schnorr signature
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySigPair {
     /// A Full public key and corresponding Ecdsa signature
-    Ecdsa(bitcoin::PublicKey, bitcoin::ecdsa::Signature),
+    Ecdsa(bitcoin::PublicKey, ElementsSig),
     /// A x-only key and corresponding Schnorr signature
-    Schnorr(bitcoin::key::XOnlyPublicKey, bitcoin::taproot::Signature),
+    Schnorr(bitcoin::key::XOnlyPublicKey, elements::SchnorrSig),
 }
 
 impl KeySigPair {
-    /// Obtain a pair of ([`bitcoin::PublicKey`], [`bitcoin::ecdsa::Signature`]) from [`KeySigPair`]
-    pub fn as_ecdsa(&self) -> Option<(bitcoin::PublicKey, bitcoin::ecdsa::Signature)> {
+    /// Obtain a pair of ([`bitcoin::PublicKey`], [`ElementsSig`]) from [`KeySigPair`]
+    pub fn as_ecdsa(&self) -> Option<(bitcoin::PublicKey, ElementsSig)> {
         match self {
             Self::Ecdsa(pk, sig) => Some((*pk, *sig)),
             Self::Schnorr(_, _) => None,
         }
     }
 
-    /// Obtain a pair of ([`bitcoin::secp256k1::XOnlyPublicKey`], [`bitcoin::taproot::Signature`]) from [`KeySigPair`]
-    pub fn as_schnorr(
-        &self,
-    ) -> Option<(bitcoin::key::XOnlyPublicKey, bitcoin::taproot::Signature)> {
+    /// Obtain a pair of ([`bitcoin::secp256k1::XOnlyPublicKey`], [`elements::SchnorrSig`]) from [`KeySigPair`]
+    pub fn as_schnorr(&self) -> Option<(bitcoin::key::XOnlyPublicKey, elements::SchnorrSig)> {
         match self {
             Self::Ecdsa(_, _) => None,
             Self::Schnorr(pk, sig) => Some((*pk, *sig)),
@@ -142,13 +140,16 @@ impl<'txin> Interpreter<'txin> {
     /// function; otherwise, it should be a closure containing a sighash and
     /// secp context, which can actually verify a given signature.
     pub fn from_txdata(
-        spk: &bitcoin::ScriptBuf,
-        script_sig: &'txin bitcoin::Script,
+        spk: &elements::Script,
+        script_sig: &'txin elements::Script,
         witness: &'txin Witness,
-        sequence: Sequence,            // CSV, relative lock time.
-        lock_time: absolute::LockTime, // CLTV, absolute lock time.
+        sequence: elements::Sequence,  // CSV, relative lock time.
+        lock_time: elements::LockTime, // CLTV, absolute lock time.
     ) -> Result<Self, Error> {
         let (inner, stack, script_code) = inner::from_txdata(spk, script_sig, witness)?;
+        // Elements timelocks share Bitcoin's consensus encoding.
+        let sequence = Sequence::from_consensus(sequence.to_consensus_u32());
+        let lock_time = absolute::LockTime::from_consensus(lock_time.to_consensus_u32());
         Ok(Interpreter { inner, stack, script_code, sequence, lock_time })
     }
 
@@ -191,13 +192,13 @@ impl<'txin> Interpreter<'txin> {
     /// - sighash single without corresponding output
     // TODO: Create a good first issue to change this to error
     // TODO: Requires refactor to remove the script_code logic in order to use the new sighash API.
-    #[allow(deprecated)] // For segwit_signature_hash
     pub fn verify_sig<C: secp256k1::Verification, T: Borrow<TxOut>>(
         &self,
         secp: &secp256k1::Secp256k1<C>,
-        tx: &bitcoin::Transaction,
+        tx: &elements::Transaction,
         input_idx: usize,
         prevouts: &sighash::Prevouts<T>,
+        genesis_hash: elements::BlockHash,
         sig: &KeySigPair,
     ) -> bool {
         fn get_prevout<'u, T: Borrow<TxOut>>(
@@ -215,60 +216,55 @@ impl<'txin> Interpreter<'txin> {
                 sighash::Prevouts::All(prevouts) => prevouts.get(input_index),
             }
         }
-        let mut cache = bitcoin::sighash::SighashCache::new(tx);
+        let mut cache = elements::sighash::SighashCache::new(tx);
         match sig {
             KeySigPair::Ecdsa(key, ecdsa_sig) => {
+                // The Elements legacy and segwit v0 sighash functions panic on
+                // an out-of-range input instead of returning an error.
+                if input_idx >= tx.input.len() {
+                    return false;
+                }
                 let script_pubkey = self.script_code.as_ref().expect("Legacy have script code");
-                let msg = if self.is_legacy() {
-                    let sighash_u32 = ecdsa_sig.sighash_type.to_u32();
-                    let sighash =
-                        cache.legacy_signature_hash(input_idx, script_pubkey, sighash_u32);
-                    sighash.map(|hash| secp256k1::Message::from_digest(hash.to_byte_array()))
+                let sighash = if self.is_legacy() {
+                    cache.legacy_sighash(input_idx, script_pubkey, ecdsa_sig.1)
                 } else if self.is_segwit_v0() {
                     let amt = match get_prevout(prevouts, input_idx) {
                         Some(txout) => txout.borrow().value,
                         None => return false,
                     };
                     // TODO: Don't manually handle the script code.
-                    let sighash = cache.p2wsh_signature_hash(
-                        input_idx,
-                        script_pubkey,
-                        amt,
-                        ecdsa_sig.sighash_type,
-                    );
-                    sighash.map(|hash| secp256k1::Message::from_digest(hash.to_byte_array()))
+                    cache.segwitv0_sighash(input_idx, script_pubkey, amt, ecdsa_sig.1)
                 } else {
                     // taproot(or future) signatures in segwitv0 context
                     return false;
                 };
 
-                let success = msg.map(|msg| {
-                    secp.verify_ecdsa(&msg, &ecdsa_sig.signature, &key.inner)
-                        .is_ok()
-                });
-                success.unwrap_or(false) // unwrap_or checks for errors, while success would have checksig results
+                let msg = secp256k1::Message::from_digest(sighash.to_byte_array());
+                secp.verify_ecdsa(&msg, &ecdsa_sig.0, &key.inner).is_ok()
             }
             KeySigPair::Schnorr(xpk, schnorr_sig) => {
                 let sighash_msg = if self.is_taproot_v1_key_spend() {
                     cache.taproot_key_spend_signature_hash(
                         input_idx,
                         prevouts,
-                        schnorr_sig.sighash_type,
+                        schnorr_sig.hash_ty,
+                        genesis_hash,
                     )
                 } else if self.is_taproot_v1_script_spend() {
                     let tap_script = self.script_code.as_ref().expect(
                         "Internal Hack: Saving leaf script instead\
                         of script code for script spend",
                     );
-                    let leaf_hash = taproot::TapLeafHash::from_script(
+                    let leaf_hash = elements::taproot::TapLeafHash::from_script(
                         tap_script,
-                        taproot::LeafVersion::TapScript,
+                        elements::taproot::LeafVersion::default(),
                     );
                     cache.taproot_script_spend_signature_hash(
                         input_idx,
                         prevouts,
                         leaf_hash,
-                        schnorr_sig.sighash_type,
+                        schnorr_sig.hash_ty,
+                        genesis_hash,
                     )
                 } else {
                     // schnorr sigs in ecdsa descriptors
@@ -276,10 +272,8 @@ impl<'txin> Interpreter<'txin> {
                 };
                 let msg =
                     sighash_msg.map(|hash| secp256k1::Message::from_digest(hash.to_byte_array()));
-                let success = msg.map(|msg| {
-                    secp.verify_schnorr(&schnorr_sig.signature, &msg, xpk)
-                        .is_ok()
-                });
+                let success =
+                    msg.map(|msg| secp.verify_schnorr(&schnorr_sig.sig, &msg, xpk).is_ok());
                 success.unwrap_or(false) // unwrap_or_default checks for errors, while success would have checksig results
             }
         }
@@ -301,15 +295,18 @@ impl<'txin> Interpreter<'txin> {
     /// the amount/prevouts.
     /// - For legacy outputs, no information about prevouts is required
     /// - For segwitv0 outputs, prevout at corresponding index with correct amount must be provided
-    /// - For taproot outputs, information about all prevouts must be supplied
+    /// - For taproot outputs, information about all prevouts and the chain's genesis hash must be supplied
     pub fn iter<'iter, C: secp256k1::Verification, T: Borrow<TxOut>>(
         &'iter self,
         secp: &'iter secp256k1::Secp256k1<C>,
-        tx: &'txin bitcoin::Transaction,
+        tx: &'txin elements::Transaction,
         input_idx: usize,
         prevouts: &'iter sighash::Prevouts<T>, // actually a 'prevouts, but 'prevouts: 'iter
+        genesis_hash: elements::BlockHash,     // required for the Elements BIP341 sighash
     ) -> Iter<'txin, 'iter> {
-        self.iter_custom(Box::new(move |sig| self.verify_sig(secp, tx, input_idx, prevouts, sig)))
+        self.iter_custom(Box::new(move |sig| {
+            self.verify_sig(secp, tx, input_idx, prevouts, genesis_hash, sig)
+        }))
     }
 
     /// Creates an iterator over the satisfied spending conditions without checking signatures
@@ -330,11 +327,11 @@ impl<'txin> Interpreter<'txin> {
     /// does this for you.
     pub fn inferred_descriptor_string(&self) -> String {
         match self.inner {
-            inner::Inner::PublicKey(ref pk, inner::PubkeyType::Pk) => format!("pk({})", pk),
-            inner::Inner::PublicKey(ref pk, inner::PubkeyType::Pkh) => format!("pkh({})", pk),
-            inner::Inner::PublicKey(ref pk, inner::PubkeyType::Wpkh) => format!("wpkh({})", pk),
+            inner::Inner::PublicKey(ref pk, inner::PubkeyType::Pk) => format!("elpk({})", pk),
+            inner::Inner::PublicKey(ref pk, inner::PubkeyType::Pkh) => format!("elpkh({})", pk),
+            inner::Inner::PublicKey(ref pk, inner::PubkeyType::Wpkh) => format!("elwpkh({})", pk),
             inner::Inner::PublicKey(ref pk, inner::PubkeyType::ShWpkh) => {
-                format!("sh(wpkh({}))", pk)
+                format!("elsh(wpkh({}))", pk)
             }
             inner::Inner::PublicKey(ref pk, inner::PubkeyType::Tr) => {
                 // In tr descriptors, normally the internal key is represented inside the tr part
@@ -343,14 +340,14 @@ impl<'txin> Interpreter<'txin> {
                 // Note that rawtr is parsing is currently not supported.
                 format!("rawtr_not_supported_yet({})", pk)
             }
-            inner::Inner::Script(ref ms, inner::ScriptType::Bare) => format!("{}", ms),
-            inner::Inner::Script(ref ms, inner::ScriptType::Sh) => format!("sh({})", ms),
-            inner::Inner::Script(ref ms, inner::ScriptType::Wsh) => format!("wsh({})", ms),
-            inner::Inner::Script(ref ms, inner::ScriptType::ShWsh) => format!("sh(wsh({}))", ms),
+            inner::Inner::Script(ref ms, inner::ScriptType::Bare) => format!("el{}", ms),
+            inner::Inner::Script(ref ms, inner::ScriptType::Sh) => format!("elsh({})", ms),
+            inner::Inner::Script(ref ms, inner::ScriptType::Wsh) => format!("elwsh({})", ms),
+            inner::Inner::Script(ref ms, inner::ScriptType::ShWsh) => format!("elsh(wsh({}))", ms),
             inner::Inner::Script(ref ms, inner::ScriptType::Tr) => {
                 // Hidden paths are still under discussion, once the spec is finalized, we can support
                 // rawnode and raw leaf.
-                format!("tr(hidden_paths_not_yet_supported,{})", ms)
+                format!("eltr(hidden_paths_not_yet_supported,{})", ms)
             }
         }
     }
@@ -462,7 +459,7 @@ pub enum HashLockType {
 /// A satisfied Miniscript condition (Signature, Hashlock, Timelock)
 /// 'intp represents the lifetime of descriptor and `stack represents
 /// the lifetime of witness
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SatisfiedConstraint {
     ///Public key and corresponding signature
     PublicKey {
@@ -1032,7 +1029,7 @@ fn verify_sersig<'txin>(
 ) -> Result<KeySigPair, Error> {
     match pk {
         BitcoinKey::Fullkey(pk) => {
-            let ecdsa_sig = bitcoin::ecdsa::Signature::from_slice(sigser)?;
+            let ecdsa_sig = elementssig_from_rawsig(sigser)?;
             let key_sig_pair = KeySigPair::Ecdsa(*pk, ecdsa_sig);
             if verify_sig(&key_sig_pair) {
                 Ok(key_sig_pair)
@@ -1041,7 +1038,7 @@ fn verify_sersig<'txin>(
             }
         }
         BitcoinKey::XOnlyPublicKey(x_only_pk) => {
-            let schnorr_sig = bitcoin::taproot::Signature::from_slice(sigser)?;
+            let schnorr_sig = elements::SchnorrSig::from_slice(sigser)?;
             let key_sig_pair = KeySigPair::Schnorr(*x_only_pk, schnorr_sig);
             if verify_sig(&key_sig_pair) {
                 Ok(key_sig_pair)
@@ -1055,23 +1052,25 @@ fn verify_sersig<'txin>(
 #[cfg(test)]
 mod tests {
 
+    use bitcoin::hashes::Hash;
     use bitcoin::secp256k1::Secp256k1;
 
     use super::inner::ToNoChecks;
     use super::*;
+    use crate::elementssig_to_rawsig;
 
     #[allow(clippy::type_complexity)]
     fn setup_keys_sigs(
         n: usize,
     ) -> (
         Vec<bitcoin::PublicKey>,
-        Vec<bitcoin::ecdsa::SerializedSignature>,
-        Vec<bitcoin::ecdsa::Signature>,
+        Vec<Vec<u8>>,
+        Vec<ElementsSig>,
         secp256k1::Message,
         Secp256k1<secp256k1::All>,
         Vec<bitcoin::key::XOnlyPublicKey>,
-        Vec<bitcoin::taproot::Signature>,
-        Vec<bitcoin::taproot::serialized_signature::SerializedSignature>,
+        Vec<elements::SchnorrSig>,
+        Vec<Vec<u8>>,
     ) {
         let secp = secp256k1::Secp256k1::new();
         let msg = secp256k1::Message::from_digest(*b"Yoda: btc, I trust. HODL I must!");
@@ -1094,23 +1093,20 @@ mod tests {
                 compressed: true,
             };
             let signature = secp.sign_ecdsa(&msg, &sk);
-            let bitcoin_sig = bitcoin::ecdsa::Signature {
-                signature,
-                sighash_type: bitcoin::sighash::EcdsaSighashType::All,
-            };
-            ecdsa_sigs.push(bitcoin_sig);
-            der_sigs.push(bitcoin_sig.serialize());
+            let elements_sig = (signature, elements::EcdsaSighashType::All);
+            ecdsa_sigs.push(elements_sig);
+            der_sigs.push(elementssig_to_rawsig(&elements_sig));
             pks.push(pk);
 
             let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &sk);
             let (x_only_pk, _parity) = bitcoin::key::XOnlyPublicKey::from_keypair(&keypair);
             x_only_pks.push(x_only_pk);
             let schnorr_sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &[0u8; 32]);
-            let schnorr_sig = bitcoin::taproot::Signature {
-                signature: schnorr_sig,
-                sighash_type: bitcoin::sighash::TapSighashType::Default,
+            let schnorr_sig = elements::SchnorrSig {
+                sig: schnorr_sig,
+                hash_ty: elements::SchnorrSighashType::Default,
             };
-            ser_schnorr_sigs.push(schnorr_sig.serialize());
+            ser_schnorr_sigs.push(schnorr_sig.to_vec());
             schnorr_sigs.push(schnorr_sig);
         }
         (pks, der_sigs, ecdsa_sigs, msg, secp, x_only_pks, schnorr_sigs, ser_schnorr_sigs)
@@ -1123,10 +1119,10 @@ mod tests {
         let secp_ref = &secp;
         let vfyfn = |pksig: &KeySigPair| match pksig {
             KeySigPair::Ecdsa(pk, ecdsa_sig) => secp_ref
-                .verify_ecdsa(&sighash, &ecdsa_sig.signature, &pk.inner)
+                .verify_ecdsa(&sighash, &ecdsa_sig.0, &pk.inner)
                 .is_ok(),
             KeySigPair::Schnorr(xpk, schnorr_sig) => secp_ref
-                .verify_schnorr(&schnorr_sig.signature, &sighash, xpk)
+                .verify_schnorr(&schnorr_sig.sig, &sighash, xpk)
                 .is_ok(),
         };
 
@@ -1554,6 +1550,43 @@ mod tests {
 
         let multi_a_error: Result<Vec<SatisfiedConstraint>, Error> = constraints.collect();
         assert!(multi_a_error.is_err());
+    }
+
+    #[test]
+    fn verify_sig_rejects_out_of_range_input() {
+        let (pks, der_sigs, ecdsa_sigs, _, secp, ..) = setup_keys_sigs(1);
+        let spk = Descriptor::new_wpkh(pks[0]).unwrap().script_pubkey();
+        let script_sig = elements::Script::new();
+        let witness = Witness::from_slice(&[der_sigs[0].clone(), pks[0].to_bytes()]);
+        let interpreter = Interpreter::from_txdata(
+            &spk,
+            &script_sig,
+            &witness,
+            elements::Sequence::MAX,
+            elements::LockTime::ZERO,
+        )
+        .unwrap();
+        assert!(interpreter.is_segwit_v0());
+
+        // A prevout is available but the transaction has no such input; the Elements
+        // segwit v0 sighash would panic, so the signature is reported as invalid.
+        let tx = elements::Transaction {
+            version: 2,
+            lock_time: elements::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let prevouts = [TxOut::default()];
+        let genesis_hash = elements::BlockHash::from_byte_array([0; 32]);
+        let sig = KeySigPair::Ecdsa(pks[0], ecdsa_sigs[0]);
+        assert!(!interpreter.verify_sig(
+            &secp,
+            &tx,
+            0,
+            &sighash::Prevouts::All(&prevouts),
+            genesis_hash,
+            &sig
+        ));
     }
 
     // By design there is no support for parse a miniscript with BitcoinKey

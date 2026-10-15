@@ -1182,8 +1182,8 @@ mod tests {
     use core::num::NonZeroU32;
     use core::str::FromStr;
 
-    use bitcoin::blockdata::{opcodes, script};
     use bitcoin::hashes;
+    use elements::{opcodes, script};
 
     use super::*;
     use crate::miniscript::{Legacy, Segwitv0, Tap};
@@ -1386,24 +1386,19 @@ mod tests {
         assert_eq!(abs.n_keys(), 5);
         assert_eq!(abs.minimum_n_keys(), Some(3));
 
-        let bitcoinsig = bitcoin::ecdsa::Signature {
-            signature,
-            sighash_type: bitcoin::sighash::EcdsaSighashType::All,
-        };
-        let sigvec = bitcoinsig.to_vec();
+        let elementssig = (signature, elements::EcdsaSighashType::All);
+        let sigvec = crate::elementssig_to_rawsig(&elementssig);
 
-        let no_sat = BTreeMap::<bitcoin::PublicKey, bitcoin::ecdsa::Signature>::new();
-        let mut left_sat = BTreeMap::<bitcoin::PublicKey, bitcoin::ecdsa::Signature>::new();
-        let mut right_sat = BTreeMap::<
-            hashes::hash160::Hash,
-            (bitcoin::PublicKey, bitcoin::ecdsa::Signature),
-        >::new();
+        let no_sat = BTreeMap::<bitcoin::PublicKey, crate::ElementsSig>::new();
+        let mut left_sat = BTreeMap::<bitcoin::PublicKey, crate::ElementsSig>::new();
+        let mut right_sat =
+            BTreeMap::<hashes::hash160::Hash, (bitcoin::PublicKey, crate::ElementsSig)>::new();
 
         for i in 0..5 {
-            left_sat.insert(keys[i], bitcoinsig);
+            left_sat.insert(keys[i], elementssig);
         }
         for i in 5..8 {
-            right_sat.insert(keys[i].to_pubkeyhash(SigType::Ecdsa), (keys[i], bitcoinsig));
+            right_sat.insert(keys[i].to_pubkeyhash(SigType::Ecdsa), (keys[i], elementssig));
         }
 
         assert!(ms.satisfy(no_sat).is_err());

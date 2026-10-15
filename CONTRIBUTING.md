@@ -1,9 +1,9 @@
-# Contributing to rust-miniscript
+# Contributing to elements-miniscript
 
 :+1::tada: First off, thanks for taking the time to contribute! :tada::+1:
 
-The following is a set of guidelines for contributing to the rust-miniscript
-project. They are substantially based on the contributing guidelines for the
+The following guidelines for elements-miniscript come from rust-miniscript.
+They are substantially based on the contributing guidelines for the
 [rust-bitcoin project](https://github.com/rust-bitcoin/rust-bitcoin/blob/master/CONTRIBUTING.md).
 These are guidelines, not rules. Use your best judgment.
 
@@ -32,7 +32,7 @@ These are guidelines, not rules. Use your best judgment.
 
 ## General
 
-The Rust Bitcoin project operates an open contributor model where anyone is
+The Elements Miniscript project operates an open contributor model where anyone is
 welcome to contribute towards development in the form of peer review,
 documentation, testing and patches.
 
@@ -46,14 +46,15 @@ you'll learn.
 
 ## Communication channels
 
-Communication about rust-miniscript happens primarily in
+Upstream rust-miniscript discussion takes place in
 [#bitcoin-rust](https://web.libera.chat/?channel=#bitcoin-rust) IRC chat on
 [Libera](https://libera.chat/) with the logs available at
 <https://gnusha.org/bitcoin-rust/> (starting from Jun 2021 and now on) and
 <https://gnusha.org/rust-bitcoin/> (historical archive before Jun 2021).
 
-Discussion about code base improvements happens in GitHub issues and on pull
-requests.
+Discuss Elements-specific changes in the
+[elements-miniscript issue tracker](https://github.com/ElementsProject/elements-miniscript/issues)
+and pull requests.
 
 
 ## Asking questions
@@ -72,7 +73,7 @@ you may get helpful advice if you have questions.
 Rust can be installed using your package manager of choice or [rustup.rs](https://rustup.rs). The
 former way is considered more secure since it typically doesn't involve trust in the CA system. But
 you should be aware that the version of Rust shipped by your distribution might be out of date.
-Generally this isn't a problem for `rust-miniscript` since we support much older versions than the
+Generally this isn't a problem for `elements-miniscript` since we support much older versions than the
 current stable one (see MSRV section in [README.md](./README.md)).
 
 ### Building
@@ -80,8 +81,8 @@ current stable one (see MSRV section in [README.md](./README.md)).
 The library can be built and tested using [`cargo`](https://github.com/rust-lang/cargo/):
 
 ```
-git clone git@github.com:rust-bitcoin/rust-miniscript.git
-cd rust-miniscript
+git clone https://github.com/ElementsProject/elements-miniscript.git
+cd elements-miniscript
 cargo build
 ```
 
@@ -133,6 +134,25 @@ Commits should cover both the issue fixed and the solution's rationale.
 Please keep these [guidelines](https://chris.beams.io/posts/git-commit/) in mind.
 
 
+## Updating from rust-miniscript
+
+After fetching rust-miniscript into a local upstream ref, run
+`contrib/prepare-upstream-sync.sh <upstream-ref> <new-local-branch>` from the
+Elements branch. The helper creates the review branch at the upstream revision
+and lists incoming commits. It leaves the checkout unchanged.
+
+Check out the review branch and merge the Elements branch into it. Resolve
+conflicts against both implementations, then run the feature matrix, lint,
+fuzz regressions and Elements node tests described in the CI workflows.
+Review the merge before integrating it. The helper does not fetch, merge,
+push or schedule updates.
+
+The `std` feature, its `cfg` gates and the `no_std` attribute come from
+rust-miniscript and are kept so that these merges stay small. The dependencies
+use the standard library either way, so disabling `std` does not produce a
+`no_std` build.
+
+
 ## Preparing PRs
 
 The main library development happens in the `master` branch. This branch must
@@ -154,7 +174,7 @@ Prerequisites that a PR must satisfy for merging into the `master` branch:
 * contain all inline docs for newly introduced API and pass doc tests including
   running `just lint` without any errors or warnings;
 * be based on the recent `master` tip from the original repository at
-  <https://github.com/rust-bitcoin/rust-miniscript>.
+  <https://github.com/ElementsProject/elements-miniscript>.
 
 NB: reviewers may run more complex test/CI scripts, thus, satisfying all the
 requirements above is just a preliminary, but not necessary sufficient step for

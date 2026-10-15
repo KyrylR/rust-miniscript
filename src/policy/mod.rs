@@ -496,7 +496,7 @@ mod tests {
                 .unwrap();
             let expected_desc = Descriptor::Tr(
                 Tr::<String>::from_str(
-                    "tr(UNSPEND ,{
+                    "eltr(UNSPEND ,{
                 {
                     {and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(B),pk(C)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H)),and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(C)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H))},
                     {and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(D)),pk(E)),pk(F)),pk(G)),pk(H)),and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:and_v(v:pk(A),pk(B)),pk(C)),pk(E)),pk(F)),pk(G)),pk(H))}
@@ -522,7 +522,7 @@ mod tests {
             println!("{}", desc);
             let expected_desc = Descriptor::Tr(
                 Tr::<String>::from_str(
-                    "tr(UNSPEND,
+                    "eltr(UNSPEND,
                     {{
                         {and_v(v:and_v(v:pk(A),pk(D)),pk(E)),and_v(v:and_v(v:pk(A),pk(C)),pk(E))},
                         {and_v(v:and_v(v:pk(A),pk(C)),pk(D)),and_v(v:and_v(v:pk(A),pk(B)),pk(E))}

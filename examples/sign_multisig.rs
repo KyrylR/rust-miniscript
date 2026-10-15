@@ -5,8 +5,11 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use bitcoin::blockdata::witness::Witness;
-use bitcoin::{absolute, ecdsa, transaction, Amount, Sequence};
+use elements_miniscript::elements::{
+    confidential, AssetId, AssetIssuance, EcdsaSighashType, LockTime, OutPoint, Script, Sequence,
+    TxInWitness,
+};
+use elements_miniscript::ElementsSig;
 
 fn main() {
     let mut tx = spending_transaction();
@@ -14,8 +17,8 @@ fn main() {
     let sig = random_signature_from_the_blockchain();
 
     // Descriptor for the output being spent.
-    let s = format!("wsh(multi(2,{},{},{}))", pks[0], pks[1], pks[2],);
-    let descriptor = miniscript::Descriptor::<bitcoin::PublicKey>::from_str(&s).unwrap();
+    let s = format!("elwsh(multi(2,{},{},{}))", pks[0], pks[1], pks[2],);
+    let descriptor = elements_miniscript::Descriptor::<bitcoin::PublicKey>::from_str(&s).unwrap();
 
     // Check weight for witness satisfaction cost ahead of time.
     // 106 (serialized witnessScript)
@@ -51,7 +54,7 @@ fn main() {
     // Attempt to satisfy at age 0, height 0.
     let original_txin = tx.input[0].clone();
 
-    let mut sigs = HashMap::<bitcoin::PublicKey, ecdsa::Signature>::new();
+    let mut sigs = HashMap::<bitcoin::PublicKey, ElementsSig>::new();
 
     // Doesn't work with no signatures.
     assert!(descriptor.satisfy(&mut tx.input[0], &sigs).is_err());
@@ -66,29 +69,33 @@ fn main() {
     sigs.insert(pks[2], sig);
     assert!(descriptor.satisfy(&mut tx.input[0], &sigs).is_ok());
     assert_ne!(tx.input[0], original_txin);
-    assert_eq!(tx.input[0].witness.len(), 4); // 0, sig, sig, witness script
+    assert_eq!(tx.input[0].witness.script_witness.len(), 4); // 0, sig, sig, witness script
 
     // ...and even if we give it a third signature, only two are used.
     sigs.insert(pks[0], sig);
     assert!(descriptor.satisfy(&mut tx.input[0], &sigs).is_ok());
     assert_ne!(tx.input[0], original_txin);
-    assert_eq!(tx.input[0].witness.len(), 4); // 0, sig, sig, witness script
+    assert_eq!(tx.input[0].witness.script_witness.len(), 4); // 0, sig, sig, witness script
 }
 
-// Transaction which spends some output.
-fn spending_transaction() -> bitcoin::Transaction {
-    bitcoin::Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![bitcoin::TxIn {
-            previous_output: Default::default(),
-            script_sig: bitcoin::ScriptBuf::new(),
+// Elements transaction which spends some output.
+fn spending_transaction() -> elements_miniscript::elements::Transaction {
+    elements_miniscript::elements::Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        input: vec![elements_miniscript::elements::TxIn {
+            previous_output: OutPoint::default(),
+            is_pegin: false,
+            script_sig: Script::new(),
             sequence: Sequence::MAX,
-            witness: Witness::default(),
+            asset_issuance: AssetIssuance::default(),
+            witness: TxInWitness::default(),
         }],
-        output: vec![bitcoin::TxOut {
-            script_pubkey: bitcoin::ScriptBuf::new(),
-            value: Amount::from_sat(100_000_000),
+        output: vec![elements_miniscript::elements::TxOut {
+            asset: confidential::Asset::Explicit(AssetId::LIQUID_BTC),
+            value: confidential::Value::Explicit(100_000_000),
+            script_pubkey: Script::new(),
+            ..Default::default()
         }],
     }
 }
@@ -116,9 +123,9 @@ fn list_of_three_arbitrary_public_keys() -> Vec<bitcoin::PublicKey> {
 
 // Returns a signature copied at random off the blockchain; this is not actually
 // a valid signature for this transaction; Miniscript does not verify the validity.
-fn random_signature_from_the_blockchain() -> ecdsa::Signature {
-    ecdsa::Signature {
-        signature: secp256k1::ecdsa::Signature::from_str(
+fn random_signature_from_the_blockchain() -> ElementsSig {
+    (
+        secp256k1::ecdsa::Signature::from_str(
             "3045\
              0221\
              00f7c3648c390d87578cd79c8016940aa8e3511c4104cb78daa8fb8e429375efc1\
@@ -126,6 +133,6 @@ fn random_signature_from_the_blockchain() -> ecdsa::Signature {
              531d75c136272f127a5dc14acc0722301cbddc222262934151f140da345af177",
         )
         .unwrap(),
-        sighash_type: bitcoin::sighash::EcdsaSighashType::All,
-    }
+        EcdsaSighashType::All,
+    )
 }
