@@ -1,0 +1,128 @@
+name: Propose upstream sync
+
+on:
+  schedule:
+    - cron: "37 3 1 * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    # Scheduled runs always use the default branch.
+    if: github.event_name == 'schedule' || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    # Limit this environment to the default branch so that other workflows,
+    # including those on pull request branches, cannot read its secret.
+    environment: upstream-sync
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch rust-miniscript master
+        run: git fetch --no-tags https://github.com/rust-bitcoin/rust-miniscript.git refs/heads/master:refs/remotes/upstream/master
+
+      - name: Propose merge
+        env:
+          # Pushes and pull requests made with this token start CI. It needs
+          # Contents, Pull requests and Workflows write access to this repository
+          # because the pushed history includes upstream workflow edits.
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::warning::Add the UPSTREAM_SYNC_TOKEN secret to the upstream-sync environment to propose upstream syncs."
+            exit 0
+          fi
+          gh auth setup-git --hostname github.com
+          base=$(git rev-parse HEAD)
+          upstream=$(git rev-parse refs/remotes/upstream/master)
+          if git merge-base --is-ancestor "$upstream" "$base"; then
+            echo "Upstream is already included."
+            exit 0
+          fi
+          open_count=$(gh pr list --state open --limit 1000 --json headRefName,isCrossRepository \
+            --jq '[.[] | select((.isCrossRepository | not) and (.headRefName | startswith("sync/upstream-")))] | length')
+          if [[ "$open_count" != "0" ]]; then
+            echo "An upstream sync pull request is already open."
+            exit 0
+          fi
+          branch="sync/upstream-${upstream:0:12}"
+          prior_count=$(gh pr list --state all --limit 1000 --head "$branch" --json isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository | not)] | length')
+          if [[ "$prior_count" != "0" ]]; then
+            echo "The proposal for $upstream has already been handled."
+            exit 0
+          fi
+          push_url="https://github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code "$push_url" "refs/heads/$branch" >/dev/null; then
+            echo "::error::$branch exists without a pull request. Open one for it or delete the branch."
+            exit 1
+          fi
+
+          ./contrib/prepare-upstream-sync.sh "$upstream" "$branch"
+          git switch --quiet "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Pull request CI runs the workflows on the proposed branch, so keep
+          # this repository's until a maintainer has reviewed upstream changes.
+          git restore --source="$base" --staged --worktree -- .github
+          if ! git diff --cached --quiet; then
+            git commit --quiet -m "Keep elements-miniscript CI configuration"
+          fi
+          if git merge --no-edit -m "Merge $BASE_BRANCH into rust-miniscript ${upstream:0:12}" "$base"; then
+            title="Merge rust-miniscript upstream ${upstream:0:12}"
+            state="Git merged \`$BASE_BRANCH\` into rust-miniscript master at \`$upstream\` without textual conflicts. Review the result for semantic conflicts."
+          else
+            conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            [[ -n "$conflicts" ]] || exit 1
+            git merge --abort
+            title="Resolve conflicts with rust-miniscript upstream ${upstream:0:12}"
+            state="**This branch does not contain the Elements code yet. Do not merge it as it is.** Merging \`$BASE_BRANCH\` into rust-miniscript master at \`$upstream\` conflicts in:"$'\n\n'"$conflicts"
+            echo "::warning::Upstream conflicts with $BASE_BRANCH; opening a draft pull request for manual resolution."
+          fi
+          commits=$(git log --reverse --first-parent --format='%h %s' "$base..$upstream")
+          ci_changes=$(git diff --name-status "$base...$upstream" -- .github)
+
+          git push "$push_url" "refs/heads/$branch:refs/heads/$branch"
+          cat > "$RUNNER_TEMP/upstream-sync-pr.md" <<EOF
+          $state
+
+          To update this branch, run:
+
+              git fetch origin $BASE_BRANCH $branch
+              git switch $branch
+              git merge origin/$BASE_BRANCH
+
+          Resolve textual and semantic conflicts against both implementations, push
+          the result here and wait for CI. Then run the checks in CONTRIBUTING.md that
+          CI does not cover and mark this pull request ready. Merge it with a merge
+          commit: squash and rebase merges drop the upstream history, so the next sync
+          would propose these commits again.
+
+          Incoming rust-miniscript changes:
+
+          \`\`\`text
+          $commits
+          \`\`\`
+
+          This branch keeps the \`.github\` directory from \`$BASE_BRANCH\`. Review
+          these upstream changes to it and port the ones you want in a separate commit:
+
+          \`\`\`text
+          ${ci_changes:-none}
+          \`\`\`
+          EOF
+          gh pr create --draft --base "$BASE_BRANCH" --head "$branch" --title "$title" \
+            --body-file "$RUNNER_TEMP/upstream-sync-pr.md"

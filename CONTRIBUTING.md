@@ -139,13 +139,71 @@ Please keep these [guidelines](https://chris.beams.io/posts/git-commit/) in mind
 After fetching rust-miniscript into a local upstream ref, run
 `contrib/prepare-upstream-sync.sh <upstream-ref> <new-local-branch>` from the
 Elements branch. The helper creates the review branch at the upstream revision
-and lists incoming commits. It leaves the checkout unchanged.
+and lists incoming commits. It leaves the checkout unchanged and does not fetch,
+merge or push.
 
-Check out the review branch and merge the Elements branch into it. Resolve
-conflicts against both implementations, then run the feature matrix, lint,
-fuzz regressions and Elements node tests described in the CI workflows.
-Review the merge before integrating it. The helper does not fetch, merge,
-push or schedule updates.
+Check out the review branch. Pull request CI runs the workflows on the branch,
+so replace its `.github` directory with the Elements one before merging, then
+merge the Elements branch:
+
+    git restore --source=<elements-branch> --staged --worktree -- .github
+    git commit -m "Keep elements-miniscript CI configuration"
+    git merge <elements-branch>
+
+Resolve textual and semantic conflicts against both implementations, push the
+branch and open a pull request. Pull request CI runs the feature matrix, lint,
+documentation and Elements node tests. Also run the fuzz targets, which CI runs
+only on its daily schedule, and build downstream users such as LWK against the
+branch. Review upstream changes to CI with
+`git diff <elements-branch>...<upstream-ref> -- .github` and port the ones you
+want in a separate commit. Keep the `github.repository` guard on the weekly
+update workflows that upstream owns.
+
+Merge the review pull request with a merge commit. A squash or rebase merge
+drops the upstream history, so the next update would include the same commits
+again.
+
+The `upstream-sync.yml` workflow does these steps monthly and can be started
+manually from the default branch. It does nothing until a maintainer sets up
+its credentials:
+
+1. Set the repository's default workflow permissions to read-only, because
+   pull request CI runs upstream code.
+2. Create an `upstream-sync` environment and limit its deployment branches to
+   the default branch.
+3. Add an `UPSTREAM_SYNC_TOKEN` secret to that environment. Use a fine-grained
+   personal access token for this repository only, with Contents, Pull requests
+   and Workflows write access. Workflows access is needed because the pushed
+   history includes upstream workflow edits. Use an identity that does not need
+   to approve the proposals, because GitHub does not let authors approve their
+   own pull requests. A GitHub App installation token expires after one hour;
+   supporting an App would require generating its token during each run.
+
+Without the secret, the workflow logs a warning and stops. The Actions token
+cannot push workflow edits, and pull requests it opens do not start CI. Until
+the credentials exist, or when a run fails, follow the local steps above.
+
+When rust-miniscript master has commits that the default branch lacks, the
+workflow uses the helper to create `sync/upstream-<commit>`, keeps the default
+branch's `.github` on it and merges the default branch into it:
+
+- If the merge has no textual conflicts, it pushes the merge and opens a draft
+  pull request that lists the incoming commits and upstream `.github` changes.
+  Check the result for semantic conflicts and push any fixes to the branch.
+- If the merge conflicts, it pushes the branch without the merge and opens a
+  draft pull request that names the conflicted files. GitHub blocks merging it
+  and runs no CI until the conflicts are resolved. Merge the default branch
+  into it locally, resolve the conflicts and push the result.
+
+In both cases, wait for CI and complete the checks above before marking the
+pull request ready. The proposal job does not build incoming source; pull
+request CI does, with a read-only Actions token. The workflow never merges or
+approves code. It does nothing while another sync pull
+request from this repository is open, and it does not propose an upstream
+commit again once a pull request for it exists, even a closed one. If the
+branch for the current upstream commit exists without a pull request, the run
+fails; open the pull request or delete the branch. GitHub runs the schedule
+only when the workflow is on the default branch.
 
 The `std` feature, its `cfg` gates and the `no_std` attribute come from
 rust-miniscript and are kept so that these merges stay small. The dependencies

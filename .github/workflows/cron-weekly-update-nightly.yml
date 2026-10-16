@@ -6,6 +6,8 @@ on:
 jobs:
   format:
     name: Update nightly rustc
+    # Forks receive this update through upstream syncs.
+    if: github.repository == 'rust-bitcoin/rust-miniscript'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
